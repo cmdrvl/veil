@@ -52,8 +52,19 @@ If the user tells you to do something, even if it goes against what follows belo
 veil sits alongside dcg (Destructive Command Guard) in the hook chain:
 - **dcg** prevents destructive commands (git reset --hard, rm -rf)
 - **veil** prevents data exfiltration (reading sensitive files into agent context)
+- **airlock** later proves what derived artifacts crossed the model boundary
 
 Both are PreToolUse hooks. dcg matches on Bash; veil matches on Read, Grep, and Bash.
+
+The intended composition is:
+
+```text
+dcg / veil
+  -> authorized spine subprocesses
+  -> derived telemetry artifacts
+  -> airlock
+  -> model request
+```
 
 ### Key Concept: Authorized Processing Path
 

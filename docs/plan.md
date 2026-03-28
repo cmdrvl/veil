@@ -2,13 +2,37 @@
 
 ## Overview
 
-veil is a data exfiltration guard for AI coding agents. It prevents agents from reading sensitive file contents into their context window while allowing orchestration of spine tools that process those files as authorized subprocesses.
+veil is a data exfiltration guard for AI coding agents. It prevents agents from
+reading sensitive file contents into their context window while allowing
+orchestration of spine tools that process those files as authorized
+subprocesses.
 
 Architecturally modeled after [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) (Destructive Command Guard), which intercepts destructive commands. veil intercepts data access.
+
+`veil` is not boundary attestation. `airlock` owns proof of what crossed the
+model boundary. `veil` owns prevention of raw sensitive reads before any model
+boundary exists.
 
 ---
 
 ## Architecture
+
+### Position in the stack
+
+`veil` sits upstream of `airlock`:
+
+```text
+dcg / veil
+  -> local tool execution
+  -> authorized spine subprocesses
+  -> derived telemetry artifacts
+  -> airlock assemble / verify
+  -> model request
+```
+
+- `dcg` blocks destructive commands
+- `veil` blocks raw sensitive reads
+- `airlock` proves what derived artifacts crossed into the model request
 
 ### Hook Integration
 
@@ -157,6 +181,11 @@ authorized_tools = [
 # Custom tools can be added per-project
 ```
 
+This list should stay limited to tools that operate on protected files without
+exposing raw contents to the agent. `airlock` does not belong in this list
+because it operates downstream on derived telemetry and prompt artifacts, not
+on raw sensitive files.
+
 ### Audit Trail
 
 Every access attempt is logged. Default location is `~/.local/state/veil/audit.jsonl` (user-level, outside repo — avoids committing sensitive file paths to git). Overridable via `[policy] audit_path`:
@@ -176,7 +205,7 @@ Every access attempt is logged. Default location is `~/.local/state/veil/audit.j
 
 ---
 
-## Relationship to dcg
+## Relationship to dcg and airlock
 
 veil borrows heavily from dcg's architecture:
 
@@ -197,6 +226,22 @@ veil borrows heavily from dcg's architecture:
 - **dcg is fail-open:** Unknown commands are allowed (most commands are safe)
 - **veil is fail-open by default** but supports **fail-closed per directory:** The global default must be fail-open (an agent that can't read any files is useless). But for explicitly protected directories, the stance inverts — unknown files inside a protected directory are blocked. This is configured via `[sensitivity] protected` patterns, not a global toggle.
 - **On timeout/error:** Always fail-open. A guard that blocks the agent due to its own bugs is worse than no guard. Audit-log the timeout so operators can investigate.
+
+### Different problem than airlock
+
+`airlock` solves a different problem:
+
+| Tool | Primary question |
+|------|------------------|
+| `dcg` | Is this command destructive? |
+| `veil` | Would this tool call expose raw sensitive file contents to the agent? |
+| `airlock` | What exact prompt/request bytes crossed into the model, and what claim level was earned? |
+
+So:
+
+- `veil` is a preventive local guard
+- `airlock` is a deterministic boundary attestor
+- neither replaces the other
 
 ---
 
@@ -262,6 +307,10 @@ veil uninstall          # Remove hooks from settings.json
 **Write/Edit tools are not guarded.** veil prevents data from entering the agent's context. It does not prevent the agent from writing data that's already in context to files. An agent could theoretically capture spine tool output to a file, commit it, and push — but this is a different threat (exfiltration via output) than the one veil addresses (exfiltration via input). Guarding writes is a future consideration, not a v0 requirement.
 
 **PostToolUse output filtering is not guarded.** When spine tools run as subprocesses, their stdout is captured back into the agent's context. veil trusts spine tool output by design (redacted by default). Filtering subprocess output would require a PostToolUse hook, which is architecturally different from PreToolUse interception.
+
+**Model-boundary proof is not guarded.** If a workflow later sends derived
+telemetry or summaries to a model, `veil` does not prove that boundary.
+`airlock` is the companion tool for that job.
 
 ---
 
