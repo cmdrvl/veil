@@ -8,9 +8,14 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use veil::allowlist::SafePathMatcher;
 use veil::config::{self, Config, PolicyMode};
+use veil::evaluator::{EvaluationInput, evaluate_access};
+use veil::extract::{PathExposure, extract_read_or_grep_paths};
+use veil::packs::PackRegistry;
+use veil::types::{Decision, DecisionAction, SensitivityResult, ToolKind};
 
-use crate::cli::{AuditArgs, ConfigArgs, DoctorArgs};
+use crate::cli::{AuditArgs, ConfigArgs, DoctorArgs, PathCommandArgs};
 use crate::hooks;
 
 const RECENT_AUDIT_LIMIT: usize = 20;
@@ -34,6 +39,16 @@ struct DoctorReport {
     checks: Vec<DoctorCheck>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PathInspection {
+    input_path: String,
+    normalized_path: PathBuf,
+    decision: Decision,
+    allowlist_pattern: Option<String>,
+    protected_pattern: Option<String>,
+    sensitivity: Option<SensitivityResult>,
+}
+
 enum SettingsPathStatus {
     Resolved(PathBuf),
     Error(String),
@@ -53,6 +68,16 @@ pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>>
 pub fn run_doctor(args: &DoctorArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
     render_doctor_for_repo(&repo_root, args.json)
+}
+
+pub fn run_test(args: &PathCommandArgs) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = env::current_dir()?;
+    render_test_for_repo(&repo_root, &args.path, args.json)
+}
+
+pub fn run_explain(args: &PathCommandArgs) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = env::current_dir()?;
+    render_explain_for_repo(&repo_root, &args.path, args.json)
 }
 
 fn render_config_for_repo(
@@ -101,6 +126,51 @@ fn render_doctor_for_repo(
         Ok(serde_json::to_string_pretty(&report.to_json_value())?)
     } else {
         Ok(render_doctor_human(&report))
+    }
+}
+
+fn render_test_for_repo(
+    repo_root: &Path,
+    path: &Path,
+    json_output: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let inspection = inspect_path(repo_root, path)?;
+
+    if json_output {
+        Ok(serde_json::to_string_pretty(&json!({
+            "input_path": inspection.input_path,
+            "normalized_path": inspection.normalized_path.display().to_string(),
+            "decision": decision_json(&inspection.decision),
+        }))?)
+    } else {
+        Ok(render_test_human(&inspection))
+    }
+}
+
+fn render_explain_for_repo(
+    repo_root: &Path,
+    path: &Path,
+    json_output: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let inspection = inspect_path(repo_root, path)?;
+
+    if json_output {
+        Ok(serde_json::to_string_pretty(&json!({
+            "input_path": inspection.input_path,
+            "normalized_path": inspection.normalized_path.display().to_string(),
+            "match": {
+                "kind": inspection.match_kind(),
+                "allowlist_pattern": inspection.allowlist_pattern,
+                "protected_pattern": inspection.protected_pattern,
+                "pack": inspection.sensitivity.as_ref().map(|value| value.pack.clone()),
+                "severity": inspection.sensitivity.as_ref().map(|value| severity_name(&value.severity)),
+                "confidence": inspection.sensitivity.as_ref().map(|value| value.confidence),
+                "directory_sensitive": inspection.sensitivity.as_ref().map(|value| value.directory_sensitive),
+            },
+            "decision": decision_json(&inspection.decision),
+        }))?)
+    } else {
+        Ok(render_explain_human(&inspection))
     }
 }
 
@@ -374,11 +444,203 @@ fn render_doctor_human(report: &DoctorReport) -> String {
     output.trim_end().to_owned()
 }
 
+fn render_test_human(inspection: &PathInspection) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Test");
+    let _ = writeln!(output, "  input: {}", inspection.input_path);
+    let _ = writeln!(
+        output,
+        "  normalized: {}",
+        inspection.normalized_path.display()
+    );
+    let _ = writeln!(
+        output,
+        "  decision: {}",
+        decision_action_name(&inspection.decision.action)
+    );
+    let _ = writeln!(
+        output,
+        "  reason: {}",
+        inspection.decision.reason.as_deref().unwrap_or("(none)")
+    );
+    let _ = writeln!(
+        output,
+        "  confidence: {}",
+        inspection
+            .decision
+            .confidence
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "(none)".to_owned())
+    );
+    let _ = writeln!(
+        output,
+        "  remediation: {}",
+        inspection
+            .decision
+            .remediation
+            .as_deref()
+            .unwrap_or("(none)")
+    );
+
+    output.trim_end().to_owned()
+}
+
+fn render_explain_human(inspection: &PathInspection) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Explain");
+    let _ = writeln!(output, "  input: {}", inspection.input_path);
+    let _ = writeln!(
+        output,
+        "  normalized: {}",
+        inspection.normalized_path.display()
+    );
+    let _ = writeln!(output, "  matched_by: {}", inspection.match_kind());
+    let _ = writeln!(
+        output,
+        "  allowlist_pattern: {}",
+        inspection.allowlist_pattern.as_deref().unwrap_or("(none)")
+    );
+    let _ = writeln!(
+        output,
+        "  protected_pattern: {}",
+        inspection.protected_pattern.as_deref().unwrap_or("(none)")
+    );
+    let _ = writeln!(
+        output,
+        "  pack: {}",
+        inspection
+            .sensitivity
+            .as_ref()
+            .map(|value| value.pack.as_str())
+            .unwrap_or("(none)")
+    );
+    let _ = writeln!(
+        output,
+        "  severity: {}",
+        inspection
+            .sensitivity
+            .as_ref()
+            .map(|value| severity_name(&value.severity))
+            .unwrap_or("(none)")
+    );
+    let _ = writeln!(
+        output,
+        "  directory_sensitive: {}",
+        inspection
+            .sensitivity
+            .as_ref()
+            .is_some_and(|value| value.directory_sensitive)
+    );
+    let _ = writeln!(
+        output,
+        "  decision: {}",
+        decision_action_name(&inspection.decision.action)
+    );
+    let _ = writeln!(
+        output,
+        "  reason: {}",
+        inspection.decision.reason.as_deref().unwrap_or("(none)")
+    );
+    let _ = writeln!(
+        output,
+        "  remediation: {}",
+        inspection
+            .decision
+            .remediation
+            .as_deref()
+            .unwrap_or("(none)")
+    );
+
+    output.trim_end().to_owned()
+}
+
+fn inspect_path(
+    repo_root: &Path,
+    raw_path: &Path,
+) -> Result<PathInspection, Box<dyn std::error::Error>> {
+    let config = config::load_config(repo_root)?;
+    let normalized_path = normalize_cli_path(raw_path, repo_root).ok_or_else(|| {
+        format!(
+            "could not normalize `{}` with the hook-mode path hardening pipeline",
+            raw_path.display()
+        )
+    })?;
+    let allowlist_pattern =
+        first_matching_pattern(&config.allowlist.safe_patterns, &normalized_path)
+            .map(str::to_owned);
+    let protected_pattern =
+        first_matching_pattern(&config.sensitivity.protected, &normalized_path).map(str::to_owned);
+    let directory_sensitive = protected_pattern.is_some();
+    let registry = PackRegistry::with_built_ins();
+    let sensitivity = registry.classify(&normalized_path, directory_sensitive);
+    let decision = evaluate_access(
+        &EvaluationInput::new(
+            ToolKind::Read,
+            normalized_path.clone(),
+            PathExposure::ReadsContents,
+        ),
+        &config,
+        &registry,
+    );
+
+    Ok(PathInspection {
+        input_path: raw_path.to_string_lossy().into_owned(),
+        normalized_path,
+        decision,
+        allowlist_pattern,
+        protected_pattern,
+        sensitivity,
+    })
+}
+
+fn normalize_cli_path(raw_path: &Path, cwd: &Path) -> Option<PathBuf> {
+    let extraction = extract_read_or_grep_paths(
+        ToolKind::Read,
+        &json!({ "file_path": raw_path.to_string_lossy() }).to_string(),
+        cwd,
+    );
+
+    extraction.candidates.into_iter().next()
+}
+
+fn first_matching_pattern<'a>(patterns: &'a [String], path: &Path) -> Option<&'a str> {
+    patterns.iter().find_map(|pattern| {
+        SafePathMatcher::from_patterns([pattern.as_str()])
+            .is_safe(path)
+            .then_some(pattern.as_str())
+    })
+}
+
+fn decision_json(decision: &Decision) -> Value {
+    json!({
+        "action": decision_action_name(&decision.action),
+        "reason": decision.reason,
+        "confidence": decision.confidence,
+        "remediation": decision.remediation,
+    })
+}
+
+fn decision_action_name(action: &DecisionAction) -> &'static str {
+    match action {
+        DecisionAction::Allow => "allow",
+        DecisionAction::Deny => "deny",
+    }
+}
+
 fn policy_mode_name(mode: &PolicyMode) -> &'static str {
     match mode {
         PolicyMode::Deny => "deny",
         PolicyMode::Warn => "warn",
         PolicyMode::Log => "log",
+    }
+}
+
+fn severity_name(severity: &veil::types::SensitivitySeverity) -> &'static str {
+    match severity {
+        veil::types::SensitivitySeverity::Low => "low",
+        veil::types::SensitivitySeverity::Medium => "medium",
+        veil::types::SensitivitySeverity::High => "high",
+        veil::types::SensitivitySeverity::Critical => "critical",
     }
 }
 
@@ -404,6 +666,20 @@ impl DoctorReport {
                 })
             }).collect::<Vec<_>>(),
         })
+    }
+}
+
+impl PathInspection {
+    fn match_kind(&self) -> &'static str {
+        if self.allowlist_pattern.is_some() {
+            "allowlist"
+        } else if self.sensitivity.is_some() {
+            "pack"
+        } else if self.protected_pattern.is_some() {
+            "protected_directory"
+        } else {
+            "none"
+        }
     }
 }
 
@@ -538,5 +814,72 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn test_command_human_output_covers_allowlisted_paths() {
+        let repo_root = unique_temp_dir("test-human");
+        let rendered = render_test_for_repo(&repo_root, Path::new("README.md"), false)
+            .expect("test rendering should succeed");
+
+        assert!(rendered.contains("Test"));
+        assert!(rendered.contains("decision: allow"));
+        assert!(rendered.contains(&format!(
+            "normalized: {}",
+            repo_root.join("README.md").display()
+        )));
+    }
+
+    #[test]
+    fn test_command_json_output_covers_unsensitive_paths() {
+        let repo_root = unique_temp_dir("test-json");
+        let value: Value = serde_json::from_str(
+            &render_test_for_repo(&repo_root, Path::new("src/app.rs"), true)
+                .expect("test JSON rendering should succeed"),
+        )
+        .expect("test JSON should parse");
+
+        assert_eq!(value["decision"]["action"], "allow");
+        assert_eq!(value["decision"]["reason"], Value::Null);
+        assert_eq!(
+            value["normalized_path"],
+            repo_root.join("src/app.rs").display().to_string()
+        );
+    }
+
+    #[test]
+    fn explain_command_human_output_covers_protected_sensitive_paths() {
+        let repo_root = unique_temp_dir("explain-human");
+        write_file(
+            &repo_root.join(".veil.toml"),
+            r#"
+            [sensitivity]
+            protected = ["protected/**"]
+            "#,
+        );
+
+        let rendered =
+            render_explain_for_repo(&repo_root, Path::new("protected/dataset.tsv"), false)
+                .expect("explain rendering should succeed");
+
+        assert!(rendered.contains("Explain"));
+        assert!(rendered.contains("matched_by: pack"));
+        assert!(rendered.contains("pack: data.tabular"));
+        assert!(rendered.contains("protected_pattern: protected/**"));
+        assert!(rendered.contains("decision: deny"));
+    }
+
+    #[test]
+    fn explain_command_json_output_covers_allowlisted_paths() {
+        let repo_root = unique_temp_dir("explain-json");
+        let value: Value = serde_json::from_str(
+            &render_explain_for_repo(&repo_root, Path::new("README.md"), true)
+                .expect("explain JSON rendering should succeed"),
+        )
+        .expect("explain JSON should parse");
+
+        assert_eq!(value["match"]["kind"], "allowlist");
+        assert_eq!(value["match"]["allowlist_pattern"], "*.md");
+        assert_eq!(value["decision"]["action"], "allow");
     }
 }

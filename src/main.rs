@@ -26,6 +26,14 @@ fn dispatch() -> Result<u8, Box<dyn std::error::Error>> {
 
 fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::error::Error>> {
     match command {
+        cli::OperatorCommand::Test(args) => {
+            println!("{}", operator::run_test(&args)?);
+            Ok(0)
+        }
+        cli::OperatorCommand::Explain(args) => {
+            println!("{}", operator::run_explain(&args)?);
+            Ok(0)
+        }
         cli::OperatorCommand::Config(args) => {
             println!("{}", operator::run_config(&args)?);
             Ok(0)

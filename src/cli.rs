@@ -34,10 +34,17 @@ pub struct DoctorArgs {
     pub json: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct PathCommandArgs {
+    pub path: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum OperatorCommand {
-    Test { path: PathBuf },
-    Explain { path: PathBuf },
+    Test(PathCommandArgs),
+    Explain(PathCommandArgs),
     Scan { dir: PathBuf },
     Packs,
     Config(ConfigArgs),
@@ -108,9 +115,10 @@ mod tests {
     fn test_subcommand_selects_expected_variant() {
         assert_eq!(
             parse(&["veil", "test", "fixtures/sample.txt"]),
-            Dispatch::Operator(OperatorCommand::Test {
+            Dispatch::Operator(OperatorCommand::Test(PathCommandArgs {
                 path: PathBuf::from("fixtures/sample.txt"),
-            })
+                json: false,
+            }))
         );
     }
 
@@ -118,9 +126,10 @@ mod tests {
     fn explain_subcommand_selects_expected_variant() {
         assert_eq!(
             parse(&["veil", "explain", "fixtures/sample.txt"]),
-            Dispatch::Operator(OperatorCommand::Explain {
+            Dispatch::Operator(OperatorCommand::Explain(PathCommandArgs {
                 path: PathBuf::from("fixtures/sample.txt"),
-            })
+                json: false,
+            }))
         );
     }
 
@@ -205,6 +214,28 @@ mod tests {
         assert_eq!(
             parse(&["veil", "doctor", "--json"]),
             Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs { json: true }))
+        );
+    }
+
+    #[test]
+    fn test_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "test", "fixtures/sample.txt", "--json"]),
+            Dispatch::Operator(OperatorCommand::Test(PathCommandArgs {
+                path: PathBuf::from("fixtures/sample.txt"),
+                json: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn explain_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "explain", "fixtures/sample.txt", "--json"]),
+            Dispatch::Operator(OperatorCommand::Explain(PathCommandArgs {
+                path: PathBuf::from("fixtures/sample.txt"),
+                json: true,
+            }))
         );
     }
 }
