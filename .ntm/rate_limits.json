@@ -1,0 +1,26 @@
+{
+  "state": {
+    "openai": {
+      "current_delay": 22500000000,
+      "consecutive_success": 1,
+      "last_rate_limit": "2026-03-29T15:54:45.409392-04:00",
+      "cooldown_until": "2026-03-29T15:55:07.909392-04:00",
+      "total_rate_limits": 2,
+      "total_successes": 8
+    }
+  },
+  "history": {
+    "openai": [
+      {
+        "time": "2026-03-29T15:53:55.403628-04:00",
+        "provider": "openai",
+        "action": "send"
+      },
+      {
+        "time": "2026-03-29T15:54:45.409392-04:00",
+        "provider": "openai",
+        "action": "send"
+      }
+    ]
+  }
+}
