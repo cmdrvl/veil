@@ -119,10 +119,13 @@ fn normalize_path(raw_path: &str, cwd: &Path) -> Option<PathBuf> {
 }
 
 fn left_pipeline(tokens: &[String]) -> &[String] {
-    match tokens.iter().position(|token| is_pipeline_separator(token)) {
-        Some(index) => &tokens[..index],
-        None => tokens,
+    for (index, token) in tokens.iter().enumerate() {
+        if is_pipeline_separator(token) {
+            return &tokens[..index];
+        }
     }
+
+    tokens
 }
 
 fn command_paths(program: &str, args: &[String]) -> Option<Vec<String>> {

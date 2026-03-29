@@ -27,10 +27,13 @@ pub fn detect_spine_invocation(
 }
 
 fn left_pipeline(tokens: &[String]) -> &[String] {
-    match tokens.iter().position(|token| is_pipeline_separator(token)) {
-        Some(index) => &tokens[..index],
-        None => tokens,
+    for (index, token) in tokens.iter().enumerate() {
+        if is_pipeline_separator(token) {
+            return &tokens[..index];
+        }
     }
+
+    tokens
 }
 
 fn authorized_tool_name(program: &str, authorized_tools: &[String]) -> Option<String> {
