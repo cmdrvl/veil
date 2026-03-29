@@ -264,14 +264,14 @@ strip = true
 ### Installation
 
 ```bash
-# Homebrew
+# Current pre-release path
+cargo install --path .
+
+# Planned after the first tagged release
 brew tap cmdrvl/tap
 brew install veil
 
-# Cargo
-cargo install --path .
-
-# Installer script (curl | bash)
+# Planned installer script (after release artifacts exist)
 curl -fsSL https://raw.githubusercontent.com/cmdrvl/veil/main/install.sh | bash
 ```
 

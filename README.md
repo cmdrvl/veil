@@ -39,12 +39,10 @@ ALLOW:  Read tool on shape-report.json → derived artifact, safe
 
 ## Quick Install
 
-```bash
-brew tap cmdrvl/tap
-brew install veil
-```
+`veil` is still pre-release. The Homebrew formula and release-backed installer
+will ship after the first tagged GitHub release.
 
-Or build from source:
+For now, build from source:
 
 ```bash
 cargo install --path .
