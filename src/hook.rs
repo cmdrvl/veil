@@ -134,10 +134,27 @@ fn required_raw_args(payload: &Value, field: &str) -> Result<String, HookParseEr
         .ok_or_else(|| HookParseError::new(format!("hook payload is missing `{field}`")))?;
 
     match value {
-        Value::String(raw) => Ok(raw.clone()),
-        _ => serde_json::to_string(value).map_err(|error| {
+        Value::String(raw) => {
+            let parsed: Value = serde_json::from_str(raw).map_err(|error| {
+                HookParseError::new(format!(
+                    "hook payload `{field}` must be valid JSON object text: {error}"
+                ))
+            })?;
+
+            if !parsed.is_object() {
+                return Err(HookParseError::new(format!(
+                    "hook payload `{field}` must decode to a JSON object"
+                )));
+            }
+
+            Ok(raw.clone())
+        }
+        Value::Object(_) => serde_json::to_string(value).map_err(|error| {
             HookParseError::new(format!("could not serialize `{field}`: {error}"))
         }),
+        _ => Err(HookParseError::new(format!(
+            "hook payload `{field}` must be a JSON object or object-encoded string"
+        ))),
     }
 }
 
@@ -291,6 +308,28 @@ mod tests {
     fn malformed_or_unsupported_payloads_fail_gracefully() {
         assert!(parse_hook_input(r#"{"unexpected":true}"#).is_err());
         assert!(parse_hook_input("not json").is_err());
+        assert!(
+            parse_hook_input(
+                r#"{
+              "timestamp": 1704614400000,
+              "cwd": "/tmp",
+              "toolName": "view",
+              "toolArgs": "not-json"
+            }"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_hook_input(
+                r#"{
+              "timestamp": 1704614400000,
+              "cwd": "/tmp",
+              "toolName": "view",
+              "toolArgs": "\"docs/plan.md\""
+            }"#
+            )
+            .is_err()
+        );
         assert!(
             parse_hook_input(
                 r#"{

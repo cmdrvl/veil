@@ -399,4 +399,21 @@ mod tests {
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }
+
+    #[test]
+    fn run_with_io_rejects_malformed_copilot_tool_args() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let error = run_with_io(
+            br#"{"cwd":"/tmp","toolName":"view","toolArgs":"not-json"}"#.as_slice(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect_err("malformed Copilot toolArgs should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
 }
