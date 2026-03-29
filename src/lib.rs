@@ -2,6 +2,7 @@
 
 pub mod allowlist;
 pub mod audit;
+pub mod config;
 pub mod extract;
 pub mod spine;
 pub mod types;
