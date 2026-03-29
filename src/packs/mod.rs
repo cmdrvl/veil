@@ -16,6 +16,9 @@ pub const BUILTIN_PACK_NAMES: &[&str] = &[
     "compliance.hipaa",
 ];
 
+const FILESYSTEM_CONFIDENCE: f32 = 0.99;
+const DATABASE_CONFIDENCE: f32 = 0.97;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ClassificationRequest<'a> {
     pub path: &'a Path,
@@ -125,7 +128,11 @@ pub fn built_in_packs() -> Vec<Box<dyn SensitivityPack>> {
     BUILTIN_PACK_NAMES
         .iter()
         .copied()
-        .map(|name| Box::new(BuiltinPack::new(name)) as Box<dyn SensitivityPack>)
+        .map(|name| match name {
+            "core.filesystem" => Box::new(FilesystemPack) as Box<dyn SensitivityPack>,
+            "data.database" => Box::new(DatabasePack) as Box<dyn SensitivityPack>,
+            _ => Box::new(NoopPack::new(name)) as Box<dyn SensitivityPack>,
+        })
         .collect()
 }
 
@@ -147,17 +154,17 @@ fn severity_rank(severity: &SensitivitySeverity) -> u8 {
 }
 
 #[derive(Debug)]
-struct BuiltinPack {
+struct NoopPack {
     name: &'static str,
 }
 
-impl BuiltinPack {
+impl NoopPack {
     const fn new(name: &'static str) -> Self {
         Self { name }
     }
 }
 
-impl SensitivityPack for BuiltinPack {
+impl SensitivityPack for NoopPack {
     fn name(&self) -> &str {
         self.name
     }
@@ -165,6 +172,126 @@ impl SensitivityPack for BuiltinPack {
     fn classify(&self, _request: &ClassificationRequest<'_>) -> Option<PackMatch> {
         None
     }
+}
+
+#[derive(Debug)]
+struct FilesystemPack;
+
+impl SensitivityPack for FilesystemPack {
+    fn name(&self) -> &str {
+        "core.filesystem"
+    }
+
+    fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
+        let path = PathView::new(request.path);
+        let basename = path.basename()?;
+
+        if is_sensitive_env_file(basename)
+            || path.contains_component(".ssh")
+            || basename.ends_with(".pem")
+            || basename.ends_with(".key")
+        {
+            return Some(PackMatch {
+                severity: SensitivitySeverity::Critical,
+                confidence: FILESYSTEM_CONFIDENCE,
+                directory_sensitive: false,
+            });
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
+struct DatabasePack;
+
+impl SensitivityPack for DatabasePack {
+    fn name(&self) -> &str {
+        "data.database"
+    }
+
+    fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
+        let path = PathView::new(request.path);
+        let basename = path.basename()?;
+
+        if is_database_file(basename) {
+            return Some(PackMatch {
+                severity: SensitivitySeverity::High,
+                confidence: DATABASE_CONFIDENCE,
+                directory_sensitive: false,
+            });
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
+struct PathView {
+    components: Vec<String>,
+}
+
+impl PathView {
+    fn new(path: &Path) -> Self {
+        let components = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .split('/')
+            .filter(|component| !component.is_empty() && *component != ".")
+            .map(|component| component.to_ascii_lowercase())
+            .collect();
+
+        Self { components }
+    }
+
+    fn basename(&self) -> Option<&str> {
+        self.components.last().map(String::as_str)
+    }
+
+    fn contains_component(&self, needle: &str) -> bool {
+        self.components.iter().any(|component| component == needle)
+    }
+}
+
+fn is_sensitive_env_file(basename: &str) -> bool {
+    if basename == ".env" {
+        return true;
+    }
+
+    let Some(suffix) = basename.strip_prefix(".env.") else {
+        return false;
+    };
+
+    !matches!(suffix, "example" | "sample" | "template")
+}
+
+fn is_database_file(basename: &str) -> bool {
+    matches!(
+        file_extension(basename),
+        Some("sqlite" | "sqlite3" | "db" | "db3" | "duckdb" | "dump")
+    ) || matches_database_dump_suffix(basename)
+}
+
+fn file_extension(basename: &str) -> Option<&str> {
+    basename.rsplit_once('.').map(|(_, extension)| extension)
+}
+
+fn matches_database_dump_suffix(basename: &str) -> bool {
+    const DATABASE_DUMP_SUFFIXES: &[&str] = &[
+        ".sql.gz",
+        ".sql.bz2",
+        ".sql.xz",
+        ".sql.zst",
+        ".sql.zip",
+        ".sql.dump",
+        ".dump.sql",
+    ];
+
+    DATABASE_DUMP_SUFFIXES
+        .iter()
+        .any(|suffix| basename.ends_with(suffix))
+        || (basename.ends_with(".sql")
+            && (basename.contains("dump") || basename.contains("backup")))
 }
 
 #[cfg(test)]
@@ -351,5 +478,90 @@ mod tests {
 
         assert_eq!(registry.pack_names(), expected);
         assert_eq!(registry.classify("safe/report.json", false), None);
+    }
+
+    #[test]
+    fn filesystem_pack_matches_common_sensitive_paths() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            ".env",
+            ".env.production",
+            ".ssh/id_rsa",
+            "keys/service.pem",
+            "keys/private.key",
+        ] {
+            let result = registry
+                .classify(path, false)
+                .expect("filesystem-sensitive path should match");
+
+            assert_eq!(result.pack, "core.filesystem");
+            assert_eq!(result.severity, SensitivitySeverity::Critical);
+            assert!((result.confidence - FILESYSTEM_CONFIDENCE).abs() < f32::EPSILON);
+            assert!(!result.directory_sensitive);
+        }
+    }
+
+    #[test]
+    fn filesystem_pack_skips_safe_lookalikes() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            ".env.example",
+            ".env.sample",
+            "docs/environment.md",
+            "keys/private.key.pub",
+            "ssh-notes/readme.txt",
+        ] {
+            assert_ne!(
+                registry
+                    .classify(path, false)
+                    .as_ref()
+                    .map(|result| result.pack.as_str()),
+                Some("core.filesystem"),
+            );
+        }
+    }
+
+    #[test]
+    fn database_pack_matches_global_database_artifacts() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "db/prod.sqlite",
+            "warehouse/report.duckdb",
+            "backups/customer.dump",
+            "exports/prod.sql.gz",
+            "exports/database_backup.sql",
+        ] {
+            let result = registry
+                .classify(path, false)
+                .expect("database artifact should match");
+
+            assert_eq!(result.pack, "data.database");
+            assert_eq!(result.severity, SensitivitySeverity::High);
+            assert!((result.confidence - DATABASE_CONFIDENCE).abs() < f32::EPSILON);
+            assert!(!result.directory_sensitive);
+        }
+    }
+
+    #[test]
+    fn database_pack_skips_non_database_paths() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "migrations/001_init.sql",
+            "docs/duckdb.md",
+            "reports/database.dbt",
+            "exports/schema.sql.txt",
+        ] {
+            assert_ne!(
+                registry
+                    .classify(path, false)
+                    .as_ref()
+                    .map(|result| result.pack.as_str()),
+                Some("data.database"),
+            );
+        }
     }
 }
