@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 
 use hook::parse_hook_input;
 use render::render_decision;
-use types::{Decision, DecisionAction};
+use types::{Decision, DecisionAction, HookProtocol};
 
 pub fn run() -> Result<u8, Box<dyn Error>> {
     let stdin = io::stdin();
@@ -28,10 +28,10 @@ pub fn run() -> Result<u8, Box<dyn Error>> {
 fn run_with_io<R: Read, W: Write>(mut reader: R, writer: &mut W) -> io::Result<()> {
     let mut input = String::new();
     reader.read_to_string(&mut input)?;
-    let _hook_input = parse_hook_input(&input)
+    let hook_input = parse_hook_input(&input)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
-    let response = render_stub_response(&stub_decision());
+    let response = render_stub_response(hook_input.protocol, &stub_decision());
     writer.write_all(response.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
@@ -47,8 +47,8 @@ fn stub_decision() -> Decision {
     }
 }
 
-fn render_stub_response(decision: &Decision) -> String {
-    render_decision(types::HookProtocol::ClaudeCode, decision).stdout
+fn render_stub_response(protocol: HookProtocol, decision: &Decision) -> String {
+    render_decision(protocol, decision).stdout
 }
 
 #[cfg(test)]
@@ -58,6 +58,8 @@ mod tests {
     #[test]
     fn run_with_io_emits_allow_response() {
         let input = br#"{
+            "session_id":"abc123",
+            "cwd":"/repo",
             "hook_event_name":"PreToolUse",
             "tool_name":"Read",
             "tool_input":{"file_path":"secret.txt"}
@@ -69,6 +71,25 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).expect("output should be UTF-8"),
             "{\"permissionDecision\":\"allow\"}\n"
+        );
+    }
+
+    #[test]
+    fn run_with_io_uses_detected_protocol_for_stub_output() {
+        let input = br#"{
+            "session_id":"gemini-1",
+            "cwd":"/repo",
+            "hook_event_name":"BeforeTool",
+            "tool_name":"run_shell_command",
+            "tool_input":{"command":"pwd"}
+        }"#;
+        let mut output = Vec::new();
+
+        run_with_io(&input[..], &mut output).expect("stub runner should succeed");
+
+        assert_eq!(
+            String::from_utf8(output).expect("output should be UTF-8"),
+            "{\"decision\":\"allow\"}\n"
         );
     }
 

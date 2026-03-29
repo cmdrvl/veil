@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecisionAction {
     Allow,
     Deny,
@@ -15,7 +17,7 @@ pub struct Decision {
     pub remediation: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HookProtocol {
     ClaudeCode,
     GeminiCli,
@@ -23,7 +25,7 @@ pub enum HookProtocol {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolKind {
     Read,
     Grep,
@@ -35,6 +37,7 @@ pub enum ToolKind {
 pub struct HookInput {
     pub protocol: HookProtocol,
     pub tool: ToolKind,
+    pub cwd: PathBuf,
     pub raw_args: String,
 }
 
