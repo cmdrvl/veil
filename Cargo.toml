@@ -1,6 +1,6 @@
 [package]
 name = "veil"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["CMD+RVL <engineering@cmdrvl.com>"]
 description = "Data exfiltration guard for AI coding agents"
