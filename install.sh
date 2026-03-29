@@ -10,6 +10,7 @@ VEIL_INSTALL_DIR="${VEIL_INSTALL_DIR:-}"
 DRY_RUN=0
 FORCE=0
 MODE="install"
+TEMP_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -46,6 +47,13 @@ die() {
 
 need_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+cleanup_temp_dir() {
+  if [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ]; then
+    rm -rf -- "$TEMP_DIR"
+    TEMP_DIR=""
+  fi
 }
 
 normalize_release_tag() {
@@ -163,7 +171,6 @@ install_binary() {
   local suffix
   local artifact
   local url
-  local temp_dir
   local archive_path
   local archive_stem
   local extracted_binary
@@ -198,21 +205,23 @@ install_binary() {
     return 0
   fi
 
-  temp_dir="$(mktemp -d)"
-  trap 'rm -rf "${temp_dir}"' EXIT
-  archive_path="${temp_dir}/${artifact}"
+  TEMP_DIR="$(mktemp -d)"
+  trap cleanup_temp_dir EXIT
+  archive_path="${TEMP_DIR}/${artifact}"
 
   mkdir -p "$target_dir"
   download_file "$url" "$archive_path"
-  tar -xzf "$archive_path" -C "$temp_dir"
+  tar -xzf "$archive_path" -C "$TEMP_DIR"
 
-  extracted_binary="${temp_dir}/${archive_stem}/veil"
+  extracted_binary="${TEMP_DIR}/${archive_stem}/veil"
   [ -x "$extracted_binary" ] || die "downloaded archive did not contain ${archive_stem}/veil"
 
   staging_path="${target}.tmp"
   cp "$extracted_binary" "$staging_path"
   chmod 0755 "$staging_path"
   mv "$staging_path" "$target"
+  cleanup_temp_dir
+  trap - EXIT
 }
 
 delegate_install() {
