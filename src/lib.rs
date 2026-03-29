@@ -5,6 +5,7 @@ pub mod audit;
 pub mod config;
 pub mod evaluator;
 pub mod extract;
+pub mod hook;
 pub mod packs;
 pub mod render;
 pub mod spine;
@@ -13,6 +14,7 @@ pub mod types;
 use std::error::Error;
 use std::io::{self, Read, Write};
 
+use hook::parse_hook_input;
 use render::render_decision;
 use types::{Decision, DecisionAction};
 
@@ -26,7 +28,8 @@ pub fn run() -> Result<u8, Box<dyn Error>> {
 fn run_with_io<R: Read, W: Write>(mut reader: R, writer: &mut W) -> io::Result<()> {
     let mut input = String::new();
     reader.read_to_string(&mut input)?;
-    drop(input);
+    let _hook_input = parse_hook_input(&input)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
     let response = render_stub_response(&stub_decision());
     writer.write_all(response.as_bytes())?;
@@ -54,7 +57,11 @@ mod tests {
 
     #[test]
     fn run_with_io_emits_allow_response() {
-        let input = br#"{"tool":"Read","tool_input":{"file_path":"secret.txt"}}"#;
+        let input = br#"{
+            "hook_event_name":"PreToolUse",
+            "tool_name":"Read",
+            "tool_input":{"file_path":"secret.txt"}
+        }"#;
         let mut output = Vec::new();
 
         run_with_io(&input[..], &mut output).expect("stub runner should succeed");
@@ -63,6 +70,17 @@ mod tests {
             String::from_utf8(output).expect("output should be UTF-8"),
             "{\"permissionDecision\":\"allow\"}\n"
         );
+    }
+
+    #[test]
+    fn run_with_io_rejects_invalid_hook_payloads() {
+        let mut output = Vec::new();
+
+        let error = run_with_io(br#"{"unexpected":true}"#.as_slice(), &mut output)
+            .expect_err("invalid hook payload should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
     }
 
     #[test]
