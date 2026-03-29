@@ -144,6 +144,83 @@ br sync --flush-only  # Export to JSONL (NO git operations)
 
 ---
 
+## Commit Cadence — One Bead, One Commit, One Push
+
+**Commit and push after completing each bead.** Do not accumulate work across multiple beads before committing. The workflow for every bead is:
+
+1. Claim the bead (`br show <id>`, add a comment that you're starting)
+2. Implement the work
+3. Run quality gates: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
+4. Commit and push immediately:
+   ```bash
+   br sync --flush-only
+   git add .beads/ <changed files>
+   git commit -m "<bead-id>: <short description of what was done>"
+   git push
+   ```
+5. Close the bead: `br close <id> --reason "Completed"`
+6. Move to the next bead
+
+**Do NOT:**
+- Work on multiple beads before committing
+- Accumulate a large uncommitted diff
+- Wait until the end of the session to commit
+- Skip the push step
+
+**Do:**
+- Keep commits small and focused (one bead = one commit)
+- Push after every commit so other agents can pull your changes
+- Run `git pull --rebase` before starting each new bead to pick up others' work
+
+---
+
+## MCP Agent Mail — Multi-Agent Coordination
+
+When Agent Mail is available:
+
+- Register identity in this project
+- **Reserve only the specific file(s) you are editing — never entire directories or broad globs**
+- Send start/finish updates per bead using bead ID as `thread_id`
+- Poll inbox at moderate cadence (2-5 minutes)
+- Acknowledge `ack_required` messages promptly
+- Release reservations when done
+
+### File Reservation Rules
+
+1. **Reserve only the files you are writing** — not the module directory, not other stubs
+2. Each bead's deliverables section documents the exact files to work on
+3. Release reservations as soon as you commit and push
+
+### How to Use
+
+1. Register: call `ensure_project` then `register_agent` using `/Users/zac/Source/cmdrvl/veil` as `project_key`
+2. Reserve files before editing: `file_reservation_paths(project_key, agent_name, ["src/hook.rs"], ttl_seconds=3600, exclusive=true)`
+3. Communicate with threads: `send_message(..., thread_id="bd-1cp")`
+4. Check inbox: `fetch_inbox(project_key, agent_name)`
+
+---
+
+## Multi-Agent Coordination
+
+When working alongside other agents:
+
+- **Never stash, revert, or overwrite other agents' work**
+- Treat unexpected changes in the working tree as if you made them
+- If you see changes you didn't make in `git status`, those are from other agents working concurrently — commit them together with your changes
+- This is normal and happens frequently in multi-agent environments
+
+**Do NOT:**
+- Stop and ask "I see unexpected changes, what should I do?"
+- Offer options like "triage these changes" or "run a full suite"
+- Express concern about uncommitted work you don't recognize
+
+**Do:**
+- Continue working as normal
+- Include those changes when you commit (they belong to the shared effort)
+- Trust that other agents know what they're doing
+
+---
+
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
