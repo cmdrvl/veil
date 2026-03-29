@@ -116,12 +116,12 @@ fn required_string<'a>(payload: &'a Value, field: &str) -> Result<&'a str, HookP
 }
 
 fn required_json(payload: &Value, field: &str) -> Result<String, HookParseError> {
-    serde_json::to_string(
+    serialize_object(
         payload
             .get(field)
             .ok_or_else(|| HookParseError::new(format!("hook payload is missing `{field}`")))?,
+        field,
     )
-    .map_err(|error| HookParseError::new(format!("could not serialize `{field}`: {error}")))
 }
 
 fn required_path(payload: &Value, field: &str) -> Result<PathBuf, HookParseError> {
@@ -141,20 +141,30 @@ fn required_raw_args(payload: &Value, field: &str) -> Result<String, HookParseEr
                 ))
             })?;
 
-            if !parsed.is_object() {
-                return Err(HookParseError::new(format!(
-                    "hook payload `{field}` must decode to a JSON object"
-                )));
-            }
+            ensure_object(&parsed, field, "must decode to a JSON object")?;
 
             Ok(raw.clone())
         }
-        Value::Object(_) => serde_json::to_string(value).map_err(|error| {
-            HookParseError::new(format!("could not serialize `{field}`: {error}"))
-        }),
+        Value::Object(_) => serialize_object(value, field),
         _ => Err(HookParseError::new(format!(
             "hook payload `{field}` must be a JSON object or object-encoded string"
         ))),
+    }
+}
+
+fn serialize_object(value: &Value, field: &str) -> Result<String, HookParseError> {
+    ensure_object(value, field, "must be a JSON object")?;
+    serde_json::to_string(value)
+        .map_err(|error| HookParseError::new(format!("could not serialize `{field}`: {error}")))
+}
+
+fn ensure_object(value: &Value, field: &str, requirement: &str) -> Result<(), HookParseError> {
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(HookParseError::new(format!(
+            "hook payload `{field}` {requirement}"
+        )))
     }
 }
 
@@ -308,6 +318,17 @@ mod tests {
     fn malformed_or_unsupported_payloads_fail_gracefully() {
         assert!(parse_hook_input(r#"{"unexpected":true}"#).is_err());
         assert!(parse_hook_input("not json").is_err());
+        assert!(
+            parse_hook_input(
+                r#"{
+              "cwd": "/tmp",
+              "hook_event_name": "PreToolUse",
+              "tool_name": "Read",
+              "tool_input": "not-json"
+            }"#
+            )
+            .is_err()
+        );
         assert!(
             parse_hook_input(
                 r#"{

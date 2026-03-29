@@ -416,4 +416,21 @@ mod tests {
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }
+
+    #[test]
+    fn run_with_io_rejects_malformed_snake_case_tool_input() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let error = run_with_io(
+            br#"{"cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":"not-json"}"#.as_slice(),
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect_err("malformed snake-case tool_input should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
 }
