@@ -6,12 +6,14 @@ pub mod config;
 pub mod evaluator;
 pub mod extract;
 pub mod packs;
+pub mod render;
 pub mod spine;
 pub mod types;
 
 use std::error::Error;
 use std::io::{self, Read, Write};
 
+use render::render_decision;
 use types::{Decision, DecisionAction};
 
 pub fn run() -> Result<u8, Box<dyn Error>> {
@@ -36,20 +38,14 @@ fn stub_decision() -> Decision {
     Decision {
         action: DecisionAction::Allow,
         reason: Some("veil scaffold stub allows all requests".to_owned()),
+        severity: None,
         confidence: Some(1.0),
         remediation: None,
     }
 }
 
 fn render_stub_response(decision: &Decision) -> String {
-    let permission_decision = match decision.action {
-        DecisionAction::Allow => "allow",
-        DecisionAction::Deny => "deny",
-    };
-
-    // The scaffold stays protocol-agnostic for now and emits the smallest
-    // hook-shaped response needed to unblock downstream implementation.
-    format!(r#"{{"permissionDecision":"{permission_decision}"}}"#)
+    render_decision(types::HookProtocol::ClaudeCode, decision).stdout
 }
 
 #[cfg(test)]
@@ -83,6 +79,7 @@ mod tests {
                 .confidence
                 .is_some_and(|value| (value - 1.0).abs() < f32::EPSILON)
         );
+        assert_eq!(decision.severity, None);
         assert_eq!(decision.remediation, None);
     }
 }

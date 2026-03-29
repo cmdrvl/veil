@@ -173,18 +173,21 @@ fn resolve_policy(
         PolicyMode::Deny => Decision {
             action: DecisionAction::Deny,
             reason: Some(reason),
+            severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
             remediation: Some(DIRECT_READ_REMEDIATION.to_owned()),
         },
         PolicyMode::Warn => Decision {
             action: DecisionAction::Allow,
             reason: Some(format!("policy default warn: {reason}")),
+            severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
             remediation: Some(DIRECT_READ_REMEDIATION.to_owned()),
         },
         PolicyMode::Log => Decision {
             action: DecisionAction::Allow,
             reason: Some(format!("policy default log: {reason}")),
+            severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
             remediation: Some(DIRECT_READ_REMEDIATION.to_owned()),
         },
@@ -195,6 +198,7 @@ fn allow_silent() -> Decision {
     Decision {
         action: DecisionAction::Allow,
         reason: None,
+        severity: None,
         confidence: None,
         remediation: None,
     }
@@ -204,6 +208,7 @@ fn allow_with_context(reason: String, confidence: Option<f32>) -> Decision {
     Decision {
         action: DecisionAction::Allow,
         reason: Some(reason),
+        severity: None,
         confidence,
         remediation: None,
     }
@@ -213,6 +218,7 @@ fn fail_open(reason: String) -> Decision {
     Decision {
         action: DecisionAction::Allow,
         reason: Some(reason),
+        severity: None,
         confidence: None,
         remediation: None,
     }
@@ -261,6 +267,7 @@ mod tests {
 
         assert_eq!(decision.action, DecisionAction::Allow);
         assert_eq!(decision.reason, None);
+        assert_eq!(decision.severity, None);
         assert_eq!(decision.confidence, None);
     }
 
@@ -274,6 +281,7 @@ mod tests {
 
         assert_eq!(decision.action, DecisionAction::Allow);
         assert_eq!(decision.reason, None);
+        assert_eq!(decision.severity, None);
     }
 
     #[test]
@@ -285,6 +293,10 @@ mod tests {
         );
 
         assert_eq!(decision.action, DecisionAction::Deny);
+        assert_eq!(
+            decision.severity,
+            Some(crate::types::SensitivitySeverity::Critical)
+        );
         assert!(
             decision
                 .reason
@@ -309,6 +321,7 @@ mod tests {
         let decision = evaluate_access(&input, &fixture_config(), &PackRegistry::with_built_ins());
 
         assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.severity, None);
         assert!(
             decision
                 .reason
@@ -329,6 +342,7 @@ mod tests {
 
         assert_eq!(decision.action, DecisionAction::Allow);
         assert_eq!(decision.reason, None);
+        assert_eq!(decision.severity, None);
     }
 
     #[test]
@@ -337,6 +351,7 @@ mod tests {
         let decision = evaluate_access(&input, &fixture_config(), &PackRegistry::with_built_ins());
 
         assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.severity, None);
         assert!(
             decision
                 .reason
@@ -354,6 +369,7 @@ mod tests {
             });
 
         assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.severity, None);
         assert!(
             decision
                 .reason
@@ -370,6 +386,7 @@ mod tests {
             });
 
         assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.severity, None);
         assert!(
             decision
                 .reason

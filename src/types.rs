@@ -10,6 +10,7 @@ pub enum DecisionAction {
 pub struct Decision {
     pub action: DecisionAction,
     pub reason: Option<String>,
+    pub severity: Option<SensitivitySeverity>,
     pub confidence: Option<f32>,
     pub remediation: Option<String>,
 }
