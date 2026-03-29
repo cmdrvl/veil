@@ -38,6 +38,7 @@ pub struct HookInput {
     pub protocol: HookProtocol,
     pub tool: ToolKind,
     pub cwd: PathBuf,
+    pub session_id: Option<String>,
     pub raw_args: String,
 }
 

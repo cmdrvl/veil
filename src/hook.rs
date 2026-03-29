@@ -88,6 +88,7 @@ fn parse_snake_case_payload(
         protocol,
         tool: normalize_tool_kind(protocol, tool_name)?,
         cwd,
+        session_id: string_field(payload, "session_id").map(str::to_owned),
         raw_args,
     })
 }
@@ -104,6 +105,7 @@ fn parse_camel_case_payload(
         protocol,
         tool: normalize_tool_kind(protocol, tool_name)?,
         cwd,
+        session_id: None,
         raw_args,
     })
 }
@@ -209,6 +211,7 @@ mod tests {
         assert_eq!(parsed.protocol, HookProtocol::ClaudeCode);
         assert_eq!(parsed.tool, ToolKind::Read);
         assert_eq!(parsed.cwd, Path::new("/repo"));
+        assert_eq!(parsed.session_id.as_deref(), Some("abc123"));
         assert_eq!(parsed.raw_args, r#"{"file_path":"secret.txt"}"#);
     }
 
@@ -228,6 +231,7 @@ mod tests {
         assert_eq!(parsed.protocol, HookProtocol::GeminiCli);
         assert_eq!(parsed.tool, ToolKind::Read);
         assert_eq!(parsed.cwd, Path::new("/repo"));
+        assert_eq!(parsed.session_id.as_deref(), Some("gemini-session"));
         assert_eq!(
             serde_json::from_str::<Value>(&parsed.raw_args).expect("raw args should stay JSON"),
             serde_json::json!({
@@ -253,6 +257,7 @@ mod tests {
         assert_eq!(parsed.protocol, HookProtocol::GitHubCopilot);
         assert_eq!(parsed.tool, ToolKind::Read);
         assert_eq!(parsed.cwd, Path::new("/tmp"));
+        assert_eq!(parsed.session_id, None);
         assert_eq!(parsed.raw_args, r#"{"path":"docs/plan.md"}"#);
     }
 

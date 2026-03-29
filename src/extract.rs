@@ -86,8 +86,9 @@ fn extract_tokenized_bash_paths(command: &str, cwd: &Path) -> PathExtraction {
 }
 
 fn extract_read_path(raw_value: &Value, cwd: &Path) -> PathExtraction {
-    let Some(path) =
-        string_field(raw_value, "file_path").and_then(|path| normalize_path(path, cwd))
+    let Some(path) = string_field(raw_value, "file_path")
+        .or_else(|| string_field(raw_value, "path"))
+        .and_then(|path| normalize_path(path, cwd))
     else {
         return PathExtraction::none();
     };
