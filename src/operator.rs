@@ -12,10 +12,12 @@ use veil::allowlist::SafePathMatcher;
 use veil::config::{self, Config, PolicyMode};
 use veil::evaluator::{EvaluationInput, evaluate_access};
 use veil::extract::{PathExposure, extract_read_or_grep_paths};
-use veil::packs::PackRegistry;
+use veil::packs::{BUILTIN_PACK_NAMES, PackRegistry};
 use veil::types::{Decision, DecisionAction, SensitivityResult, ToolKind};
 
-use crate::cli::{AuditArgs, ConfigArgs, DoctorArgs, PathCommandArgs};
+use crate::cli::{
+    AuditArgs, ConfigArgs, DirCommandArgs, DoctorArgs, JsonOutputArgs, PathCommandArgs,
+};
 use crate::hooks;
 
 const RECENT_AUDIT_LIMIT: usize = 20;
@@ -78,6 +80,15 @@ pub fn run_test(args: &PathCommandArgs) -> Result<String, Box<dyn std::error::Er
 pub fn run_explain(args: &PathCommandArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
     render_explain_for_repo(&repo_root, &args.path, args.json)
+}
+
+pub fn run_scan(args: &DirCommandArgs) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = env::current_dir()?;
+    render_scan_for_repo(&repo_root, &args.dir, args.json)
+}
+
+pub fn run_packs(args: &JsonOutputArgs) -> Result<String, Box<dyn std::error::Error>> {
+    render_packs(args.json)
 }
 
 fn render_config_for_repo(
@@ -171,6 +182,54 @@ fn render_explain_for_repo(
         }))?)
     } else {
         Ok(render_explain_human(&inspection))
+    }
+}
+
+fn render_scan_for_repo(
+    repo_root: &Path,
+    dir: &Path,
+    json_output: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let scan_root = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        repo_root.join(dir)
+    };
+    let files = collect_scan_files(&scan_root)?;
+    let inspections = files
+        .into_iter()
+        .map(|path| {
+            let input_path = path
+                .strip_prefix(repo_root)
+                .map_or_else(|_| path.clone(), Path::to_path_buf);
+            inspect_path(repo_root, &input_path)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if json_output {
+        Ok(serde_json::to_string_pretty(&json!({
+            "root": scan_root.display().to_string(),
+            "files": inspections.iter().map(scan_entry_json).collect::<Vec<_>>(),
+        }))?)
+    } else {
+        Ok(render_scan_human(&scan_root, &inspections))
+    }
+}
+
+fn render_packs(json_output: bool) -> Result<String, Box<dyn std::error::Error>> {
+    let inventory = built_in_pack_inventory();
+
+    if json_output {
+        Ok(serde_json::to_string_pretty(&json!({
+            "packs": inventory.iter().map(|(name, description)| {
+                json!({
+                    "name": name,
+                    "description": description,
+                })
+            }).collect::<Vec<_>>(),
+        }))?)
+    } else {
+        Ok(render_packs_human(&inventory))
     }
 }
 
@@ -554,6 +613,41 @@ fn render_explain_human(inspection: &PathInspection) -> String {
     output.trim_end().to_owned()
 }
 
+fn render_scan_human(scan_root: &Path, inspections: &[PathInspection]) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Scan");
+    let _ = writeln!(output, "  root: {}", scan_root.display());
+    let _ = writeln!(output, "  files: {}", inspections.len());
+
+    if inspections.is_empty() {
+        output.push_str("  results:\n    - (none)\n");
+        return output.trim_end().to_owned();
+    }
+
+    output.push_str("  results:\n");
+    for inspection in inspections {
+        let _ = writeln!(
+            output,
+            "    - {} {} [{}]",
+            decision_action_name(&inspection.decision.action),
+            inspection.input_path,
+            inspection.match_kind()
+        );
+    }
+
+    output.trim_end().to_owned()
+}
+
+fn render_packs_human(inventory: &[(&'static str, &'static str)]) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Packs");
+    for (name, description) in inventory {
+        let _ = writeln!(output, "  - {name}: {description}");
+    }
+
+    output.trim_end().to_owned()
+}
+
 fn inspect_path(
     repo_root: &Path,
     raw_path: &Path,
@@ -603,6 +697,38 @@ fn normalize_cli_path(raw_path: &Path, cwd: &Path) -> Option<PathBuf> {
     extraction.candidates.into_iter().next()
 }
 
+fn collect_scan_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_scan_files_into(root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_scan_files_into(root: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+    if root.is_file() {
+        files.push(root.to_path_buf());
+        return Ok(());
+    }
+
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_scan_files_into(&path, files)?;
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
 fn first_matching_pattern<'a>(patterns: &'a [String], path: &Path) -> Option<&'a str> {
     patterns.iter().find_map(|pattern| {
         SafePathMatcher::from_patterns([pattern.as_str()])
@@ -615,6 +741,7 @@ fn decision_json(decision: &Decision) -> Value {
     json!({
         "action": decision_action_name(&decision.action),
         "reason": decision.reason,
+        "severity": decision.severity.as_ref().map(severity_name),
         "confidence": decision.confidence,
         "remediation": decision.remediation,
     })
@@ -641,6 +768,45 @@ fn severity_name(severity: &veil::types::SensitivitySeverity) -> &'static str {
         veil::types::SensitivitySeverity::Medium => "medium",
         veil::types::SensitivitySeverity::High => "high",
         veil::types::SensitivitySeverity::Critical => "critical",
+    }
+}
+
+fn scan_entry_json(inspection: &PathInspection) -> Value {
+    json!({
+        "input_path": inspection.input_path,
+        "normalized_path": inspection.normalized_path.display().to_string(),
+        "match": {
+            "kind": inspection.match_kind(),
+            "allowlist_pattern": inspection.allowlist_pattern,
+            "protected_pattern": inspection.protected_pattern,
+            "pack": inspection.sensitivity.as_ref().map(|value| value.pack.clone()),
+            "severity": inspection.sensitivity.as_ref().map(|value| severity_name(&value.severity)),
+            "confidence": inspection.sensitivity.as_ref().map(|value| value.confidence),
+            "directory_sensitive": inspection.sensitivity.as_ref().map(|value| value.directory_sensitive),
+        },
+        "decision": decision_json(&inspection.decision),
+    })
+}
+
+fn built_in_pack_inventory() -> Vec<(&'static str, &'static str)> {
+    BUILTIN_PACK_NAMES
+        .iter()
+        .copied()
+        .map(|name| (name, pack_description(name)))
+        .collect()
+}
+
+fn pack_description(name: &str) -> &'static str {
+    match name {
+        "core.filesystem" => "common secret-bearing filesystem paths",
+        "core.credentials" => "credentials-bearing config and token targets",
+        "data.tabular" => "protected-directory CSV, TSV, and parquet data",
+        "data.xml" => "protected-directory XML filing artifacts",
+        "data.database" => "database files and dump-style artifacts",
+        "compliance.financial" => "financial records and holdings-style artifacts",
+        "compliance.pii" => "personally identifying data artifacts",
+        "compliance.hipaa" => "health-record artifacts",
+        _ => "built-in sensitivity pack",
     }
 }
 
@@ -881,5 +1047,90 @@ mod tests {
         assert_eq!(value["match"]["kind"], "allowlist");
         assert_eq!(value["match"]["allowlist_pattern"], "*.md");
         assert_eq!(value["decision"]["action"], "allow");
+    }
+
+    #[test]
+    fn scan_command_human_output_reports_sensitive_and_non_sensitive_examples() {
+        let repo_root = unique_temp_dir("scan-human");
+        write_file(
+            &repo_root.join(".veil.toml"),
+            r#"
+            [sensitivity]
+            protected = ["protected/**"]
+            "#,
+        );
+        write_file(&repo_root.join("README.md"), "# docs");
+        write_file(&repo_root.join("protected/holdings.csv"), "fund,value");
+
+        let rendered =
+            render_scan_for_repo(&repo_root, Path::new("."), false).expect("scan should render");
+
+        assert!(rendered.contains("Scan"));
+        assert!(rendered.contains("allow README.md [allowlist]"));
+        assert!(rendered.contains("deny protected/holdings.csv [pack]"));
+    }
+
+    #[test]
+    fn scan_command_json_output_lists_classified_files() {
+        let repo_root = unique_temp_dir("scan-json");
+        write_file(
+            &repo_root.join(".veil.toml"),
+            r#"
+            [sensitivity]
+            protected = ["protected/**"]
+            "#,
+        );
+        write_file(&repo_root.join("README.md"), "# docs");
+        write_file(&repo_root.join("protected/holdings.csv"), "fund,value");
+
+        let value: Value = serde_json::from_str(
+            &render_scan_for_repo(&repo_root, Path::new("."), true)
+                .expect("scan JSON should render"),
+        )
+        .expect("scan JSON should parse");
+
+        assert_eq!(value["files"].as_array().map(Vec::len), Some(3));
+        assert!(
+            value["files"]
+                .as_array()
+                .expect("files should be an array")
+                .iter()
+                .any(|entry| entry["match"]["pack"] == "data.tabular")
+        );
+        assert!(
+            value["files"]
+                .as_array()
+                .expect("files should be an array")
+                .iter()
+                .any(|entry| entry["decision"]["action"] == "allow")
+        );
+    }
+
+    #[test]
+    fn packs_command_human_output_lists_builtin_packs() {
+        let rendered = render_packs(false).expect("packs rendering should succeed");
+
+        assert!(rendered.contains("Packs"));
+        assert!(rendered.contains("core.filesystem"));
+        assert!(rendered.contains("data.xml"));
+    }
+
+    #[test]
+    fn packs_command_json_output_lists_builtin_inventory() {
+        let value: Value =
+            serde_json::from_str(&render_packs(true).expect("packs JSON should render"))
+                .expect("packs JSON should parse");
+
+        assert_eq!(
+            value["packs"].as_array().map(Vec::len),
+            Some(BUILTIN_PACK_NAMES.len())
+        );
+        assert!(
+            value["packs"]
+                .as_array()
+                .expect("packs should be an array")
+                .iter()
+                .any(|entry| entry["name"] == "compliance.hipaa")
+        );
     }
 }

@@ -41,12 +41,25 @@ pub struct PathCommandArgs {
     pub json: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct DirCommandArgs {
+    pub dir: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct JsonOutputArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum OperatorCommand {
     Test(PathCommandArgs),
     Explain(PathCommandArgs),
-    Scan { dir: PathBuf },
-    Packs,
+    Scan(DirCommandArgs),
+    Packs(JsonOutputArgs),
     Config(ConfigArgs),
     Audit(AuditArgs),
     Doctor(DoctorArgs),
@@ -79,22 +92,6 @@ where
     T: Into<OsString> + Clone,
 {
     Cli::try_parse_from(args).map(Cli::dispatch)
-}
-
-impl OperatorCommand {
-    pub fn as_name(&self) -> &'static str {
-        match self {
-            Self::Test { .. } => "test",
-            Self::Explain { .. } => "explain",
-            Self::Scan { .. } => "scan",
-            Self::Packs => "packs",
-            Self::Config(_) => "config",
-            Self::Audit(_) => "audit",
-            Self::Doctor(_) => "doctor",
-            Self::Install => "install",
-            Self::Uninstall => "uninstall",
-        }
-    }
 }
 
 #[cfg(test)]
@@ -137,16 +134,20 @@ mod tests {
     fn scan_subcommand_selects_expected_variant() {
         assert_eq!(
             parse(&["veil", "scan", "fixtures"]),
-            Dispatch::Operator(OperatorCommand::Scan {
+            Dispatch::Operator(OperatorCommand::Scan(DirCommandArgs {
                 dir: PathBuf::from("fixtures"),
-            })
+                json: false,
+            }))
         );
     }
 
     #[test]
     fn flag_only_subcommands_select_expected_variants() {
         for (name, command) in [
-            ("packs", OperatorCommand::Packs),
+            (
+                "packs",
+                OperatorCommand::Packs(JsonOutputArgs { json: false }),
+            ),
             (
                 "config",
                 OperatorCommand::Config(ConfigArgs { json: false }),
@@ -236,6 +237,25 @@ mod tests {
                 path: PathBuf::from("fixtures/sample.txt"),
                 json: true,
             }))
+        );
+    }
+
+    #[test]
+    fn scan_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "scan", "fixtures", "--json"]),
+            Dispatch::Operator(OperatorCommand::Scan(DirCommandArgs {
+                dir: PathBuf::from("fixtures"),
+                json: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn packs_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "packs", "--json"]),
+            Dispatch::Operator(OperatorCommand::Packs(JsonOutputArgs { json: true }))
         );
     }
 }

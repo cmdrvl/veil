@@ -34,6 +34,14 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             println!("{}", operator::run_explain(&args)?);
             Ok(0)
         }
+        cli::OperatorCommand::Scan(args) => {
+            println!("{}", operator::run_scan(&args)?);
+            Ok(0)
+        }
+        cli::OperatorCommand::Packs(args) => {
+            println!("{}", operator::run_packs(&args)?);
+            Ok(0)
+        }
         cli::OperatorCommand::Config(args) => {
             println!("{}", operator::run_config(&args)?);
             Ok(0)
@@ -56,6 +64,5 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             println!("Removed veil hooks from {}", path.display());
             Ok(0)
         }
-        command => Err(format!("`veil {}` is not implemented yet", command.as_name()).into()),
     }
 }
