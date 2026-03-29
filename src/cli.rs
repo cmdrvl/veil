@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -16,15 +16,33 @@ pub struct Cli {
     command: Option<OperatorCommand>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct ConfigArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct AuditArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct DoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum OperatorCommand {
     Test { path: PathBuf },
     Explain { path: PathBuf },
     Scan { dir: PathBuf },
     Packs,
-    Config,
-    Audit,
-    Doctor,
+    Config(ConfigArgs),
+    Audit(AuditArgs),
+    Doctor(DoctorArgs),
     Install,
     Uninstall,
 }
@@ -63,9 +81,9 @@ impl OperatorCommand {
             Self::Explain { .. } => "explain",
             Self::Scan { .. } => "scan",
             Self::Packs => "packs",
-            Self::Config => "config",
-            Self::Audit => "audit",
-            Self::Doctor => "doctor",
+            Self::Config(_) => "config",
+            Self::Audit(_) => "audit",
+            Self::Doctor(_) => "doctor",
             Self::Install => "install",
             Self::Uninstall => "uninstall",
         }
@@ -120,9 +138,15 @@ mod tests {
     fn flag_only_subcommands_select_expected_variants() {
         for (name, command) in [
             ("packs", OperatorCommand::Packs),
-            ("config", OperatorCommand::Config),
-            ("audit", OperatorCommand::Audit),
-            ("doctor", OperatorCommand::Doctor),
+            (
+                "config",
+                OperatorCommand::Config(ConfigArgs { json: false }),
+            ),
+            ("audit", OperatorCommand::Audit(AuditArgs { json: false })),
+            (
+                "doctor",
+                OperatorCommand::Doctor(DoctorArgs { json: false }),
+            ),
             ("install", OperatorCommand::Install),
             ("uninstall", OperatorCommand::Uninstall),
         ] {
@@ -158,5 +182,29 @@ mod tests {
                 "expected help output to mention `{name}`"
             );
         }
+    }
+
+    #[test]
+    fn config_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "config", "--json"]),
+            Dispatch::Operator(OperatorCommand::Config(ConfigArgs { json: true }))
+        );
+    }
+
+    #[test]
+    fn audit_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "audit", "--json"]),
+            Dispatch::Operator(OperatorCommand::Audit(AuditArgs { json: true }))
+        );
+    }
+
+    #[test]
+    fn doctor_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "doctor", "--json"]),
+            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs { json: true }))
+        );
     }
 }

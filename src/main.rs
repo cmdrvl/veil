@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 mod cli;
 mod hooks;
+mod operator;
 
 fn main() -> ExitCode {
     match dispatch() {
@@ -25,6 +26,18 @@ fn dispatch() -> Result<u8, Box<dyn std::error::Error>> {
 
 fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::error::Error>> {
     match command {
+        cli::OperatorCommand::Config(args) => {
+            println!("{}", operator::run_config(&args)?);
+            Ok(0)
+        }
+        cli::OperatorCommand::Audit(args) => {
+            println!("{}", operator::run_audit(&args)?);
+            Ok(0)
+        }
+        cli::OperatorCommand::Doctor(args) => {
+            println!("{}", operator::run_doctor(&args)?);
+            Ok(0)
+        }
         cli::OperatorCommand::Install => {
             let path = hooks::install_default()?;
             println!("Installed veil hooks in {}", path.display());

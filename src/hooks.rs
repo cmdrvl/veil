@@ -21,11 +21,24 @@ pub fn uninstall_default() -> io::Result<PathBuf> {
     Ok(settings_path)
 }
 
-fn default_settings_path() -> io::Result<PathBuf> {
+pub(crate) fn default_settings_path() -> io::Result<PathBuf> {
     default_settings_path_from(
         std::env::var_os(SETTINGS_OVERRIDE_ENV),
         std::env::var_os("HOME"),
     )
+}
+
+pub(crate) fn has_managed_hooks(path: &Path) -> io::Result<bool> {
+    let mut settings = load_settings(path)?;
+    let entries = pre_tool_use_entries(&mut settings);
+
+    Ok(MANAGED_MATCHERS.iter().all(|matcher| {
+        entries
+            .iter()
+            .find(|entry| matcher_matches(entry, matcher))
+            .and_then(|entry| entry.get("hooks").and_then(Value::as_array))
+            .is_some_and(|hooks| hooks.iter().any(is_veil_hook))
+    }))
 }
 
 fn default_settings_path_from(
@@ -334,6 +347,51 @@ mod tests {
             default_settings_path_from(Some(override_path.clone().into_os_string()), None)
                 .expect("override env should be honored"),
             override_path
+        );
+    }
+
+    #[test]
+    fn managed_hook_probe_requires_all_matchers() {
+        let path = temp_settings_path("managed-hooks-missing");
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook()] },
+                        { "matcher": "Bash", "hooks": [veil_hook()] }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        assert!(
+            !has_managed_hooks(&path).expect("managed hook probe should succeed"),
+            "all managed matchers must be present"
+        );
+    }
+
+    #[test]
+    fn managed_hook_probe_accepts_fully_installed_settings() {
+        let path = temp_settings_path("managed-hooks-present");
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook()] },
+                        { "matcher": "Grep", "hooks": [veil_hook()] },
+                        { "matcher": "Bash", "hooks": [veil_hook()] }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        assert!(
+            has_managed_hooks(&path).expect("managed hook probe should succeed"),
+            "all managed matchers are installed"
         );
     }
 }
