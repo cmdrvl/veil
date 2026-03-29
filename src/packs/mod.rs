@@ -17,9 +17,13 @@ pub const BUILTIN_PACK_NAMES: &[&str] = &[
 ];
 
 const FILESYSTEM_CONFIDENCE: f32 = 0.99;
+const CREDENTIALS_CONFIDENCE: f32 = 0.99;
 const DATABASE_CONFIDENCE: f32 = 0.97;
 const TABULAR_CONFIDENCE: f32 = 0.95;
 const XML_CONFIDENCE: f32 = 0.94;
+const FINANCIAL_CONFIDENCE: f32 = 0.96;
+const PII_CONFIDENCE: f32 = 0.97;
+const HIPAA_CONFIDENCE: f32 = 0.98;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClassificationRequest<'a> {
@@ -132,9 +136,13 @@ pub fn built_in_packs() -> Vec<Box<dyn SensitivityPack>> {
         .copied()
         .map(|name| match name {
             "core.filesystem" => Box::new(FilesystemPack) as Box<dyn SensitivityPack>,
+            "core.credentials" => Box::new(CredentialsPack) as Box<dyn SensitivityPack>,
             "data.tabular" => Box::new(TabularPack) as Box<dyn SensitivityPack>,
             "data.xml" => Box::new(XmlPack) as Box<dyn SensitivityPack>,
             "data.database" => Box::new(DatabasePack) as Box<dyn SensitivityPack>,
+            "compliance.financial" => Box::new(FinancialPack) as Box<dyn SensitivityPack>,
+            "compliance.pii" => Box::new(PiiPack) as Box<dyn SensitivityPack>,
+            "compliance.hipaa" => Box::new(HipaaPack) as Box<dyn SensitivityPack>,
             _ => Box::new(NoopPack::new(name)) as Box<dyn SensitivityPack>,
         })
         .collect()
@@ -207,6 +215,30 @@ impl SensitivityPack for FilesystemPack {
 }
 
 #[derive(Debug)]
+struct CredentialsPack;
+
+impl SensitivityPack for CredentialsPack {
+    fn name(&self) -> &str {
+        "core.credentials"
+    }
+
+    fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
+        let path = PathView::new(request.path);
+        let basename = path.basename()?;
+
+        if is_credentials_file(&path, basename) {
+            return Some(PackMatch {
+                severity: SensitivitySeverity::Critical,
+                confidence: CREDENTIALS_CONFIDENCE,
+                directory_sensitive: false,
+            });
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
 struct DatabasePack;
 
 impl SensitivityPack for DatabasePack {
@@ -222,6 +254,78 @@ impl SensitivityPack for DatabasePack {
             return Some(PackMatch {
                 severity: SensitivitySeverity::High,
                 confidence: DATABASE_CONFIDENCE,
+                directory_sensitive: false,
+            });
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
+struct FinancialPack;
+
+impl SensitivityPack for FinancialPack {
+    fn name(&self) -> &str {
+        "compliance.financial"
+    }
+
+    fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
+        let path = PathView::new(request.path);
+        let basename = path.basename()?;
+
+        if is_financial_file(&path, basename) {
+            return Some(PackMatch {
+                severity: SensitivitySeverity::High,
+                confidence: FINANCIAL_CONFIDENCE,
+                directory_sensitive: false,
+            });
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
+struct PiiPack;
+
+impl SensitivityPack for PiiPack {
+    fn name(&self) -> &str {
+        "compliance.pii"
+    }
+
+    fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
+        let path = PathView::new(request.path);
+        let basename = path.basename()?;
+
+        if is_pii_file(&path, basename) {
+            return Some(PackMatch {
+                severity: SensitivitySeverity::High,
+                confidence: PII_CONFIDENCE,
+                directory_sensitive: false,
+            });
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
+struct HipaaPack;
+
+impl SensitivityPack for HipaaPack {
+    fn name(&self) -> &str {
+        "compliance.hipaa"
+    }
+
+    fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
+        let path = PathView::new(request.path);
+        let basename = path.basename()?;
+
+        if is_hipaa_file(&path, basename) {
+            return Some(PackMatch {
+                severity: SensitivitySeverity::Critical,
+                confidence: HIPAA_CONFIDENCE,
                 directory_sensitive: false,
             });
         }
@@ -311,6 +415,27 @@ impl PathView {
     fn contains_component(&self, needle: &str) -> bool {
         self.components.iter().any(|component| component == needle)
     }
+
+    fn has_term(&self, needle: &str) -> bool {
+        self.components
+            .iter()
+            .flat_map(|component| component_terms(component))
+            .any(|term| term == needle)
+    }
+
+    fn has_any_term(&self, needles: &[&str]) -> bool {
+        needles.iter().any(|needle| self.has_term(needle))
+    }
+
+    fn has_all_terms(&self, needles: &[&str]) -> bool {
+        needles.iter().all(|needle| self.has_term(needle))
+    }
+}
+
+fn component_terms(component: &str) -> impl Iterator<Item = &str> {
+    component
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|term| !term.is_empty())
 }
 
 fn is_sensitive_env_file(basename: &str) -> bool {
@@ -356,16 +481,103 @@ fn matches_database_dump_suffix(basename: &str) -> bool {
                 || basename.contains("snapshot")))
 }
 
+fn is_credentials_file(path: &PathView, basename: &str) -> bool {
+    const EXACT_CREDENTIAL_FILES: &[&str] = &[
+        ".aws/credentials",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "credentials",
+        "service-account.json",
+        "service_account.json",
+    ];
+
+    if EXACT_CREDENTIAL_FILES
+        .iter()
+        .any(|candidate| basename == *candidate || path.components.join("/") == *candidate)
+    {
+        return true;
+    }
+
+    is_config_like_file(basename)
+        && (path.has_any_term(&["credential", "credentials", "secret", "secrets"])
+            || path.has_all_terms(&["access", "token"])
+            || path.has_all_terms(&["refresh", "token"])
+            || path.has_all_terms(&["oauth", "token"])
+            || path.has_all_terms(&["api", "key"])
+            || path.has_all_terms(&["service", "account"])
+            || path.has_all_terms(&["database", "url"])
+            || path.has_all_terms(&["db", "url"]))
+}
+
 fn is_tabular_file(basename: &str) -> bool {
     matches!(file_extension(basename), Some("csv" | "tsv" | "parquet"))
         || basename.ends_with(".csv.gz")
         || basename.ends_with(".tsv.gz")
 }
 
+fn is_financial_file(path: &PathView, basename: &str) -> bool {
+    is_structured_data_file(basename)
+        && (path.has_any_term(&["trade", "trades", "transaction", "transactions", "ledger"])
+            || path.has_all_terms(&["fund", "holding"])
+            || path.has_all_terms(&["fund", "holdings"])
+            || path.has_all_terms(&["portfolio", "holding"])
+            || path.has_all_terms(&["portfolio", "holdings"])
+            || path.has_all_terms(&["fund", "nav"])
+            || path.has_all_terms(&["portfolio", "nav"])
+            || path.has_all_terms(&["portfolio", "position"])
+            || path.has_all_terms(&["portfolio", "positions"]))
+}
+
+fn is_pii_file(path: &PathView, basename: &str) -> bool {
+    is_structured_data_file(basename)
+        && (path.has_any_term(&[
+            "ssn",
+            "passport",
+            "pii",
+            "dob",
+            "birthdate",
+            "taxpayer",
+            "taxid",
+        ]) || path.has_all_terms(&["driver", "license"]))
+}
+
+fn is_hipaa_file(path: &PathView, basename: &str) -> bool {
+    is_structured_data_file(basename)
+        && path.has_any_term(&[
+            "hipaa",
+            "phi",
+            "patient",
+            "patients",
+            "medical",
+            "clinical",
+            "diagnosis",
+            "diagnoses",
+            "treatment",
+            "treatments",
+        ])
+}
+
 fn is_xml_filing_file(basename: &str) -> bool {
     matches!(file_extension(basename), Some("xml"))
         || basename.ends_with(".xml.gz")
         || basename.ends_with(".nport")
+}
+
+fn is_config_like_file(basename: &str) -> bool {
+    matches!(
+        file_extension(basename),
+        Some("json" | "yaml" | "yml" | "toml" | "ini" | "conf" | "env")
+    )
+}
+
+fn is_structured_data_file(basename: &str) -> bool {
+    matches!(
+        file_extension(basename),
+        Some("csv" | "tsv" | "parquet" | "json" | "jsonl" | "xlsx" | "xls" | "xml")
+    ) || basename.ends_with(".csv.gz")
+        || basename.ends_with(".tsv.gz")
+        || basename.ends_with(".xml.gz")
 }
 
 #[cfg(test)]
@@ -599,6 +811,47 @@ mod tests {
     }
 
     #[test]
+    fn credentials_pack_matches_secret_bearing_config_paths() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "config/credentials.json",
+            "secrets/service-account.yaml",
+            ".aws/credentials",
+            "oauth/access_token.toml",
+        ] {
+            let result = registry
+                .classify(path, false)
+                .expect("credentials-bearing config path should match");
+
+            assert_eq!(result.pack, "core.credentials");
+            assert_eq!(result.severity, SensitivitySeverity::Critical);
+            assert!((result.confidence - CREDENTIALS_CONFIDENCE).abs() < f32::EPSILON);
+            assert!(!result.directory_sensitive);
+        }
+    }
+
+    #[test]
+    fn credentials_pack_skips_docs_and_source_files() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "docs/credentials.md",
+            "src/tokenizer.rs",
+            "examples/service_account.rs",
+            "docs/secrets.yaml.example",
+        ] {
+            assert_ne!(
+                registry
+                    .classify(path, false)
+                    .as_ref()
+                    .map(|result| result.pack.as_str()),
+                Some("core.credentials"),
+            );
+        }
+    }
+
+    #[test]
     fn database_pack_matches_global_database_artifacts() {
         let registry = PackRegistry::with_built_ins();
 
@@ -655,6 +908,119 @@ mod tests {
         assert_eq!(direct_match, protected_match);
         assert_eq!(direct_match.pack, "data.database");
         assert!(!direct_match.directory_sensitive);
+    }
+
+    #[test]
+    fn financial_pack_matches_financial_data_artifacts() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "fund/holdings_2026.csv",
+            "trades/daily_trades.parquet",
+            "reports/nav_ledger.xlsx",
+        ] {
+            let result = registry
+                .classify(path, false)
+                .expect("financial data path should match");
+
+            assert_eq!(result.pack, "compliance.financial");
+            assert_eq!(result.severity, SensitivitySeverity::High);
+            assert!((result.confidence - FINANCIAL_CONFIDENCE).abs() < f32::EPSILON);
+            assert!(!result.directory_sensitive);
+        }
+    }
+
+    #[test]
+    fn financial_pack_skips_safe_lookalikes() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "docs/financial-report.md",
+            "src/trade.rs",
+            "notes/portfolio.txt",
+        ] {
+            assert_ne!(
+                registry
+                    .classify(path, false)
+                    .as_ref()
+                    .map(|result| result.pack.as_str()),
+                Some("compliance.financial"),
+            );
+        }
+    }
+
+    #[test]
+    fn pii_pack_matches_personal_data_artifacts() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "exports/customer_ssn.csv",
+            "records/passport_index.json",
+            "hr/employee_dob.xlsx",
+        ] {
+            let result = registry
+                .classify(path, false)
+                .expect("PII-style path should match");
+
+            assert_eq!(result.pack, "compliance.pii");
+            assert_eq!(result.severity, SensitivitySeverity::High);
+            assert!((result.confidence - PII_CONFIDENCE).abs() < f32::EPSILON);
+            assert!(!result.directory_sensitive);
+        }
+    }
+
+    #[test]
+    fn pii_pack_skips_safe_lookalikes() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in ["docs/passport.md", "src/pii.rs", "notes/taxpayer.txt"] {
+            assert_ne!(
+                registry
+                    .classify(path, false)
+                    .as_ref()
+                    .map(|result| result.pack.as_str()),
+                Some("compliance.pii"),
+            );
+        }
+    }
+
+    #[test]
+    fn hipaa_pack_matches_health_record_artifacts() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "hipaa/patient_diagnosis.csv",
+            "clinical/treatment_plan.json",
+            "medical/patient_records.parquet",
+        ] {
+            let result = registry
+                .classify(path, false)
+                .expect("HIPAA-style path should match");
+
+            assert_eq!(result.pack, "compliance.hipaa");
+            assert_eq!(result.severity, SensitivitySeverity::Critical);
+            assert!((result.confidence - HIPAA_CONFIDENCE).abs() < f32::EPSILON);
+            assert!(!result.directory_sensitive);
+        }
+    }
+
+    #[test]
+    fn hipaa_pack_skips_safe_lookalikes() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "docs/hipaa.md",
+            "src/patient.rs",
+            "notes/medical-device.txt",
+        ] {
+            assert_ne!(
+                registry
+                    .classify(path, false)
+                    .as_ref()
+                    .map(|result| result.pack.as_str()),
+                Some("compliance.hipaa"),
+            );
+        }
     }
 
     #[test]
@@ -762,5 +1128,18 @@ mod tests {
                 Some("data.xml"),
             );
         }
+    }
+
+    #[test]
+    fn more_specific_heuristic_pack_beats_generic_tabular_match() {
+        let registry = PackRegistry::with_built_ins();
+
+        let result = registry
+            .classify("protected/fund_holdings.csv", true)
+            .expect("overlapping path should still classify deterministically");
+
+        assert_eq!(result.pack, "compliance.financial");
+        assert_eq!(result.severity, SensitivitySeverity::High);
+        assert!((result.confidence - FINANCIAL_CONFIDENCE).abs() < f32::EPSILON);
     }
 }
