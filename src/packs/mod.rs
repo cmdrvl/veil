@@ -18,6 +18,8 @@ pub const BUILTIN_PACK_NAMES: &[&str] = &[
 
 const FILESYSTEM_CONFIDENCE: f32 = 0.99;
 const DATABASE_CONFIDENCE: f32 = 0.97;
+const TABULAR_CONFIDENCE: f32 = 0.95;
+const XML_CONFIDENCE: f32 = 0.94;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClassificationRequest<'a> {
@@ -130,6 +132,8 @@ pub fn built_in_packs() -> Vec<Box<dyn SensitivityPack>> {
         .copied()
         .map(|name| match name {
             "core.filesystem" => Box::new(FilesystemPack) as Box<dyn SensitivityPack>,
+            "data.tabular" => Box::new(TabularPack) as Box<dyn SensitivityPack>,
+            "data.xml" => Box::new(XmlPack) as Box<dyn SensitivityPack>,
             "data.database" => Box::new(DatabasePack) as Box<dyn SensitivityPack>,
             _ => Box::new(NoopPack::new(name)) as Box<dyn SensitivityPack>,
         })
@@ -227,6 +231,62 @@ impl SensitivityPack for DatabasePack {
 }
 
 #[derive(Debug)]
+struct TabularPack;
+
+impl SensitivityPack for TabularPack {
+    fn name(&self) -> &str {
+        "data.tabular"
+    }
+
+    fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
+        if !request.directory_sensitive {
+            return None;
+        }
+
+        let path = PathView::new(request.path);
+        let basename = path.basename()?;
+
+        if is_tabular_file(basename) {
+            return Some(PackMatch {
+                severity: SensitivitySeverity::High,
+                confidence: TABULAR_CONFIDENCE,
+                directory_sensitive: true,
+            });
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
+struct XmlPack;
+
+impl SensitivityPack for XmlPack {
+    fn name(&self) -> &str {
+        "data.xml"
+    }
+
+    fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
+        if !request.directory_sensitive {
+            return None;
+        }
+
+        let path = PathView::new(request.path);
+        let basename = path.basename()?;
+
+        if is_xml_filing_file(basename) {
+            return Some(PackMatch {
+                severity: SensitivitySeverity::High,
+                confidence: XML_CONFIDENCE,
+                directory_sensitive: true,
+            });
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
 struct PathView {
     components: Vec<String>,
 }
@@ -294,6 +354,18 @@ fn matches_database_dump_suffix(basename: &str) -> bool {
             && (basename.contains("dump")
                 || basename.contains("backup")
                 || basename.contains("snapshot")))
+}
+
+fn is_tabular_file(basename: &str) -> bool {
+    matches!(file_extension(basename), Some("csv" | "tsv" | "parquet"))
+        || basename.ends_with(".csv.gz")
+        || basename.ends_with(".tsv.gz")
+}
+
+fn is_xml_filing_file(basename: &str) -> bool {
+    matches!(file_extension(basename), Some("xml"))
+        || basename.ends_with(".xml.gz")
+        || basename.ends_with(".nport")
 }
 
 #[cfg(test)]
@@ -583,5 +655,112 @@ mod tests {
         assert_eq!(direct_match, protected_match);
         assert_eq!(direct_match.pack, "data.database");
         assert!(!direct_match.directory_sensitive);
+    }
+
+    #[test]
+    fn tabular_pack_requires_directory_sensitive_input() {
+        let registry = PackRegistry::with_built_ins();
+
+        assert_eq!(registry.classify("protected/holdings.csv", false), None);
+
+        let result = registry
+            .classify("protected/holdings.csv", true)
+            .expect("protected tabular file should match");
+
+        assert_eq!(result.pack, "data.tabular");
+        assert_eq!(result.severity, SensitivitySeverity::High);
+        assert!((result.confidence - TABULAR_CONFIDENCE).abs() < f32::EPSILON);
+        assert!(result.directory_sensitive);
+    }
+
+    #[test]
+    fn tabular_pack_matches_protected_directory_data_files() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "protected/holdings.csv",
+            "protected/nav.tsv",
+            "protected/snapshots/report.parquet",
+            "protected/exports/report.csv.gz",
+        ] {
+            let result = registry
+                .classify(path, true)
+                .expect("protected-directory tabular file should match");
+
+            assert_eq!(result.pack, "data.tabular");
+            assert!(result.directory_sensitive);
+        }
+    }
+
+    #[test]
+    fn tabular_pack_skips_non_tabular_paths_in_protected_directories() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "protected/readme.md",
+            "protected/schema.sql",
+            "protected/report.json",
+        ] {
+            assert_ne!(
+                registry
+                    .classify(path, true)
+                    .as_ref()
+                    .map(|result| result.pack.as_str()),
+                Some("data.tabular"),
+            );
+        }
+    }
+
+    #[test]
+    fn xml_pack_requires_directory_sensitive_input() {
+        let registry = PackRegistry::with_built_ins();
+
+        assert_eq!(registry.classify("protected/nport/report.xml", false), None);
+
+        let result = registry
+            .classify("protected/nport/report.xml", true)
+            .expect("protected XML filing should match");
+
+        assert_eq!(result.pack, "data.xml");
+        assert_eq!(result.severity, SensitivitySeverity::High);
+        assert!((result.confidence - XML_CONFIDENCE).abs() < f32::EPSILON);
+        assert!(result.directory_sensitive);
+    }
+
+    #[test]
+    fn xml_pack_matches_protected_directory_filing_paths() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "protected/edgar/submission.xml",
+            "protected/nport/filing.xml.gz",
+            "protected/edgar/report.nport",
+        ] {
+            let result = registry
+                .classify(path, true)
+                .expect("protected XML-style filing should match");
+
+            assert_eq!(result.pack, "data.xml");
+            assert!(result.directory_sensitive);
+        }
+    }
+
+    #[test]
+    fn xml_pack_skips_non_xml_protected_directory_paths() {
+        let registry = PackRegistry::with_built_ins();
+
+        for path in [
+            "protected/edgar/readme.md",
+            "protected/edgar/report.csv",
+            "protected/edgar/summary.json",
+        ] {
+            assert_ne!(
+                registry
+                    .classify(path, true)
+                    .as_ref()
+                    .map(|result| result.pack.as_str()),
+                Some("data.xml"),
+            );
+        }
     }
 }
