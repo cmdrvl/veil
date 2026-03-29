@@ -262,7 +262,7 @@ fn is_sensitive_env_file(basename: &str) -> bool {
         return false;
     };
 
-    !matches!(suffix, "example" | "sample" | "template")
+    !suffix.is_empty() && !matches!(suffix, "example" | "sample" | "template")
 }
 
 fn is_database_file(basename: &str) -> bool {
@@ -291,7 +291,9 @@ fn matches_database_dump_suffix(basename: &str) -> bool {
         .iter()
         .any(|suffix| basename.ends_with(suffix))
         || (basename.ends_with(".sql")
-            && (basename.contains("dump") || basename.contains("backup")))
+            && (basename.contains("dump")
+                || basename.contains("backup")
+                || basename.contains("snapshot")))
 }
 
 #[cfg(test)]
@@ -507,6 +509,7 @@ mod tests {
         let registry = PackRegistry::with_built_ins();
 
         for path in [
+            ".env.",
             ".env.example",
             ".env.sample",
             "docs/environment.md",
@@ -533,6 +536,7 @@ mod tests {
             "backups/customer.dump",
             "exports/prod.sql.gz",
             "exports/database_backup.sql",
+            "exports/customer_snapshot.sql",
         ] {
             let result = registry
                 .classify(path, false)
@@ -563,5 +567,21 @@ mod tests {
                 Some("data.database"),
             );
         }
+    }
+
+    #[test]
+    fn database_pack_remains_global_when_directory_sensitive_input_is_true() {
+        let registry = PackRegistry::with_built_ins();
+
+        let direct_match = registry
+            .classify("warehouse/report.duckdb", false)
+            .expect("database artifact should match without directory sensitivity");
+        let protected_match = registry
+            .classify("warehouse/report.duckdb", true)
+            .expect("database artifact should match with directory sensitivity");
+
+        assert_eq!(direct_match, protected_match);
+        assert_eq!(direct_match.pack, "data.database");
+        assert!(!direct_match.directory_sensitive);
     }
 }
