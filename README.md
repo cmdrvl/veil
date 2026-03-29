@@ -97,7 +97,9 @@ safe_patterns = [
 # are common sensitive targets. Allowlist specific filenames instead.
 
 [policy]
-# What to do when a sensitive file is accessed
+# What to do when veil detects a sensitive access
+# (either a classified-sensitive file anywhere, or any unknown file inside an
+# explicitly protected directory)
 default = "deny"           # deny | warn | log
 audit_log = true           # Log all access attempts
 audit_path = "~/.local/state/veil/audit.jsonl"  # default; outside repo
@@ -110,14 +112,20 @@ File access attempt (Read/Grep/Bash)
     │
     ├── Allowlist check → safe pattern? → ALLOW (silent)
     │
-    ├── Sensitivity check → protected path?
+    ├── Protected-dir / sensitivity check
     │       │
     │       ├── Is this a spine tool subprocess? → ALLOW (audit log)
     │       │
-    │       └── Direct read into context? → DENY (explain why)
+    │       └── Direct read into context? → policy default (deny|warn|log)
     │
-    └── Unknown file → policy default (deny|warn|log)
+    └── Unknown file outside protected dirs → ALLOW
 ```
+
+### Default Stance
+
+- Unknown file outside `[sensitivity] protected` directories is allowed.
+- Unknown file inside a protected directory is treated as sensitive and resolved through `[policy] default`.
+- Classified-sensitive file anywhere is resolved through pack-specific rules or `[policy] default`, with direct reads denied by default.
 
 ---
 

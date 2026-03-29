@@ -224,7 +224,8 @@ veil borrows heavily from dcg's architecture:
 ### Key Difference: Default Stance
 
 - **dcg is fail-open:** Unknown commands are allowed (most commands are safe)
-- **veil is fail-open by default** but supports **fail-closed per directory:** The global default must be fail-open (an agent that can't read any files is useless). But for explicitly protected directories, the stance inverts — unknown files inside a protected directory are blocked. This is configured via `[sensitivity] protected` patterns, not a global toggle.
+- **veil is fail-open by default** but supports **fail-closed per directory:** The global default must be fail-open (an agent that can't read any files is useless). But for explicitly protected directories, the stance inverts — unknown files inside a protected directory are treated as sensitive and resolved through policy. This is configured via `[sensitivity] protected` patterns, not a global toggle.
+- **Canonical contract:** Unknown files outside protected directories are allowed. Unknown files inside protected directories are resolved through `[policy] default`. Classified-sensitive files anywhere are resolved through pack-specific rules or `[policy] default`.
 - **On timeout/error:** Always fail-open. A guard that blocks the agent due to its own bugs is worse than no guard. Audit-log the timeout so operators can investigate.
 
 ### Different problem than airlock
@@ -372,7 +373,8 @@ If budget exceeded → allow with audit log (fail-open).
 ### Property Tests
 - Any path matching an allowlist pattern should never be denied
 - Spine tool invocations on protected paths should be allowed (that's the authorized processing path)
-- Sensitivity + no allowlist + no spine tool → always denied
+- Unknown paths outside protected directories should not be denied by default
+- Sensitive or protected-directory paths without an allowlist or spine-tool exception should resolve through policy
 
 ---
 
