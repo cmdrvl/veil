@@ -3,6 +3,7 @@
 pub mod allowlist;
 pub mod audit;
 pub mod config;
+pub mod evaluator;
 pub mod extract;
 pub mod packs;
 pub mod spine;

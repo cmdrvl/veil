@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
@@ -120,16 +122,27 @@ fn grep_exposure(raw_value: &Value) -> PathExposure {
 }
 
 fn normalize_path(raw_path: &str, cwd: &Path) -> Option<PathBuf> {
+    if raw_path.is_empty() || raw_path.chars().any(char::is_control) {
+        return None;
+    }
+
     let candidate = Path::new(raw_path);
     if candidate.as_os_str().is_empty() {
         return None;
     }
 
-    Some(if candidate.is_absolute() {
+    let absolute = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         cwd.join(candidate)
-    })
+    };
+    let hardened = lexical_normalize(&absolute)?;
+
+    if is_fd_indirection(&hardened) {
+        return Some(resolve_indirection(&hardened).unwrap_or(hardened));
+    }
+
+    fs::canonicalize(&hardened).ok().or(Some(hardened))
 }
 
 fn normalize_candidates(paths: Vec<String>, cwd: &Path) -> Vec<PathBuf> {
@@ -614,6 +627,77 @@ fn is_redirection(arg: &str) -> bool {
     matches!(arg, "<" | ">" | ">>" | "1>" | "1>>" | "2>" | "2>>")
 }
 
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    let mut prefix = None::<OsString>;
+    let mut has_root = false;
+    let mut parts = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(value) => prefix = Some(value.as_os_str().to_os_string()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !parts.is_empty() {
+                    parts.pop();
+                } else if !has_root {
+                    return None;
+                }
+            }
+            Component::Normal(value) => parts.push(value.to_os_string()),
+        }
+    }
+
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if has_root {
+        normalized.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    for part in parts {
+        normalized.push(part);
+    }
+
+    if normalized.as_os_str().is_empty() {
+        if has_root {
+            normalized.push(std::path::MAIN_SEPARATOR_STR);
+        } else {
+            return None;
+        }
+    }
+
+    Some(normalized)
+}
+
+fn resolve_indirection(path: &Path) -> Option<PathBuf> {
+    let target = match fs::read_link(path) {
+        Ok(target) => target,
+        Err(_) => return Some(path.to_path_buf()),
+    };
+    let absolute = if target.is_absolute() {
+        target
+    } else if target.components().count() > 1 {
+        path.parent()?.join(target)
+    } else {
+        return Some(path.to_path_buf());
+    };
+    let normalized = match lexical_normalize(&absolute) {
+        Some(normalized) => normalized,
+        None => return Some(path.to_path_buf()),
+    };
+
+    fs::canonicalize(&normalized)
+        .ok()
+        .or(Some(normalized))
+        .or(Some(path.to_path_buf()))
+}
+
+fn is_fd_indirection(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    raw.starts_with("/dev/fd/") || raw.starts_with("/proc/self/fd/")
+}
+
 fn is_pipeline_separator(token: &str) -> bool {
     token.len() == 1 && token.as_bytes()[0] == b'|'
 }
@@ -621,9 +705,25 @@ fn is_pipeline_separator(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::fs::File;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     fn workspace() -> &'static Path {
         Path::new("/workspace/veil")
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("veil-extract-{label}-{nanos}"))
     }
 
     #[test]
@@ -653,6 +753,102 @@ mod tests {
         assert_eq!(
             extraction.candidates,
             vec![PathBuf::from("/workspace/veil/docs/plan.md")]
+        );
+    }
+
+    #[test]
+    fn traversal_segments_are_collapsed_before_matching() {
+        let extraction = extract_read_or_grep_paths(
+            ToolKind::Read,
+            r#"{"file_path":"../../secret.csv"}"#,
+            Path::new("/workspace/veil/data/reports"),
+        );
+
+        assert_eq!(extraction.exposure, PathExposure::ReadsContents);
+        assert_eq!(
+            extraction.candidates,
+            vec![PathBuf::from("/workspace/veil/secret.csv")]
+        );
+        assert!(
+            extraction.candidates[0]
+                .components()
+                .all(|component| component != Component::ParentDir)
+        );
+    }
+
+    #[test]
+    fn null_byte_paths_are_rejected() {
+        let extraction = extract_read_or_grep_paths(
+            ToolKind::Read,
+            &json!({ "file_path": "secret\u{0}.csv" }).to_string(),
+            workspace(),
+        );
+
+        assert_eq!(extraction, PathExtraction::none());
+    }
+
+    #[test]
+    fn nonexistent_paths_with_spaces_and_unicode_are_hardened_without_panicking() {
+        let cwd = Path::new("/workspace/veil/input dir");
+        let extraction = extract_read_or_grep_paths(
+            ToolKind::Read,
+            &json!({ "file_path": "./reports/../über summary.csv" }).to_string(),
+            cwd,
+        );
+
+        assert_eq!(extraction.exposure, PathExposure::ReadsContents);
+        assert_eq!(
+            extraction.candidates,
+            vec![PathBuf::from("/workspace/veil/input dir/über summary.csv")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_targets_are_resolved_when_the_target_exists() {
+        let root = unique_temp_dir("symlink");
+        let protected_dir = root.join("protected");
+        fs::create_dir_all(&protected_dir).expect("protected directory should be creatable");
+        let target = protected_dir.join("secret.csv");
+        fs::write(&target, "classified").expect("target file should be writable");
+        symlink(&target, root.join("alias.csv")).expect("symlink should be creatable");
+
+        let extraction = extract_read_or_grep_paths(
+            ToolKind::Read,
+            &json!({ "file_path": "alias.csv" }).to_string(),
+            &root,
+        );
+
+        assert_eq!(extraction.exposure, PathExposure::ReadsContents);
+        assert_eq!(
+            extraction.candidates,
+            vec![fs::canonicalize(&target).expect("target should canonicalize")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_descriptor_paths_are_resolved_when_supported_by_the_platform() {
+        let root = unique_temp_dir("fd");
+        fs::create_dir_all(&root).expect("temp directory should be creatable");
+        let target = root.join("sensitive.csv");
+        fs::write(&target, "classified").expect("target file should be writable");
+        let file = File::open(&target).expect("target file should be openable");
+        let fd_path = fd_proxy_path(&file).expect("platform should expose an fd path");
+
+        let extraction = extract_read_or_grep_paths(
+            ToolKind::Read,
+            &json!({ "file_path": fd_path }).to_string(),
+            workspace(),
+        );
+
+        assert_eq!(extraction.exposure, PathExposure::ReadsContents);
+        assert_eq!(extraction.candidates.len(), 1);
+        assert!(
+            extraction.candidates[0]
+                == fs::canonicalize(&target).expect("target should canonicalize")
+                || extraction.candidates[0] == fd_path,
+            "fd indirection should either resolve to the target or remain an unmangled fd path"
         );
     }
 
@@ -887,5 +1083,17 @@ mod tests {
             extract_bash_read_paths(r#"git status"#, workspace()),
             PathExtraction::none()
         );
+    }
+
+    #[cfg(unix)]
+    fn fd_proxy_path(file: &File) -> Option<PathBuf> {
+        let fd = file.as_raw_fd();
+        for base in [Path::new("/proc/self/fd"), Path::new("/dev/fd")] {
+            if base.exists() {
+                return Some(base.join(fd.to_string()));
+            }
+        }
+
+        None
     }
 }
