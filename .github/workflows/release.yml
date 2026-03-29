@@ -105,9 +105,26 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate checksums
+        id: checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          checksum_file="veil-${version}-SHA256SUMS"
+          cd dist
+          : > "${checksum_file}"
+          while IFS= read -r asset; do
+            sha256sum "${asset}" >> "${checksum_file}"
+          done < <(printf '%s\n' veil-*.tar.gz | LC_ALL=C sort)
+          test -s "${checksum_file}"
+          echo "checksum_path=dist/${checksum_file}" >> "${GITHUB_OUTPUT}"
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            ${{ steps.checksums.outputs.checksum_path }}
           fail_on_unmatched_files: true
           generate_release_notes: true
