@@ -422,23 +422,18 @@ fn build_doctor_report(repo_root: &Path, settings_status: SettingsPathStatus) ->
     }
 
     match settings_status {
-        SettingsPathStatus::Resolved(path) => match hooks::has_managed_hooks(&path) {
-            Ok(true) => checks.push(DoctorCheck {
+        SettingsPathStatus::Resolved(path) => match hooks::inspect_managed_hooks(&path) {
+            Ok(inspection) if inspection.is_healthy() => checks.push(DoctorCheck {
                 name: "hooks",
                 status: DoctorStatus::Ok,
-                detail: format!(
-                    "managed Read/Grep/Bash hooks are installed in {}",
-                    path.display()
-                ),
+                detail: healthy_hook_detail(&path, &inspection),
                 remediation: None,
             }),
-            Ok(false) => checks.push(DoctorCheck {
+            Ok(inspection) => checks.push(DoctorCheck {
                 name: "hooks",
                 status: DoctorStatus::ActionNeeded,
-                detail: missing_hook_detail(&path),
-                remediation: Some(
-                    "run `veil install` to add the managed PreToolUse hook entries".to_owned(),
-                ),
+                detail: actionable_hook_detail(&path, &inspection),
+                remediation: Some(actionable_hook_remediation(&inspection)),
             }),
             Err(error) => checks.push(DoctorCheck {
                 name: "hooks",
@@ -471,11 +466,99 @@ fn audit_check_detail(path: &Path) -> String {
     }
 }
 
-fn missing_hook_detail(path: &Path) -> String {
-    if path.exists() {
-        format!("managed veil hooks are missing from {}", path.display())
+fn healthy_hook_detail(path: &Path, inspection: &hooks::ManagedHooksInspection) -> String {
+    let mut executables = inspection
+        .matchers
+        .iter()
+        .filter_map(|matcher| match &matcher.status {
+            hooks::ManagedHookStatus::Installed { executable, .. } => {
+                Some(executable.display().to_string())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    executables.sort();
+    executables.dedup();
+
+    if executables.len() == 1 {
+        format!(
+            "managed Read/Grep/Bash hooks are installed in {} and resolve to {}",
+            path.display(),
+            executables[0]
+        )
     } else {
-        format!("Claude settings file does not exist at {}", path.display())
+        format!(
+            "managed Read/Grep/Bash hooks are installed in {} and all configured commands resolve to executables",
+            path.display()
+        )
+    }
+}
+
+fn actionable_hook_detail(path: &Path, inspection: &hooks::ManagedHooksInspection) -> String {
+    let missing = inspection
+        .matchers
+        .iter()
+        .filter_map(|matcher| {
+            matches!(matcher.status, hooks::ManagedHookStatus::Missing).then_some(matcher.matcher)
+        })
+        .collect::<Vec<_>>();
+    let invalid = inspection
+        .matchers
+        .iter()
+        .filter_map(|matcher| match &matcher.status {
+            hooks::ManagedHookStatus::Invalid { command, reason } => {
+                Some(format!("{} => `{}` ({reason})", matcher.matcher, command))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        if path.exists() {
+            parts.push(format!(
+                "missing managed hooks for {} in {}",
+                missing.join("/"),
+                path.display()
+            ));
+        } else {
+            parts.push(format!(
+                "Claude settings file does not exist at {}",
+                path.display()
+            ));
+        }
+    }
+    if !invalid.is_empty() {
+        parts.push(format!(
+            "managed hook commands do not resolve to executables: {}",
+            invalid.join("; ")
+        ));
+    }
+
+    parts.join(". ")
+}
+
+fn actionable_hook_remediation(inspection: &hooks::ManagedHooksInspection) -> String {
+    let has_missing = inspection
+        .matchers
+        .iter()
+        .any(|matcher| matches!(matcher.status, hooks::ManagedHookStatus::Missing));
+    let has_invalid = inspection
+        .matchers
+        .iter()
+        .any(|matcher| matches!(matcher.status, hooks::ManagedHookStatus::Invalid { .. }));
+
+    match (has_missing, has_invalid) {
+        (true, true) => {
+            "run `veil install` to restore missing PreToolUse entries and rewrite the managed hook commands".to_owned()
+        }
+        (true, false) => {
+            "run `veil install` to add the managed PreToolUse hook entries".to_owned()
+        }
+        (false, true) => {
+            "run `veil install` to rewrite the managed hook commands to the current executable".to_owned()
+        }
+        (false, false) => "rerun `veil doctor` after reinstalling the hooks".to_owned(),
     }
 }
 
@@ -852,6 +935,8 @@ impl PathInspection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -868,6 +953,19 @@ mod tests {
         }
 
         fs::write(path, contents).expect("fixture file should be writable");
+    }
+
+    fn create_executable(path: &Path) {
+        write_file(path, "#!/bin/sh\nexit 0\n");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path)
+                .expect("test executable should exist")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)
+                .expect("test executable permissions should be writable");
+        }
     }
 
     #[test]
@@ -954,17 +1052,24 @@ mod tests {
     fn doctor_json_output_reports_healthy_when_hooks_are_installed() {
         let repo_root = unique_temp_dir("doctor-json");
         let settings_path = repo_root.join("claude/settings.json");
+        let executable_path = repo_root.join("bin/veil");
+        create_executable(&executable_path);
         write_file(
             &settings_path,
-            r#"{
-              "hooks": {
+            &format!(
+                r#"{{
+              "hooks": {{
                 "PreToolUse": [
-                  { "matcher": "Read", "hooks": [{ "type": "command", "command": "$HOME/.local/bin/veil" }] },
-                  { "matcher": "Grep", "hooks": [{ "type": "command", "command": "$HOME/.local/bin/veil" }] },
-                  { "matcher": "Bash", "hooks": [{ "type": "command", "command": "$HOME/.local/bin/veil" }] }
+                  {{ "matcher": "Read", "hooks": [{{ "type": "command", "command": "{}" }}] }},
+                  {{ "matcher": "Grep", "hooks": [{{ "type": "command", "command": "{}" }}] }},
+                  {{ "matcher": "Bash", "hooks": [{{ "type": "command", "command": "{}" }}] }}
                 ]
-              }
-            }"#,
+              }}
+            }}"#,
+                executable_path.display(),
+                executable_path.display(),
+                executable_path.display()
+            ),
         );
 
         let value = build_doctor_report(&repo_root, SettingsPathStatus::Resolved(settings_path))
@@ -980,6 +1085,33 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn doctor_reports_invalid_hook_command_paths() {
+        let repo_root = unique_temp_dir("doctor-invalid-hooks");
+        let settings_path = repo_root.join("claude/settings.json");
+        write_file(
+            &settings_path,
+            r#"{
+              "hooks": {
+                "PreToolUse": [
+                  { "matcher": "Read", "hooks": [{ "type": "command", "command": "/definitely/missing/veil" }] },
+                  { "matcher": "Grep", "hooks": [{ "type": "command", "command": "/definitely/missing/veil" }] },
+                  { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/definitely/missing/veil" }] }
+                ]
+              }
+            }"#,
+        );
+
+        let rendered = render_doctor_human(&build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(settings_path),
+        ));
+
+        assert!(rendered.contains("hooks [action_needed]"));
+        assert!(rendered.contains("do not resolve to executables"));
+        assert!(rendered.contains("run `veil install`"));
     }
 
     #[test]

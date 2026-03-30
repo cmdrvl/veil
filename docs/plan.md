@@ -44,20 +44,23 @@ veil registers as a Claude Code `PreToolUse` hook with multiple matchers:
     "PreToolUse": [
       {
         "matcher": "Read",
-        "hooks": [{ "type": "command", "command": "$HOME/.local/bin/veil" }]
+        "hooks": [{ "type": "command", "command": "/absolute/path/to/veil" }]
       },
       {
         "matcher": "Grep",
-        "hooks": [{ "type": "command", "command": "$HOME/.local/bin/veil" }]
+        "hooks": [{ "type": "command", "command": "/absolute/path/to/veil" }]
       },
       {
         "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "$HOME/.local/bin/veil" }]
+        "hooks": [{ "type": "command", "command": "/absolute/path/to/veil" }]
       }
     ]
   }
 }
 ```
+
+`veil install` should write the currently running executable path into those
+hook entries rather than assuming a fixed install location.
 
 #### Hook ordering with dcg
 
