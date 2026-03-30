@@ -56,6 +56,7 @@ pub struct JsonOutputArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum OperatorCommand {
+    Operator(JsonOutputArgs),
     Test(PathCommandArgs),
     Explain(PathCommandArgs),
     Scan(DirCommandArgs),
@@ -145,6 +146,10 @@ mod tests {
     fn flag_only_subcommands_select_expected_variants() {
         for (name, command) in [
             (
+                "operator",
+                OperatorCommand::Operator(JsonOutputArgs { json: false }),
+            ),
+            (
                 "packs",
                 OperatorCommand::Packs(JsonOutputArgs { json: false }),
             ),
@@ -177,6 +182,7 @@ mod tests {
         let help = String::from_utf8(help).expect("help should be valid UTF-8");
 
         for name in [
+            "operator",
             "test",
             "explain",
             "scan",
@@ -256,6 +262,14 @@ mod tests {
         assert_eq!(
             parse(&["veil", "packs", "--json"]),
             Dispatch::Operator(OperatorCommand::Packs(JsonOutputArgs { json: true }))
+        );
+    }
+
+    #[test]
+    fn operator_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "operator", "--json"]),
+            Dispatch::Operator(OperatorCommand::Operator(JsonOutputArgs { json: true }))
         );
     }
 }

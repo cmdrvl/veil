@@ -87,7 +87,7 @@ protected = [
 [spine]
 # Spine tools allowed to process sensitive files as subprocesses
 authorized_tools = [
-    "shape", "rvl", "vacuum", "hash",
+    "shape", "rvl", "vacuum", "hashbytes",
     "fingerprint", "profile", "canon", "lock", "pack",
 ]
 
@@ -112,6 +112,19 @@ default = "deny"           # deny | warn | log
 audit_log = true           # Log all access attempts
 audit_path = "~/.local/state/veil/audit.jsonl"  # default; outside repo
 ```
+
+### Operator Discovery
+
+When `veil` blocks a direct read, use the configured authorized path instead of guessing:
+
+```bash
+veil operator
+veil operator --json
+```
+
+`veil operator` reads `[spine] authorized_tools` from the active config, runs
+`--describe` on each installed tool, and prints a combined reference with any
+missing or broken tools called out explicitly.
 
 ### Decision Pipeline
 

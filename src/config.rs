@@ -13,7 +13,7 @@ const DEFAULT_AUTHORIZED_TOOLS: &[&str] = &[
     "shape",
     "rvl",
     "vacuum",
-    "hash",
+    "hashbytes",
     "fingerprint",
     "profile",
     "canon",

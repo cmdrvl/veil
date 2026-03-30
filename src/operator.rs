@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde_json::{Value, json};
 use veil::allowlist::SafePathMatcher;
@@ -51,6 +52,25 @@ struct PathInspection {
     sensitivity: Option<SensitivityResult>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct OperatorGuide {
+    configured_authorized_tools: Vec<String>,
+    tools: Vec<AuthorizedToolReference>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AuthorizedToolReference {
+    configured_as: String,
+    status: ToolReferenceStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ToolReferenceStatus {
+    Available { manifest: Value },
+    Missing { reason: String },
+    Error { reason: String },
+}
+
 enum SettingsPathStatus {
     Resolved(PathBuf),
     Error(String),
@@ -70,6 +90,11 @@ pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>>
 pub fn run_doctor(args: &DoctorArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
     render_doctor_for_repo(&repo_root, args.json)
+}
+
+pub fn run_operator(args: &JsonOutputArgs) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = env::current_dir()?;
+    render_operator_for_repo(&repo_root, args.json)
 }
 
 pub fn run_test(args: &PathCommandArgs) -> Result<String, Box<dyn std::error::Error>> {
@@ -137,6 +162,20 @@ fn render_doctor_for_repo(
         Ok(serde_json::to_string_pretty(&report.to_json_value())?)
     } else {
         Ok(render_doctor_human(&report))
+    }
+}
+
+fn render_operator_for_repo(
+    repo_root: &Path,
+    json_output: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let config = config::load_config(repo_root)?;
+    let guide = build_operator_guide(&config);
+
+    if json_output {
+        Ok(serde_json::to_string_pretty(&guide.to_json_value())?)
+    } else {
+        Ok(render_operator_human(&guide))
     }
 }
 
@@ -233,6 +272,87 @@ fn render_packs(json_output: bool) -> Result<String, Box<dyn std::error::Error>>
     }
 }
 
+fn build_operator_guide(config: &Config) -> OperatorGuide {
+    OperatorGuide {
+        configured_authorized_tools: config.spine.authorized_tools.clone(),
+        tools: config
+            .spine
+            .authorized_tools
+            .iter()
+            .map(|configured_tool| describe_authorized_tool(configured_tool))
+            .collect(),
+    }
+}
+
+fn describe_authorized_tool(configured_tool: &str) -> AuthorizedToolReference {
+    let describe_command = format!("{configured_tool} --describe");
+    let (program, args) = match describe_command_parts(configured_tool) {
+        Ok(parts) => parts,
+        Err(reason) => {
+            return AuthorizedToolReference {
+                configured_as: configured_tool.to_owned(),
+                status: ToolReferenceStatus::Error { reason },
+            };
+        }
+    };
+
+    let mut command = Command::new(&program);
+    command.args(args).arg("--describe");
+
+    let status = match command.output() {
+        Ok(output) if output.status.success() => {
+            match serde_json::from_slice::<Value>(&output.stdout) {
+                Ok(manifest) => ToolReferenceStatus::Available { manifest },
+                Err(error) => ToolReferenceStatus::Error {
+                    reason: format!("`{describe_command}` returned invalid JSON: {error}"),
+                },
+            }
+        }
+        Ok(output) => ToolReferenceStatus::Error {
+            reason: format_describe_failure(&describe_command, &output.status, &output.stderr),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ToolReferenceStatus::Missing {
+            reason: format!("`{program}` was not found while running `{describe_command}`"),
+        },
+        Err(error) => ToolReferenceStatus::Error {
+            reason: format!("failed to run `{describe_command}`: {error}"),
+        },
+    };
+
+    AuthorizedToolReference {
+        configured_as: configured_tool.to_owned(),
+        status,
+    }
+}
+
+fn describe_command_parts(configured_tool: &str) -> Result<(String, Vec<String>), String> {
+    let parts = shlex::split(configured_tool)
+        .ok_or_else(|| format!("could not parse configured tool command `{configured_tool}`"))?;
+    let (program, args) = parts
+        .split_first()
+        .ok_or_else(|| format!("configured tool command `{configured_tool}` is empty"))?;
+
+    Ok((program.clone(), args.to_vec()))
+}
+
+fn format_describe_failure(
+    command: &str,
+    status: &std::process::ExitStatus,
+    stderr: &[u8],
+) -> String {
+    let exit = status.code().map_or_else(
+        || "terminated by signal".to_owned(),
+        |code| format!("exit {code}"),
+    );
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+
+    if stderr.is_empty() {
+        format!("`{command}` failed with {exit}")
+    } else {
+        format!("`{command}` failed with {exit}: {stderr}")
+    }
+}
+
 fn config_json(config: &Config) -> Value {
     json!({
         "sensitivity": {
@@ -285,6 +405,72 @@ fn render_config_human(config: &Config) -> String {
         "authorized_tools",
         &config.spine.authorized_tools,
     );
+
+    output.trim_end().to_owned()
+}
+
+fn render_operator_human(guide: &OperatorGuide) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Operator");
+    let _ = writeln!(
+        output,
+        "  guidance: use these authorized spine tools instead of a direct read"
+    );
+    let _ = writeln!(output, "  rerun_with_json: veil operator --json");
+    let _ = writeln!(output, "  configured: {}", guide.tools.len());
+    let _ = writeln!(output, "  available: {}", guide.available_count());
+    let _ = writeln!(output, "  unavailable: {}", guide.unavailable_count());
+
+    if guide.tools.is_empty() {
+        let _ = writeln!(output, "  tools: (none)");
+        return output.trim_end().to_owned();
+    }
+
+    for tool in &guide.tools {
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "  - {} [{}]",
+            tool.display_name(),
+            tool.status.label()
+        );
+        let _ = writeln!(output, "    configured_as: {}", tool.configured_as);
+
+        match &tool.status {
+            ToolReferenceStatus::Available { manifest } => {
+                if let Some(description) = manifest["description"].as_str() {
+                    let _ = writeln!(output, "    description: {description}");
+                }
+                if let Some(binary) = manifest["invocation"]["binary"].as_str() {
+                    let _ = writeln!(output, "    binary: {binary}");
+                }
+                let usages = manifest_usage_lines(manifest);
+                if usages.is_empty() {
+                    let _ = writeln!(output, "    usage: (not advertised)");
+                } else {
+                    let _ = writeln!(output, "    usage:");
+                    for usage in usages {
+                        let _ = writeln!(output, "      - {usage}");
+                    }
+                }
+                let formats = manifest_string_array(manifest.pointer("/capabilities/formats"));
+                if !formats.is_empty() {
+                    let _ = writeln!(output, "    formats: {}", formats.join(", "));
+                }
+                let upstream = manifest_string_array(manifest.pointer("/pipeline/upstream"));
+                let downstream = manifest_string_array(manifest.pointer("/pipeline/downstream"));
+                let _ = writeln!(
+                    output,
+                    "    pipeline: upstream={} downstream={}",
+                    join_or_none(&upstream),
+                    join_or_none(&downstream)
+                );
+            }
+            ToolReferenceStatus::Missing { reason } | ToolReferenceStatus::Error { reason } => {
+                let _ = writeln!(output, "    reason: {reason}");
+            }
+        }
+    }
 
     output.trim_end().to_owned()
 }
@@ -731,6 +917,31 @@ fn render_packs_human(inventory: &[(&'static str, &'static str)]) -> String {
     output.trim_end().to_owned()
 }
 
+fn manifest_usage_lines(manifest: &Value) -> Vec<String> {
+    manifest_string_array(manifest.pointer("/invocation/usage"))
+}
+
+fn manifest_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn join_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "(none)".to_owned()
+    } else {
+        values.join(", ")
+    }
+}
+
 fn inspect_path(
     repo_root: &Path,
     raw_path: &Path,
@@ -932,6 +1143,90 @@ impl PathInspection {
     }
 }
 
+impl OperatorGuide {
+    fn available_count(&self) -> usize {
+        self.tools
+            .iter()
+            .filter(|tool| matches!(tool.status, ToolReferenceStatus::Available { .. }))
+            .count()
+    }
+
+    fn unavailable_count(&self) -> usize {
+        self.tools.len().saturating_sub(self.available_count())
+    }
+
+    fn to_json_value(&self) -> Value {
+        json!({
+            "schema_version": "veil.operator.v0",
+            "guidance": "Use these authorized spine tools instead of a direct read.",
+            "summary": {
+                "configured": self.tools.len(),
+                "available": self.available_count(),
+                "unavailable": self.unavailable_count(),
+            },
+            "configured_authorized_tools": self.configured_authorized_tools,
+            "tools": self.tools.iter().map(|tool| {
+                match &tool.status {
+                    ToolReferenceStatus::Available { manifest } => json!({
+                        "configured_as": tool.configured_as,
+                        "status": "available",
+                        "reason": Value::Null,
+                        "manifest": manifest,
+                    }),
+                    ToolReferenceStatus::Missing { reason } => json!({
+                        "configured_as": tool.configured_as,
+                        "status": "missing",
+                        "reason": reason,
+                        "manifest": Value::Null,
+                    }),
+                    ToolReferenceStatus::Error { reason } => json!({
+                        "configured_as": tool.configured_as,
+                        "status": "error",
+                        "reason": reason,
+                        "manifest": Value::Null,
+                    }),
+                }
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
+impl AuthorizedToolReference {
+    fn display_name(&self) -> String {
+        match &self.status {
+            ToolReferenceStatus::Available { manifest } => manifest["name"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| configured_tool_display_name(&self.configured_as)),
+            ToolReferenceStatus::Missing { .. } | ToolReferenceStatus::Error { .. } => {
+                configured_tool_display_name(&self.configured_as)
+            }
+        }
+    }
+}
+
+impl ToolReferenceStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            ToolReferenceStatus::Available { .. } => "available",
+            ToolReferenceStatus::Missing { .. } => "missing",
+            ToolReferenceStatus::Error { .. } => "error",
+        }
+    }
+}
+
+fn configured_tool_display_name(configured_tool: &str) -> String {
+    shlex::split(configured_tool)
+        .and_then(|parts| parts.into_iter().next())
+        .and_then(|program| {
+            Path::new(&program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| configured_tool.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,6 +1263,22 @@ mod tests {
         }
     }
 
+    fn create_describe_tool(path: &Path, stdout: &str, stderr: &str, exit_code: i32) {
+        let script = format!(
+            "#!/bin/sh\ncat <<'EOF'\n{stdout}\nEOF\ncat >&2 <<'EOF'\n{stderr}\nEOF\nexit {exit_code}\n"
+        );
+        write_file(path, &script);
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(path)
+                .expect("test executable should exist")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)
+                .expect("test executable permissions should be writable");
+        }
+    }
+
     #[test]
     fn config_json_output_reflects_merged_config() {
         let repo_root = unique_temp_dir("config-json");
@@ -993,6 +1304,137 @@ mod tests {
         assert_eq!(value["policy"]["default"], "warn");
         assert_eq!(value["policy"]["audit_log"], false);
         assert_eq!(value["policy"]["audit_path"], "/tmp/veil-audit.jsonl");
+    }
+
+    #[test]
+    fn operator_command_json_output_combines_available_and_missing_tools() {
+        let repo_root = unique_temp_dir("operator-json");
+        let tool_path = repo_root.join("bin/shape");
+        create_describe_tool(
+            &tool_path,
+            r#"{
+              "schema_version": "operator.v0",
+              "name": "shape",
+              "description": "Schema profiler",
+              "invocation": {
+                "binary": "shape",
+                "usage": ["shape sensitive.csv --json"]
+              },
+              "capabilities": {
+                "formats": ["csv"]
+              },
+              "pipeline": {
+                "upstream": [],
+                "downstream": ["rvl"]
+              }
+            }"#,
+            "",
+            0,
+        );
+        write_file(
+            &repo_root.join(".veil.toml"),
+            &format!(
+                "[spine]\nauthorized_tools = [\"{}\", \"/definitely/missing/rvl\"]\n",
+                tool_path.display()
+            ),
+        );
+
+        let rendered =
+            render_operator_for_repo(&repo_root, true).expect("operator JSON should render");
+        let value: Value = serde_json::from_str(&rendered).expect("operator JSON should parse");
+
+        assert_eq!(value["schema_version"], "veil.operator.v0");
+        assert_eq!(value["summary"]["configured"], 2);
+        assert_eq!(value["summary"]["available"], 1);
+        assert_eq!(value["summary"]["unavailable"], 1);
+        assert!(
+            value["tools"]
+                .as_array()
+                .expect("tools should be an array")
+                .iter()
+                .any(|tool| tool["status"] == "available" && tool["manifest"]["name"] == "shape")
+        );
+        assert!(
+            value["tools"]
+                .as_array()
+                .expect("tools should be an array")
+                .iter()
+                .any(|tool| {
+                    tool["status"] == "missing"
+                        && tool["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains("not found"))
+                })
+        );
+    }
+
+    #[test]
+    fn operator_command_human_output_surfaces_usage_and_missing_tools() {
+        let repo_root = unique_temp_dir("operator-human");
+        let tool_path = repo_root.join("bin/shape");
+        create_describe_tool(
+            &tool_path,
+            r#"{
+              "schema_version": "operator.v0",
+              "name": "shape",
+              "description": "Schema profiler",
+              "invocation": {
+                "binary": "shape",
+                "usage": ["shape sensitive.csv --json"]
+              },
+              "capabilities": {
+                "formats": ["csv"]
+              },
+              "pipeline": {
+                "upstream": [],
+                "downstream": ["rvl"]
+              }
+            }"#,
+            "",
+            0,
+        );
+        write_file(
+            &repo_root.join(".veil.toml"),
+            &format!(
+                "[spine]\nauthorized_tools = [\"{}\", \"/definitely/missing/rvl\"]\n",
+                tool_path.display()
+            ),
+        );
+
+        let rendered = render_operator_for_repo(&repo_root, false)
+            .expect("operator human output should render");
+
+        assert!(rendered.contains("Operator"));
+        assert!(rendered.contains("shape [available]"));
+        assert!(rendered.contains("shape sensitive.csv --json"));
+        assert!(rendered.contains("rvl [missing]"));
+    }
+
+    #[test]
+    fn operator_command_reports_invalid_describe_output() {
+        let repo_root = unique_temp_dir("operator-invalid");
+        let tool_path = repo_root.join("bin/broken");
+        create_describe_tool(&tool_path, "not json", "", 0);
+        write_file(
+            &repo_root.join(".veil.toml"),
+            &format!(
+                "[spine]\nauthorized_tools = [\"{}\"]\n",
+                tool_path.display()
+            ),
+        );
+
+        let rendered =
+            render_operator_for_repo(&repo_root, true).expect("operator JSON should render");
+        let value: Value = serde_json::from_str(&rendered).expect("operator JSON should parse");
+
+        assert_eq!(value["summary"]["available"], 0);
+        assert_eq!(value["summary"]["unavailable"], 1);
+        assert_eq!(value["tools"][0]["status"], "error");
+        assert!(
+            value["tools"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("invalid JSON"))
+        );
     }
 
     #[test]

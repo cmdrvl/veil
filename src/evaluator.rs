@@ -10,7 +10,7 @@ use crate::packs::PackRegistry;
 use crate::spine::SpineInvocation;
 use crate::types::{Decision, DecisionAction, SensitivityResult, SensitivitySeverity, ToolKind};
 
-const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. To inspect this file, write a local script that extracts only metadata (e.g., sheet names, column headers, row counts, field names) and prints a structured summary — do not load file contents into context. Alternatively, use spine tools: `vacuum` to inventory files, `hash` for integrity, `fingerprint` for format identification, `shape` for schema profiling, or `rvl` for structured comparison.";
+const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. Run `veil operator` to see the authorized spine tools available in this repo and choose the right metadata-safe path. If no listed tool fits, write a local script that extracts only metadata (e.g., sheet names, column headers, row counts, field names) and prints a structured summary without loading file contents into context.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvaluationInput {
