@@ -8,6 +8,30 @@ use serde_json::Value;
 
 use crate::types::ToolKind;
 
+const PYTHON_DIRECT_READ_CALLS: &[&str] = &[
+    "open",
+    "read_csv",
+    "read_table",
+    "read_fwf",
+    "read_json",
+    "read_excel",
+    "read_parquet",
+    "read_feather",
+    "read_pickle",
+    "read_orc",
+    "read_sas",
+    "read_spss",
+    "read_stata",
+    "read_xml",
+    "read_ndjson",
+    "scan_csv",
+    "scan_parquet",
+    "scan_ndjson",
+    "loadtxt",
+    "genfromtxt",
+];
+const PYTHON_PATH_READ_METHODS: &[&str] = &["read_text", "read_bytes", "open"];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InterpreterKind {
     Python,
@@ -65,7 +89,7 @@ fn extract_tokenized_bash_paths(command: &str, cwd: &Path) -> PathExtraction {
     };
 
     let pipeline = left_pipeline(&tokens);
-    let Some((program, args)) = pipeline.split_first() else {
+    let Some((program, args)) = resolve_invocation(pipeline) else {
         return PathExtraction::none();
     };
 
@@ -170,6 +194,58 @@ fn left_pipeline(tokens: &[String]) -> &[String] {
     }
 
     tokens
+}
+
+fn resolve_invocation(tokens: &[String]) -> Option<(&str, &[String])> {
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if is_env_assignment(token) {
+            index += 1;
+            continue;
+        }
+
+        match command_name(token) {
+            "env" => {
+                index += 1;
+                while index < tokens.len() {
+                    let token = tokens[index].as_str();
+                    if token == "--" {
+                        index += 1;
+                        break;
+                    }
+
+                    if token.starts_with('-') || is_env_assignment(token) {
+                        index += 1;
+                        continue;
+                    }
+
+                    break;
+                }
+            }
+            "command" | "builtin" | "nohup" => {
+                index += 1;
+                while index < tokens.len() {
+                    let token = tokens[index].as_str();
+                    if token == "--" {
+                        index += 1;
+                        break;
+                    }
+
+                    if token.starts_with('-') {
+                        index += 1;
+                        continue;
+                    }
+
+                    break;
+                }
+            }
+            _ => return Some((token, &tokens[index + 1..])),
+        }
+    }
+
+    None
 }
 
 fn command_paths(program: &str, args: &[String]) -> Option<Vec<String>> {
@@ -418,18 +494,194 @@ fn extract_interpreter_script_paths(kind: InterpreterKind, script: &str) -> Vec<
 }
 
 fn extract_python_script_paths(script: &str) -> Vec<String> {
-    let mut paths = quoted_literals_after_marker(script, "open(")
-        .into_iter()
-        .map(|(path, _)| path)
-        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    let bytes = script.as_bytes();
+    let mut index = 0;
 
-    for (path, end) in quoted_literals_after_marker(script, "Path(") {
-        if script[end..].trim_start().starts_with(").read") {
-            paths.push(path);
+    while index < bytes.len() {
+        match bytes[index] {
+            b'#' => {
+                index = skip_until_newline(bytes, index + 1);
+            }
+            b'\'' | b'"' => match skip_python_string(script, index) {
+                Some(next) => index = next,
+                None => break,
+            },
+            byte if is_identifier_start(byte) => {
+                let start = index;
+                let end = parse_identifier_chain(script, index);
+                let name = &script[start..end];
+                let after_name = skip_ascii_whitespace(script, end);
+
+                if bytes.get(after_name) == Some(&b'(') {
+                    let suffix = name.rsplit('.').next().unwrap_or(name);
+                    if PYTHON_DIRECT_READ_CALLS.contains(&suffix)
+                        && let Some((path, call_end)) =
+                            parse_first_python_path_argument(script, after_name + 1)
+                    {
+                        paths.push(path);
+                        index = call_end;
+                        continue;
+                    }
+
+                    if suffix == "Path"
+                        && let Some((path, path_end)) =
+                            parse_first_python_path_argument(script, after_name + 1)
+                    {
+                        let after_path = skip_ascii_whitespace(script, path_end);
+                        if bytes.get(after_path) == Some(&b')') {
+                            let after_call = skip_ascii_whitespace(script, after_path + 1);
+                            if bytes.get(after_call) == Some(&b'.') {
+                                let method_start = after_call + 1;
+                                if bytes
+                                    .get(method_start)
+                                    .is_some_and(|byte| is_identifier_start(*byte))
+                                {
+                                    let method_end = parse_identifier(script, method_start);
+                                    let method = &script[method_start..method_end];
+                                    let after_method = skip_ascii_whitespace(script, method_end);
+                                    if bytes.get(after_method) == Some(&b'(')
+                                        && PYTHON_PATH_READ_METHODS.contains(&method)
+                                    {
+                                        paths.push(path);
+                                        index = after_method + 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                index = end;
+            }
+            _ => index += 1,
         }
     }
 
     paths
+}
+
+fn skip_until_newline(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        if bytes[index] == b'\n' {
+            return index + 1;
+        }
+        index += 1;
+    }
+
+    bytes.len()
+}
+
+fn skip_python_string(script: &str, start: usize) -> Option<usize> {
+    let bytes = script.as_bytes();
+    let quote = *bytes.get(start)?;
+    let triple_quoted =
+        bytes.get(start + 1) == Some(&quote) && bytes.get(start + 2) == Some(&quote);
+    let mut index = start + if triple_quoted { 3 } else { 1 };
+
+    while index < bytes.len() {
+        if !triple_quoted && bytes[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+
+        if triple_quoted {
+            if bytes.get(index) == Some(&quote)
+                && bytes.get(index + 1) == Some(&quote)
+                && bytes.get(index + 2) == Some(&quote)
+            {
+                return Some(index + 3);
+            }
+        } else if bytes[index] == quote {
+            return Some(index + 1);
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn parse_first_python_path_argument(script: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = script.as_bytes();
+    let index = skip_ascii_whitespace(script, start);
+    let byte = *bytes.get(index)?;
+
+    if byte == b'\'' || byte == b'"' {
+        return parse_quoted_literal(script, index);
+    }
+
+    if !is_identifier_start(byte) {
+        return None;
+    }
+
+    let name_end = parse_identifier_chain(script, index);
+    let after_name = skip_ascii_whitespace(script, name_end);
+    if bytes.get(after_name) == Some(&b'=') {
+        return parse_first_python_path_argument(script, after_name + 1);
+    }
+
+    let name = &script[index..name_end];
+    if name.rsplit('.').next().unwrap_or(name) != "Path" || bytes.get(after_name) != Some(&b'(') {
+        return None;
+    }
+
+    let (path, path_end) = parse_first_python_path_argument(script, after_name + 1)?;
+    let after_path = skip_ascii_whitespace(script, path_end);
+    if bytes.get(after_path) == Some(&b')') {
+        Some((path, after_path + 1))
+    } else {
+        None
+    }
+}
+
+fn skip_ascii_whitespace(script: &str, mut index: usize) -> usize {
+    let bytes = script.as_bytes();
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        index += 1;
+    }
+    index
+}
+
+fn parse_identifier_chain(script: &str, start: usize) -> usize {
+    let bytes = script.as_bytes();
+    let mut index = parse_identifier(script, start);
+
+    while bytes.get(index) == Some(&b'.')
+        && bytes
+            .get(index + 1)
+            .is_some_and(|byte| is_identifier_start(*byte))
+    {
+        index = parse_identifier(script, index + 1);
+    }
+
+    index
+}
+
+fn parse_identifier(script: &str, start: usize) -> usize {
+    let bytes = script.as_bytes();
+    let mut index = start;
+
+    while bytes
+        .get(index)
+        .is_some_and(|byte| is_identifier_continue(*byte))
+    {
+        index += 1;
+    }
+
+    index
+}
+
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_identifier_continue(byte: u8) -> bool {
+    is_identifier_start(byte) || byte.is_ascii_digit()
 }
 
 fn extract_node_script_paths(script: &str) -> Vec<String> {
@@ -701,6 +953,16 @@ fn is_fd_indirection(path: &Path) -> bool {
 
 fn is_pipeline_separator(token: &str) -> bool {
     token.len() == 1 && token.as_bytes()[0] == b'|'
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -991,6 +1253,48 @@ mod tests {
     }
 
     #[test]
+    fn python_inline_script_extracts_pandas_read_csv_path() {
+        let extraction = extract_bash_read_paths(
+            r#"python3 -c "import pandas as pd; df = pd.read_csv(\"secret.csv\")""#,
+            workspace(),
+        );
+
+        assert_eq!(extraction.exposure, PathExposure::ReadsContents);
+        assert_eq!(
+            extraction.candidates,
+            vec![PathBuf::from("/workspace/veil/secret.csv")]
+        );
+    }
+
+    #[test]
+    fn python_inline_script_extracts_context_manager_open_with_whitespace() {
+        let extraction = extract_bash_read_paths(
+            r#"python3 -c "with open (\"two words.txt\", \"r\") as handle: print(handle.read())""#,
+            workspace(),
+        );
+
+        assert_eq!(extraction.exposure, PathExposure::ReadsContents);
+        assert_eq!(
+            extraction.candidates,
+            vec![PathBuf::from("/workspace/veil/two words.txt")]
+        );
+    }
+
+    #[test]
+    fn env_wrapped_python_inline_reads_are_detected() {
+        let extraction = extract_bash_read_paths(
+            r#"PYTHONWARNINGS=ignore python3 -c "import pandas as pd; pd.read_csv(\"secret.csv\")""#,
+            workspace(),
+        );
+
+        assert_eq!(extraction.exposure, PathExposure::ReadsContents);
+        assert_eq!(
+            extraction.candidates,
+            vec![PathBuf::from("/workspace/veil/secret.csv")]
+        );
+    }
+
+    #[test]
     fn node_inline_script_extracts_readfilesync_path() {
         let extraction = extract_bash_read_paths(
             r#"node -e "console.log(require('fs').readFileSync(\"secret.txt\", \"utf8\"))""#,
@@ -1082,6 +1386,13 @@ mod tests {
         );
         assert_eq!(
             extract_bash_read_paths(r#"git status"#, workspace()),
+            PathExtraction::none()
+        );
+        assert_eq!(
+            extract_bash_read_paths(
+                r#"python3 -c "print(\"read_csv('secret.csv')\")""#,
+                workspace(),
+            ),
             PathExtraction::none()
         );
     }
