@@ -364,7 +364,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(stdout).expect("stdout should be UTF-8"),
-            "{\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"direct read inside a protected directory is blocked by policy default\"}\n"
+            "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"direct read inside a protected directory is blocked by policy default\"}}\n"
         );
         let stderr = String::from_utf8(stderr).expect("stderr should be UTF-8");
         assert!(stderr.contains("Sensitive file access blocked"));

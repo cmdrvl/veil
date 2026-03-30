@@ -4,6 +4,8 @@ use serde_json::json;
 
 use crate::types::{Decision, DecisionAction, HookProtocol, SensitivitySeverity};
 
+const CLAUDE_PRE_TOOL_EVENT: &str = "PreToolUse";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenderedDecision {
     pub stdout: String,
@@ -12,9 +14,8 @@ pub struct RenderedDecision {
 
 pub fn render_decision(protocol: HookProtocol, decision: &Decision) -> RenderedDecision {
     let stdout = match protocol {
-        HookProtocol::ClaudeCode | HookProtocol::GitHubCopilot | HookProtocol::Unknown => {
-            render_permission_stdout(decision)
-        }
+        HookProtocol::ClaudeCode => render_claude_stdout(decision),
+        HookProtocol::GitHubCopilot | HookProtocol::Unknown => render_permission_stdout(decision),
         HookProtocol::GeminiCli => render_gemini_stdout(decision),
     };
 
@@ -24,6 +25,23 @@ pub fn render_decision(protocol: HookProtocol, decision: &Decision) -> RenderedD
     };
 
     RenderedDecision { stdout, stderr }
+}
+
+fn render_claude_stdout(decision: &Decision) -> String {
+    let mut payload = json!({
+        "hookSpecificOutput": {
+            "hookEventName": CLAUDE_PRE_TOOL_EVENT,
+            "permissionDecision": permission_decision(decision),
+        }
+    });
+
+    if decision.action == DecisionAction::Deny
+        && let Some(reason) = &decision.reason
+    {
+        payload["hookSpecificOutput"]["permissionDecisionReason"] = json!(reason);
+    }
+
+    payload.to_string()
 }
 
 fn render_permission_stdout(decision: &Decision) -> String {
@@ -126,7 +144,10 @@ mod tests {
     fn claude_allow_output_is_silent_on_stderr() {
         let rendered = render_decision(HookProtocol::ClaudeCode, &allow_decision());
 
-        assert_eq!(rendered.stdout, r#"{"permissionDecision":"allow"}"#);
+        assert_eq!(
+            rendered.stdout,
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#
+        );
         assert_eq!(rendered.stderr, None);
     }
 
@@ -136,7 +157,7 @@ mod tests {
 
         assert_eq!(
             rendered.stdout,
-            r#"{"permissionDecision":"deny","permissionDecisionReason":"matched by core.filesystem"}"#
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"matched by core.filesystem"}}"#
         );
         assert!(
             rendered
