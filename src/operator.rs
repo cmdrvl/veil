@@ -414,7 +414,7 @@ fn render_operator_human(guide: &OperatorGuide) -> String {
     let _ = writeln!(output, "Operator");
     let _ = writeln!(
         output,
-        "  guidance: use these authorized spine tools instead of a direct read"
+        "  guidance: start with `veil operator` when a sensitive-file read is blocked; choose an authorized spine tool instead of guessing a shell command"
     );
     let _ = writeln!(output, "  rerun_with_json: veil operator --json");
     let _ = writeln!(output, "  configured: {}", guide.tools.len());
@@ -1158,7 +1158,7 @@ impl OperatorGuide {
     fn to_json_value(&self) -> Value {
         json!({
             "schema_version": "veil.operator.v0",
-            "guidance": "Use these authorized spine tools instead of a direct read.",
+            "guidance": "Start with veil operator when a sensitive-file read is blocked, then choose an authorized spine tool instead of guessing a shell command.",
             "summary": {
                 "configured": self.tools.len(),
                 "available": self.available_count(),
@@ -1344,6 +1344,10 @@ mod tests {
         let value: Value = serde_json::from_str(&rendered).expect("operator JSON should parse");
 
         assert_eq!(value["schema_version"], "veil.operator.v0");
+        assert_eq!(
+            value["guidance"],
+            "Start with veil operator when a sensitive-file read is blocked, then choose an authorized spine tool instead of guessing a shell command."
+        );
         assert_eq!(value["summary"]["configured"], 2);
         assert_eq!(value["summary"]["available"], 1);
         assert_eq!(value["summary"]["unavailable"], 1);
@@ -1405,6 +1409,8 @@ mod tests {
             .expect("operator human output should render");
 
         assert!(rendered.contains("Operator"));
+        assert!(rendered.contains("start with `veil operator`"));
+        assert!(rendered.contains("instead of guessing a shell command"));
         assert!(rendered.contains("shape [available]"));
         assert!(rendered.contains("shape sensitive.csv --json"));
         assert!(rendered.contains("rvl [missing]"));

@@ -2,9 +2,9 @@
 
 **Data exfiltration guard for AI coding agents.**
 
-A high-performance Claude Code hook that prevents agents from reading sensitive
-file contents into their context window, enforcing a clean boundary between
-orchestration and data access.
+A high-performance Claude Code hook that blocks direct sensitive-file reads
+into the agent context and steers operators toward authorized local processing
+tools, enforcing a clean boundary between orchestration and data access.
 
 `veil` is the preventive companion to `airlock`:
 
@@ -20,8 +20,8 @@ AI coding agents can read any file on your machine. When orchestrating data pipe
 
 ## The Solution
 
-veil intercepts file access attempts before they execute, blocking reads of
-sensitive files while allowing authorized processing through spine tools
+veil intercepts direct file access attempts before they execute, blocking reads
+of sensitive files while allowing authorized processing through spine tools
 (`shape`, `rvl`, `profile`, `canon`, etc.) that run as subprocesses and
 produce structured metadata — never raw data.
 
@@ -68,7 +68,11 @@ veil hooks into Claude Code's `PreToolUse` event for multiple tool types:
 |-------------|----------------|
 | `Read` | Direct file reads into context |
 | `Grep` | Content-mode grep exposing file contents |
-| `Bash` | Shell commands that read files (`cat`, `head`, `python -c "open(...)"`) |
+| `Bash` | Common shell-reader patterns that would expose file contents directly |
+
+Treat `veil` as an operator-first guardrail: it blocks direct reads, then points
+you to the configured authorized path for sensitive-file work instead of
+encouraging ad hoc shell commands.
 
 ### Configuration
 
@@ -125,6 +129,17 @@ veil operator --json
 `veil operator` reads `[spine] authorized_tools` from the active config, runs
 `--describe` on each installed tool, and prints a combined reference with any
 missing or broken tools called out explicitly.
+
+### Operator-First Workflow
+
+When a sensitive-file read is blocked:
+
+1. Run `veil operator`.
+2. Pick the authorized spine tool that matches the job.
+3. Produce metadata or other derived artifacts through that tool instead of
+   reaching for a direct read.
+4. If those derived artifacts later go to a model, use `airlock` to attest the
+   model boundary.
 
 ### Decision Pipeline
 
