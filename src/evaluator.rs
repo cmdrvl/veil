@@ -10,7 +10,7 @@ use crate::packs::PackRegistry;
 use crate::spine::SpineInvocation;
 use crate::types::{Decision, DecisionAction, SensitivityResult, SensitivitySeverity, ToolKind};
 
-const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. Run `veil operator` to see the authorized spine tools available in this repo and choose the right metadata-safe path. If no listed tool fits, write a local script that extracts only metadata (e.g., sheet names, column headers, row counts, field names) and prints a structured summary without loading file contents into context.";
+const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. Run `veil operator` to discover the authorized spine tools available in this repo, then choose the right metadata-safe path for this file. If no listed tool fits, write a local script that extracts only metadata (e.g., sheet names, column headers, row counts, field names) and prints a structured summary without loading file contents into context.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvaluationInput {
@@ -375,6 +375,18 @@ mod tests {
         assert_eq!(
             decision.remediation.as_deref(),
             Some(DIRECT_READ_REMEDIATION)
+        );
+        assert!(
+            decision
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("Run `veil operator`"))
+        );
+        assert!(
+            decision
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("discover the authorized spine tools"))
         );
     }
 

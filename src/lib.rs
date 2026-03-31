@@ -369,6 +369,9 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr should be UTF-8");
         assert!(stderr.contains("Sensitive file access blocked"));
         assert!(!stderr.contains("nested/.."));
+        assert!(stderr.contains("Run `veil operator`"));
+        assert!(stderr.contains("discover the authorized spine tools"));
+        assert!(stderr.contains("choose the right metadata-safe path for this file"));
 
         let records = read_audit_records(&audit_path);
         assert_eq!(records.len(), 1);
