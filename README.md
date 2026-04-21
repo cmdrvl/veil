@@ -214,6 +214,32 @@ raw sensitive files
 That split matters. `veil` protects the local working environment. `airlock`
 attests the model boundary.
 
+## Boundary With Outbound Screening
+
+`veil` is a path guard, not an outbound disclosure policy engine.
+
+It can decide whether an agent may read a local path, grep file contents, or run
+a shell reader that would expose raw sensitive bytes. It can also help wrappers
+preflight attachment paths before send-time workflows hand those files to an
+email or chat client.
+
+It does not decide whether an outbound message body is safe, complete,
+appropriate for a counterpart, or compliant with a relationship-specific
+disclosure profile. That belongs in the calling wrapper and, later, the KOVREX
+surface that owns counterpart identity, authorization, approval state, and
+send-path policy.
+
+Use the split this way:
+
+- `veil`: block raw local reads and screen referenced file paths.
+- calling wrapper: classify outbound intent, recipient, approval context, and
+  body text.
+- KOVREX integration: enforce account, counterpart, and disclosure policy before
+  a send action is allowed.
+
+Do not extend `veil` into a generic outbound content moderator. If the outbound
+body is already in the agent context, `veil` is no longer the right abstraction.
+
 ---
 
 ## Two Operating Modes

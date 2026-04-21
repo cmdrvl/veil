@@ -316,6 +316,25 @@ veil uninstall          # Remove hooks from settings.json
 telemetry or summaries to a model, `veil` does not prove that boundary.
 `airlock` is the companion tool for that job.
 
+**Outbound body policy is not guarded.** `veil` can guard local paths referenced
+by an outbound workflow, including attachment paths, but it does not classify
+message bodies or decide whether a send is allowed. Relationship-specific
+disclosure policy, approval state, counterpart identity, and final send
+authorization belong in the calling wrapper and later KOVREX integration.
+
+This boundary is intentional:
+
+- `veil` answers: would this tool call expose raw local file contents to the
+  agent?
+- the wrapper answers: should this outbound body or action be allowed for this
+  counterpart and context?
+- KOVREX answers: is this authenticated surface allowed to perform this send
+  with these attachments and disclosures?
+
+Do not add generic outbound content-screening semantics to `veil`. It is allowed
+to inspect file paths before an outbound action; it is not responsible for
+moderating prose already present in the agent context.
+
 ---
 
 ## Interaction with Spine Tool Redaction
