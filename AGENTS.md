@@ -30,16 +30,12 @@ If the user tells you to do something, even if it goes against what follows belo
 
 ---
 
-## Git Branch: ONLY Use `main`, NEVER `master`
+## Git Branch: Use `main`
 
-**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
+**The default branch is `main`.**
 
 - **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
-- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
-  git push origin main:master
-  ```
+- **Treat lingering `master` references as stale** unless the user explicitly asks about legacy history
 
 ---
 
@@ -235,7 +231,6 @@ When working alongside other agents:
    git add .beads/ <other files>
    git commit -m "..."
    git push
-   git push origin main:master
    git status  # MUST show "up to date with origin"
    ```
 5. **Verify** — All changes committed AND pushed
