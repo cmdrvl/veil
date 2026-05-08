@@ -17,11 +17,16 @@ use veil::packs::{BUILTIN_PACK_NAMES, PackRegistry};
 use veil::types::{Decision, DecisionAction, SensitivityResult, ToolKind};
 
 use crate::cli::{
-    AuditArgs, ConfigArgs, DirCommandArgs, DoctorArgs, JsonOutputArgs, PathCommandArgs,
+    AuditArgs, ConfigArgs, DirCommandArgs, DoctorAction, DoctorArgs, DoctorCapabilitiesArgs,
+    JsonOutputArgs, PathCommandArgs,
 };
 use crate::hooks;
 
 const RECENT_AUDIT_LIMIT: usize = 20;
+const DOCTOR_HEALTH_SCHEMA_VERSION: &str = "veil.doctor.health.v1";
+const DOCTOR_CAPABILITIES_SCHEMA_VERSION: &str = "veil.doctor.capabilities.v1";
+const DOCTOR_TRIAGE_SCHEMA_VERSION: &str = "veil.doctor.triage.v1";
+const READ_ONLY_DOCTOR_CONTRACT: &str = "cmdrvl.read_only_doctor.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DoctorStatus {
@@ -89,7 +94,20 @@ pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>>
 
 pub fn run_doctor(args: &DoctorArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
-    render_doctor_for_repo(&repo_root, args.json)
+    if args.robot_triage {
+        return render_doctor_robot_triage_for_repo(&repo_root);
+    }
+
+    match &args.action {
+        Some(DoctorAction::Health(health_args)) => {
+            render_doctor_health_for_repo(&repo_root, args.json || health_args.json)
+        }
+        Some(DoctorAction::Capabilities(capabilities_args)) => {
+            render_doctor_capabilities(capabilities_args)
+        }
+        Some(DoctorAction::RobotDocs) => Ok(render_doctor_robot_docs()),
+        None => render_doctor_health_for_repo(&repo_root, args.json),
+    }
 }
 
 pub fn run_operator(args: &JsonOutputArgs) -> Result<String, Box<dyn std::error::Error>> {
@@ -146,7 +164,7 @@ fn render_audit_for_path(
     }
 }
 
-fn render_doctor_for_repo(
+fn render_doctor_health_for_repo(
     repo_root: &Path,
     json_output: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -163,6 +181,42 @@ fn render_doctor_for_repo(
     } else {
         Ok(render_doctor_human(&report))
     }
+}
+
+fn render_doctor_capabilities(
+    args: &DoctorCapabilitiesArgs,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let value = doctor_capabilities_json_value();
+
+    if args.json {
+        Ok(serde_json::to_string_pretty(&value)?)
+    } else {
+        Ok(render_doctor_capabilities_human(&value))
+    }
+}
+
+fn render_doctor_robot_triage_for_repo(
+    repo_root: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let report = build_doctor_report(
+        repo_root,
+        match hooks::default_settings_path() {
+            Ok(path) => SettingsPathStatus::Resolved(path),
+            Err(error) => SettingsPathStatus::Error(error.to_string()),
+        },
+    );
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "schema_version": DOCTOR_TRIAGE_SCHEMA_VERSION,
+        "tool": "veil",
+        "version": env!("CARGO_PKG_VERSION"),
+        "contract": READ_ONLY_DOCTOR_CONTRACT,
+        "ok": report.is_healthy(),
+        "summary": report.summary_json_value(),
+        "checks": report.checks_json_value(),
+        "recommended_actions": report.recommended_actions_json_value(),
+        "capabilities": doctor_capabilities_json_value(),
+    }))?)
 }
 
 fn render_operator_for_repo(
@@ -296,7 +350,17 @@ fn describe_authorized_tool(configured_tool: &str) -> AuthorizedToolReference {
         }
     };
 
-    let mut command = Command::new(&program);
+    let executable = match validate_describe_executable(&program) {
+        Ok(executable) => executable,
+        Err(reason) => {
+            return AuthorizedToolReference {
+                configured_as: configured_tool.to_owned(),
+                status: ToolReferenceStatus::Error { reason },
+            };
+        }
+    };
+
+    let mut command = Command::new(executable);
     command.args(args).arg("--describe");
 
     let status = match command.output() {
@@ -333,6 +397,23 @@ fn describe_command_parts(configured_tool: &str) -> Result<(String, Vec<String>)
         .ok_or_else(|| format!("configured tool command `{configured_tool}` is empty"))?;
 
     Ok((program.clone(), args.to_vec()))
+}
+
+fn validate_describe_executable(program: &str) -> Result<&str, String> {
+    if program.trim().is_empty() {
+        return Err("configured tool command has an empty executable".to_owned());
+    }
+
+    if program
+        .bytes()
+        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+    {
+        return Err(format!(
+            "configured tool executable `{program}` contains a control character"
+        ));
+    }
+
+    Ok(program)
 }
 
 fn format_describe_failure(
@@ -751,25 +832,70 @@ fn actionable_hook_remediation(inspection: &hooks::ManagedHooksInspection) -> St
 fn render_doctor_human(report: &DoctorReport) -> String {
     let mut output = String::new();
     let overall = if report.is_healthy() {
-        "ok"
+        "healthy"
     } else {
-        "action_needed"
+        "attention_needed"
     };
+    let _ = writeln!(
+        output,
+        "veil doctor {overall}: {} checks passed, {} findings",
+        report.ok_count(),
+        report.finding_count()
+    );
     let _ = writeln!(output, "Doctor");
     let _ = writeln!(output, "  overall: {overall}");
 
     for check in &report.checks {
-        let status = match check.status {
-            DoctorStatus::Ok => "ok",
-            DoctorStatus::ActionNeeded => "action_needed",
-        };
+        let status = check.status.as_str();
         let _ = writeln!(output, "  - {} [{}] {}", check.name, status, check.detail);
         if let Some(remediation) = &check.remediation {
-            let _ = writeln!(output, "    fix: {remediation}");
+            let _ = writeln!(output, "    recommendation: {remediation}");
         }
     }
 
     output.trim_end().to_owned()
+}
+
+fn render_doctor_capabilities_human(value: &Value) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Doctor Capabilities");
+    let _ = writeln!(
+        output,
+        "  schema_version: {}",
+        value["schema_version"].as_str().unwrap_or("<unknown>")
+    );
+    let _ = writeln!(output, "  contract: {READ_ONLY_DOCTOR_CONTRACT}");
+    let _ = writeln!(output, "  read_only: true");
+    let _ = writeln!(output, "  fix_mode: not_available");
+    let _ = writeln!(output, "  network: not_used");
+    let _ = writeln!(output, "  commands:");
+    for command in doctor_command_lines() {
+        let _ = writeln!(output, "    - {command}");
+    }
+    output.push_str("  fixers: (none)\n");
+
+    output.trim_end().to_owned()
+}
+
+fn render_doctor_robot_docs() -> String {
+    [
+        "veil doctor robot-docs",
+        "",
+        "Read-only contract:",
+        "- Runs local config, audit-path, and managed Claude hook detectors.",
+        "- Does not install hooks, rewrite settings, write audit records, mutate config, or use network.",
+        "- No fix mode is available in this release.",
+        "",
+        "Commands:",
+        "- veil doctor health",
+        "- veil doctor health --json",
+        "- veil doctor capabilities --json",
+        "- veil doctor --robot-triage",
+        "- veil doctor robot-docs",
+        "",
+        "When `ok` is false, follow `recommended_actions` manually or run `veil install` only when the operator has chosen to repair hook settings.",
+    ]
+    .join("\n")
 }
 
 fn render_test_human(inspection: &PathInspection) -> String {
@@ -1111,22 +1237,148 @@ impl DoctorReport {
             .all(|check| check.status == DoctorStatus::Ok)
     }
 
-    fn to_json_value(&self) -> Value {
+    fn ok_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|check| check.status == DoctorStatus::Ok)
+            .count()
+    }
+
+    fn finding_count(&self) -> usize {
+        self.checks.len().saturating_sub(self.ok_count())
+    }
+
+    fn status_name(&self) -> &'static str {
+        if self.is_healthy() {
+            "healthy"
+        } else {
+            "attention_needed"
+        }
+    }
+
+    fn summary_json_value(&self) -> Value {
         json!({
-            "ok": self.is_healthy(),
-            "checks": self.checks.iter().map(|check| {
-                json!({
-                    "name": check.name,
-                    "status": match check.status {
-                        DoctorStatus::Ok => "ok",
-                        DoctorStatus::ActionNeeded => "action_needed",
-                    },
-                    "detail": check.detail,
-                    "remediation": check.remediation,
-                })
-            }).collect::<Vec<_>>(),
+            "status": self.status_name(),
+            "checks": self.checks.len(),
+            "passed": self.ok_count(),
+            "findings": self.finding_count(),
+            "read_only": true,
+            "fixers": 0,
         })
     }
+
+    fn checks_json_value(&self) -> Vec<Value> {
+        self.checks
+            .iter()
+            .map(DoctorCheck::to_json_value)
+            .collect::<Vec<_>>()
+    }
+
+    fn recommended_actions_json_value(&self) -> Vec<Value> {
+        self.checks
+            .iter()
+            .filter_map(|check| {
+                check.remediation.as_ref().map(|remediation| {
+                    json!({
+                        "check": check.name,
+                        "action": remediation,
+                    })
+                })
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn to_json_value(&self) -> Value {
+        json!({
+            "schema_version": DOCTOR_HEALTH_SCHEMA_VERSION,
+            "tool": "veil",
+            "version": env!("CARGO_PKG_VERSION"),
+            "contract": READ_ONLY_DOCTOR_CONTRACT,
+            "ok": self.is_healthy(),
+            "summary": self.summary_json_value(),
+            "checks": self.checks_json_value(),
+            "recommended_actions": self.recommended_actions_json_value(),
+            "fixers": [],
+        })
+    }
+}
+
+impl DoctorStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DoctorStatus::Ok => "ok",
+            DoctorStatus::ActionNeeded => "action_needed",
+        }
+    }
+}
+
+impl DoctorCheck {
+    fn to_json_value(&self) -> Value {
+        json!({
+            "name": self.name,
+            "status": self.status.as_str(),
+            "detail": self.detail,
+            "remediation": self.remediation,
+        })
+    }
+}
+
+fn doctor_capabilities_json_value() -> Value {
+    json!({
+        "schema_version": DOCTOR_CAPABILITIES_SCHEMA_VERSION,
+        "tool": "veil",
+        "version": env!("CARGO_PKG_VERSION"),
+        "contract": READ_ONLY_DOCTOR_CONTRACT,
+        "read_only": true,
+        "fix_mode": "not_available",
+        "network": "not_used",
+        "writes": {
+            "config": false,
+            "hooks": false,
+            "audit_log": false,
+            "doctor_artifacts": false,
+            "network": false,
+        },
+        "commands": doctor_command_lines().iter().map(|command| {
+            json!({
+                "command": command,
+                "read_only": true,
+            })
+        }).collect::<Vec<_>>(),
+        "detectors": [
+            {
+                "name": "config",
+                "description": "Loads the merged veil configuration from project, user, system, and environment layers.",
+                "writes": false
+            },
+            {
+                "name": "audit",
+                "description": "Reports where audit records would be written without appending an audit record.",
+                "writes": false
+            },
+            {
+                "name": "hooks",
+                "description": "Inspects managed Claude Read/Grep/Bash PreToolUse hook entries and executable resolution.",
+                "writes": false
+            }
+        ],
+        "fixers": [],
+        "artifact_policy": {
+            "doctor_dir": ".doctor/",
+            "written_by_this_release": false,
+            "gitignored": true
+        }
+    })
+}
+
+fn doctor_command_lines() -> Vec<&'static str> {
+    vec![
+        "veil doctor health",
+        "veil doctor health --json",
+        "veil doctor capabilities --json",
+        "veil doctor robot-docs",
+        "veil doctor --robot-triage",
+    ]
 }
 
 impl PathInspection {
@@ -1523,6 +1775,8 @@ mod tests {
         let value = build_doctor_report(&repo_root, SettingsPathStatus::Resolved(settings_path))
             .to_json_value();
 
+        assert_eq!(value["schema_version"], DOCTOR_HEALTH_SCHEMA_VERSION);
+        assert_eq!(value["contract"], READ_ONLY_DOCTOR_CONTRACT);
         assert_eq!(value["ok"], true);
         assert_eq!(
             value["checks"]
@@ -1560,6 +1814,61 @@ mod tests {
         assert!(rendered.contains("hooks [action_needed]"));
         assert!(rendered.contains("do not resolve to executables"));
         assert!(rendered.contains("run `veil install`"));
+    }
+
+    #[test]
+    fn doctor_capabilities_json_reports_read_only_no_fix_contract() {
+        let rendered = render_doctor_capabilities(&DoctorCapabilitiesArgs { json: true })
+            .expect("capabilities should render");
+        let value: Value = serde_json::from_str(&rendered).expect("capabilities JSON should parse");
+
+        assert_eq!(value["schema_version"], DOCTOR_CAPABILITIES_SCHEMA_VERSION);
+        assert_eq!(value["contract"], READ_ONLY_DOCTOR_CONTRACT);
+        assert_eq!(value["read_only"], true);
+        assert_eq!(value["fix_mode"], "not_available");
+        assert_eq!(value["network"], "not_used");
+        assert_eq!(value["writes"]["hooks"], false);
+        assert_eq!(
+            value["fixers"].as_array().map(Vec::len),
+            Some(0),
+            "first doctor slice must not advertise fixers"
+        );
+    }
+
+    #[test]
+    fn doctor_robot_triage_json_includes_recommendations_for_missing_hooks() {
+        let repo_root = unique_temp_dir("doctor-robot-triage");
+        let settings_path = repo_root.join("claude/settings.json");
+        let report = build_doctor_report(&repo_root, SettingsPathStatus::Resolved(settings_path));
+        let value = json!({
+            "schema_version": DOCTOR_TRIAGE_SCHEMA_VERSION,
+            "tool": "veil",
+            "version": env!("CARGO_PKG_VERSION"),
+            "contract": READ_ONLY_DOCTOR_CONTRACT,
+            "ok": report.is_healthy(),
+            "summary": report.summary_json_value(),
+            "checks": report.checks_json_value(),
+            "recommended_actions": report.recommended_actions_json_value(),
+            "capabilities": doctor_capabilities_json_value(),
+        });
+
+        assert_eq!(value["schema_version"], DOCTOR_TRIAGE_SCHEMA_VERSION);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["summary"]["read_only"], true);
+        assert!(
+            value["recommended_actions"]
+                .as_array()
+                .is_some_and(|actions| !actions.is_empty())
+        );
+    }
+
+    #[test]
+    fn doctor_robot_docs_names_no_fix_policy() {
+        let rendered = render_doctor_robot_docs();
+
+        assert!(rendered.contains("veil doctor health"));
+        assert!(rendered.contains("veil doctor capabilities --json"));
+        assert!(rendered.contains("No fix mode is available"));
     }
 
     #[test]

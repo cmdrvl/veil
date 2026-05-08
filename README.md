@@ -130,6 +130,23 @@ veil operator --json
 `--describe` on each installed tool, and prints a combined reference with any
 missing or broken tools called out explicitly.
 
+### Doctor Mode
+
+`veil doctor` is read-only. It inspects local configuration, the audit path, and
+managed Claude Read/Grep/Bash hook state without installing hooks, rewriting
+settings, appending audit records, or using the network.
+
+```bash
+veil doctor health
+veil doctor health --json
+veil doctor capabilities --json
+veil doctor robot-docs
+veil doctor --robot-triage
+```
+
+No `doctor --fix` mode is available yet. Any future repair mode must ship with
+detector, backup, inverse, fixture, and undo coverage before it is exposed.
+
 ### Operator-First Workflow
 
 When a sensitive-file read is blocked:

@@ -30,6 +30,29 @@ pub struct AuditArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct DoctorArgs {
+    #[arg(long = "robot-triage")]
+    pub robot_triage: bool,
+    #[arg(long)]
+    pub json: bool,
+    #[command(subcommand)]
+    pub action: Option<DoctorAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum DoctorAction {
+    Health(DoctorHealthArgs),
+    Capabilities(DoctorCapabilitiesArgs),
+    RobotDocs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct DoctorHealthArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct DoctorCapabilitiesArgs {
     #[arg(long)]
     pub json: bool,
 }
@@ -160,7 +183,11 @@ mod tests {
             ("audit", OperatorCommand::Audit(AuditArgs { json: false })),
             (
                 "doctor",
-                OperatorCommand::Doctor(DoctorArgs { json: false }),
+                OperatorCommand::Doctor(DoctorArgs {
+                    robot_triage: false,
+                    json: false,
+                    action: None,
+                }),
             ),
             ("install", OperatorCommand::Install),
             ("uninstall", OperatorCommand::Uninstall),
@@ -220,7 +247,61 @@ mod tests {
     fn doctor_subcommand_accepts_json_flag() {
         assert_eq!(
             parse(&["veil", "doctor", "--json"]),
-            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs { json: true }))
+            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
+                robot_triage: false,
+                json: true,
+                action: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn doctor_health_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "doctor", "health", "--json"]),
+            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
+                robot_triage: false,
+                json: false,
+                action: Some(DoctorAction::Health(DoctorHealthArgs { json: true })),
+            }))
+        );
+    }
+
+    #[test]
+    fn doctor_capabilities_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "doctor", "capabilities", "--json"]),
+            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
+                robot_triage: false,
+                json: false,
+                action: Some(DoctorAction::Capabilities(DoctorCapabilitiesArgs {
+                    json: true,
+                })),
+            }))
+        );
+    }
+
+    #[test]
+    fn doctor_robot_docs_subcommand_selects_expected_variant() {
+        assert_eq!(
+            parse(&["veil", "doctor", "robot-docs"]),
+            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
+                robot_triage: false,
+                json: false,
+                action: Some(DoctorAction::RobotDocs),
+            }))
+        );
+    }
+
+    #[test]
+    fn doctor_robot_triage_flag_selects_expected_mode() {
+        assert_eq!(
+            parse(&["veil", "doctor", "--robot-triage"]),
+            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
+                robot_triage: true,
+                json: false,
+                action: None,
+            }))
         );
     }
 
