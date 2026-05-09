@@ -58,6 +58,18 @@ Or build from source:
 cargo install --path .
 ```
 
+## Release Automation
+
+Tagged `v*` releases build the four supported tarballs, publish
+`veil-<tag>-SHA256SUMS`, then update `cmdrvl/homebrew-tap` from that published
+checksum asset. Configure `HOMEBREW_TAP_TOKEN` with write access to the tap
+repository before cutting a release. The tap job validates `Formula/veil.rb`,
+pushes directly to `main` when allowed, and opens a documented tap PR if branch
+protection blocks the direct push.
+
+The remaining signed checksum/provenance/SBOM release artifact expansion is
+tracked separately in bead `bd-37f`.
+
 ---
 
 ## How It Works

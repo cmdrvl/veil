@@ -135,3 +135,207 @@ jobs:
             ${{ steps.checksums.outputs.checksum_path }}
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: macos-14
+    permissions:
+      contents: read
+    env:
+      TAP_REPO: cmdrvl/homebrew-tap
+      TAP_DIR: homebrew-tap
+      FORMULA_PATH: Formula/veil.rb
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+    steps:
+      - name: Require Homebrew tap token
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${HOMEBREW_TAP_TOKEN}" ]; then
+            exit 0
+          fi
+          echo "::error::Set HOMEBREW_TAP_TOKEN with write access to cmdrvl/homebrew-tap."
+          exit 1
+
+      - name: Download published checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          checksum_asset="veil-${GITHUB_REF_NAME}-SHA256SUMS"
+          for attempt in 1 2 3 4 5; do
+            if gh release download "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${checksum_asset}" \
+              --dir dist; then
+              break
+            fi
+            if [ "${attempt}" -eq 5 ]; then
+              echo "::error::Could not download published checksum asset ${checksum_asset}."
+              exit 1
+            fi
+            sleep 10
+          done
+          test -s "dist/${checksum_asset}"
+
+      - name: Extract formula inputs
+        id: formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksum_file="dist/veil-${GITHUB_REF_NAME}-SHA256SUMS"
+
+          checksum_for() {
+            local suffix="$1"
+            local output_name="$2"
+            local asset="veil-${GITHUB_REF_NAME}-${suffix}.tar.gz"
+            local checksum
+
+            checksum="$(awk -v asset="${asset}" '$2 == asset { print $1 }' "${checksum_file}")"
+            if [ -z "${checksum}" ]; then
+              echo "::error::Missing checksum for ${asset} in ${checksum_file}."
+              exit 1
+            fi
+
+            echo "${output_name}=${checksum}" >> "${GITHUB_OUTPUT}"
+          }
+
+          checksum_for "darwin-arm64" "darwin_arm64_sha256"
+          checksum_for "darwin-x86_64" "darwin_x86_64_sha256"
+          checksum_for "linux-arm64" "linux_arm64_sha256"
+          checksum_for "linux-x86_64" "linux_x86_64_sha256"
+          echo "version=${GITHUB_REF_NAME#v}" >> "${GITHUB_OUTPUT}"
+          echo "asset_base=https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPO }}
+          path: ${{ env.TAP_DIR }}
+          token: ${{ env.HOMEBREW_TAP_TOKEN }}
+
+      - name: Generate veil formula
+        working-directory: ${{ env.TAP_DIR }}
+        env:
+          ASSET_BASE: ${{ steps.formula.outputs.asset_base }}
+          DARWIN_ARM64_SHA256: ${{ steps.formula.outputs.darwin_arm64_sha256 }}
+          DARWIN_X86_64_SHA256: ${{ steps.formula.outputs.darwin_x86_64_sha256 }}
+          LINUX_ARM64_SHA256: ${{ steps.formula.outputs.linux_arm64_sha256 }}
+          LINUX_X86_64_SHA256: ${{ steps.formula.outputs.linux_x86_64_sha256 }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.formula.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${FORMULA_PATH}")"
+          cat > "${FORMULA_PATH}" <<RUBY
+          class Veil < Formula
+            desc "Data exfiltration guard for AI coding agents"
+            homepage "https://github.com/cmdrvl/veil"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${ASSET_BASE}/veil-${RELEASE_TAG}-darwin-arm64.tar.gz"
+                sha256 "${DARWIN_ARM64_SHA256}"
+              end
+
+              on_intel do
+                url "${ASSET_BASE}/veil-${RELEASE_TAG}-darwin-x86_64.tar.gz"
+                sha256 "${DARWIN_X86_64_SHA256}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${ASSET_BASE}/veil-${RELEASE_TAG}-linux-arm64.tar.gz"
+                sha256 "${LINUX_ARM64_SHA256}"
+              end
+
+              on_intel do
+                url "${ASSET_BASE}/veil-${RELEASE_TAG}-linux-x86_64.tar.gz"
+                sha256 "${LINUX_X86_64_SHA256}"
+              end
+            end
+
+            def install
+              bin.install "veil"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/veil --version")
+            end
+          end
+          RUBY
+
+      - name: Validate formula syntax
+        working-directory: ${{ env.TAP_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -c "${FORMULA_PATH}"
+          brew style "${FORMULA_PATH}"
+
+      - name: Publish tap update
+        working-directory: ${{ env.TAP_DIR }}
+        env:
+          GH_TOKEN: ${{ env.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- "${FORMULA_PATH}"; then
+            echo "Formula already matches ${GITHUB_REF_NAME}; no tap update needed."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${FORMULA_PATH}"
+          git commit -m "veil ${GITHUB_REF_NAME}"
+
+          if git push origin HEAD:main; then
+            echo "Updated ${TAP_REPO} main with veil ${GITHUB_REF_NAME}."
+            exit 0
+          fi
+
+          branch="automation/veil-${GITHUB_REF_NAME}-homebrew-tap"
+          echo "::warning::Direct tap push failed; opening ${TAP_REPO} pull request from ${branch}."
+
+          if ! git push origin "HEAD:${branch}"; then
+            existing_pr_url="$(gh pr list \
+              --repo "${TAP_REPO}" \
+              --head "${branch}" \
+              --state open \
+              --json url \
+              --jq '.[0].url // ""')"
+            if [ -n "${existing_pr_url}" ]; then
+              echo "Existing tap update PR: ${existing_pr_url}"
+              exit 0
+            fi
+
+            echo "::error::Could not push ${branch} and no open PR was found."
+            exit 1
+          fi
+
+          existing_pr_url="$(gh pr list \
+            --repo "${TAP_REPO}" \
+            --head "${branch}" \
+            --state open \
+            --json url \
+            --jq '.[0].url // ""')"
+          if [ -n "${existing_pr_url}" ]; then
+            echo "Updated existing tap update PR: ${existing_pr_url}"
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "${TAP_REPO}" \
+            --base main \
+            --head "${branch}" \
+            --title "Update veil to ${GITHUB_REF_NAME}" \
+            --body "Automated Homebrew tap update for ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}. Formula/veil.rb was regenerated from the published checksum asset veil-${GITHUB_REF_NAME}-SHA256SUMS and validated with ruby -c plus brew style before this branch was pushed."
