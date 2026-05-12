@@ -1,5 +1,9 @@
 # veil
 
+![veil: privacy guard at the read boundary. A painterly dashboard showing a restricted source file (Connections.csv, LinkedIn export) on the left, a refusal artifact and an explicit grant card in the middle, and aggregates flowing to model context on the right. An evidence ledger records both the refusal and the grant with timestamps.](docs/images/veil.webp)
+
+> *The agent asked to read the file. Veil decided what happens next.*
+
 **Data exfiltration guard for AI coding agents.**
 
 A high-performance Claude Code hook that blocks direct sensitive-file reads
@@ -287,3 +291,7 @@ Agent never touches documents. It writes a deterministic pipeline script that th
 ## License
 
 MIT
+
+---
+
+*`veil` is part of the open-source toolchain from the [CMD+RVL](https://cmdrvl.com) lineage and AI enablement practice. MIT-licensed. Contributions welcome from any practice or stack.*
