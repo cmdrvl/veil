@@ -689,18 +689,18 @@ fn build_doctor_report(repo_root: &Path, settings_status: SettingsPathStatus) ->
     }
 
     match settings_status {
-        SettingsPathStatus::Resolved(path) => match hooks::inspect_managed_hooks(&path) {
+        SettingsPathStatus::Resolved(path) => match hooks::inspect_guard_preflight(&path) {
             Ok(inspection) if inspection.is_healthy() => checks.push(DoctorCheck {
                 name: "hooks",
                 status: DoctorStatus::Ok,
-                detail: healthy_hook_detail(&path, &inspection),
+                detail: healthy_guard_hook_detail(&path, &inspection),
                 remediation: None,
             }),
             Ok(inspection) => checks.push(DoctorCheck {
                 name: "hooks",
                 status: DoctorStatus::ActionNeeded,
-                detail: actionable_hook_detail(&path, &inspection),
-                remediation: Some(actionable_hook_remediation(&inspection)),
+                detail: actionable_guard_hook_detail(&path, &inspection),
+                remediation: Some(actionable_guard_hook_remediation(&inspection)),
             }),
             Err(error) => checks.push(DoctorCheck {
                 name: "hooks",
@@ -723,6 +723,14 @@ fn build_doctor_report(repo_root: &Path, settings_status: SettingsPathStatus) ->
     }
 
     DoctorReport { checks }
+}
+
+fn healthy_guard_hook_detail(path: &Path, inspection: &hooks::GuardPreflightInspection) -> String {
+    format!(
+        "{}; {}",
+        healthy_hook_detail(path, &inspection.veil),
+        dcg_hook_detail(&inspection.dcg)
+    )
 }
 
 fn audit_check_detail(path: &Path) -> String {
@@ -758,6 +766,47 @@ fn healthy_hook_detail(path: &Path, inspection: &hooks::ManagedHooksInspection) 
             "managed Read/Grep/Bash hooks are installed in {} and all configured commands resolve to executables",
             path.display()
         )
+    }
+}
+
+fn actionable_guard_hook_detail(
+    path: &Path,
+    inspection: &hooks::GuardPreflightInspection,
+) -> String {
+    let mut details = Vec::new();
+
+    if !inspection.veil.is_healthy() {
+        details.push(actionable_hook_detail(path, &inspection.veil));
+    }
+
+    if !inspection.dcg.is_healthy() {
+        details.push(dcg_hook_detail(&inspection.dcg));
+    }
+
+    details.join("; ")
+}
+
+fn actionable_guard_hook_remediation(inspection: &hooks::GuardPreflightInspection) -> String {
+    let veil_unhealthy = !inspection.veil.is_healthy();
+    let dcg_unhealthy = !inspection.dcg.is_healthy();
+
+    match (veil_unhealthy, dcg_unhealthy) {
+        (true, true) => "run `veil install` to restore veil PreToolUse entries, then install or repair the dcg Bash PreToolUse hook".to_owned(),
+        (true, false) => actionable_hook_remediation(&inspection.veil),
+        (false, true) => "install or repair the dcg Bash PreToolUse hook, then rerun `veil doctor`".to_owned(),
+        (false, false) => "rerun `veil doctor` after reinstalling the hooks".to_owned(),
+    }
+}
+
+fn dcg_hook_detail(inspection: &hooks::DcgHookInspection) -> String {
+    match &inspection.status {
+        hooks::ManagedHookStatus::Installed { executable, .. } => {
+            format!("dcg Bash hook resolves to {}", executable.display())
+        }
+        hooks::ManagedHookStatus::Missing => "missing dcg Bash hook".to_owned(),
+        hooks::ManagedHookStatus::Invalid { command, reason } => {
+            format!("dcg Bash hook command `{command}` does not resolve: {reason}")
+        }
     }
 }
 
@@ -1777,7 +1826,9 @@ mod tests {
         let repo_root = unique_temp_dir("doctor-json");
         let settings_path = repo_root.join("claude/settings.json");
         let executable_path = repo_root.join("bin/veil");
+        let dcg_path = repo_root.join("bin/dcg");
         create_executable(&executable_path);
+        create_executable(&dcg_path);
         write_file(
             &settings_path,
             &format!(
@@ -1786,13 +1837,20 @@ mod tests {
                 "PreToolUse": [
                   {{ "matcher": "Read", "hooks": [{{ "type": "command", "command": "{}" }}] }},
                   {{ "matcher": "Grep", "hooks": [{{ "type": "command", "command": "{}" }}] }},
-                  {{ "matcher": "Bash", "hooks": [{{ "type": "command", "command": "{}" }}] }}
+                  {{
+                    "matcher": "Bash",
+                    "hooks": [
+                      {{ "type": "command", "command": "{}" }},
+                      {{ "type": "command", "command": "{}" }}
+                    ]
+                  }}
                 ]
               }}
             }}"#,
                 executable_path.display(),
                 executable_path.display(),
-                executable_path.display()
+                executable_path.display(),
+                dcg_path.display()
             ),
         );
 

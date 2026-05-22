@@ -25,6 +25,10 @@ fn dispatch() -> Result<u8, Box<dyn std::error::Error>> {
 }
 
 fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::error::Error>> {
+    if command_requires_guard_preflight(&command) {
+        enforce_guard_preflight()?;
+    }
+
     match command {
         cli::OperatorCommand::Operator(args) => {
             println!("{}", operator::run_operator(&args)?);
@@ -68,5 +72,32 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             println!("Removed veil hooks from {}", path.display());
             Ok(0)
         }
+    }
+}
+
+fn command_requires_guard_preflight(command: &cli::OperatorCommand) -> bool {
+    !matches!(
+        command,
+        cli::OperatorCommand::Doctor(_)
+            | cli::OperatorCommand::Install
+            | cli::OperatorCommand::Uninstall
+    )
+}
+
+fn enforce_guard_preflight() -> Result<(), Box<dyn std::error::Error>> {
+    let settings_path = hooks::default_settings_path().map_err(|error| {
+        format!("guard preflight failed: could not resolve active hook settings path: {error}")
+    })?;
+    let inspection = hooks::inspect_guard_preflight(&settings_path).map_err(|error| {
+        format!(
+            "guard preflight failed: could not inspect hook settings at {}: {error}",
+            settings_path.display()
+        )
+    })?;
+
+    if inspection.is_healthy() {
+        Ok(())
+    } else {
+        Err(hooks::guard_preflight_refusal(&settings_path, &inspection).into())
     }
 }

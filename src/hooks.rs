@@ -9,6 +9,11 @@ use serde_json::{Map, Value, json};
 const MANAGED_MATCHERS: &[&str] = &["Read", "Grep", "Bash"];
 const LEGACY_VEIL_COMMAND: &str = "$HOME/.local/bin/veil";
 const SETTINGS_OVERRIDE_ENV: &str = "VEIL_CLAUDE_SETTINGS_PATH";
+const DCG_COMMAND_STEMS: &[&str] = &[
+    "dcg",
+    "destructive_command_guard",
+    "destructive-command-guard",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManagedHooksInspection {
@@ -16,8 +21,19 @@ pub(crate) struct ManagedHooksInspection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardPreflightInspection {
+    pub veil: ManagedHooksInspection,
+    pub dcg: DcgHookInspection,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManagedMatcherInspection {
     pub matcher: &'static str,
+    pub status: ManagedHookStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DcgHookInspection {
     pub status: ManagedHookStatus,
 }
 
@@ -53,17 +69,62 @@ pub(crate) fn default_settings_path() -> io::Result<PathBuf> {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn inspect_managed_hooks(path: &Path) -> io::Result<ManagedHooksInspection> {
     let mut settings = load_settings(path)?;
     let entries = pre_tool_use_entries(&mut settings);
+    Ok(inspect_veil_entries(entries))
+}
+
+pub(crate) fn inspect_guard_preflight(path: &Path) -> io::Result<GuardPreflightInspection> {
+    let mut settings = load_settings(path)?;
+    let entries = pre_tool_use_entries(&mut settings);
+
+    Ok(GuardPreflightInspection {
+        veil: inspect_veil_entries(entries),
+        dcg: inspect_dcg_entries(entries),
+    })
+}
+
+pub(crate) fn guard_preflight_refusal(
+    path: &Path,
+    inspection: &GuardPreflightInspection,
+) -> String {
+    let mut findings = Vec::new();
+
+    if !inspection.veil.is_healthy() {
+        findings.push("veil Read/Grep/Bash hooks are missing or invalid".to_owned());
+    }
+
+    match &inspection.dcg.status {
+        ManagedHookStatus::Installed { .. } => {}
+        ManagedHookStatus::Missing => findings.push("dcg Bash hook is missing".to_owned()),
+        ManagedHookStatus::Invalid { command, reason } => findings.push(format!(
+            "dcg Bash hook command `{command}` is invalid: {reason}"
+        )),
+    }
+
+    let findings = if findings.is_empty() {
+        "unknown guard-hook failure".to_owned()
+    } else {
+        findings.join("; ")
+    };
+
+    format!(
+        "guard preflight failed: {findings}. Refusing to run domain work until both dcg and veil hooks are installed and healthy. Run `veil doctor` for details; run `veil install` to repair veil hooks and install or repair dcg. Settings: {}",
+        path.display()
+    )
+}
+
+fn inspect_veil_entries(entries: &[Value]) -> ManagedHooksInspection {
     let matchers = MANAGED_MATCHERS
         .iter()
         .map(|matcher| ManagedMatcherInspection {
             matcher,
             status: entries
                 .iter()
-                .find(|entry| matcher_matches(entry, matcher))
-                .and_then(managed_hook_command)
+                .filter(|entry| matcher_matches(entry, matcher))
+                .find_map(managed_hook_command)
                 .map_or(
                     ManagedHookStatus::Missing,
                     |command| match resolve_hook_command_executable(&command) {
@@ -77,7 +138,26 @@ pub(crate) fn inspect_managed_hooks(path: &Path) -> io::Result<ManagedHooksInspe
         })
         .collect();
 
-    Ok(ManagedHooksInspection { matchers })
+    ManagedHooksInspection { matchers }
+}
+
+fn inspect_dcg_entries(entries: &[Value]) -> DcgHookInspection {
+    let status = entries
+        .iter()
+        .filter(|entry| matcher_matches(entry, "Bash"))
+        .find_map(dcg_hook_command)
+        .map_or(
+            ManagedHookStatus::Missing,
+            |command| match resolve_hook_command_executable(&command) {
+                Ok(executable) => ManagedHookStatus::Installed {
+                    command,
+                    executable,
+                },
+                Err(reason) => ManagedHookStatus::Invalid { command, reason },
+            },
+        );
+
+    DcgHookInspection { status }
 }
 
 impl ManagedHooksInspection {
@@ -85,6 +165,18 @@ impl ManagedHooksInspection {
         self.matchers
             .iter()
             .all(|matcher| matches!(matcher.status, ManagedHookStatus::Installed { .. }))
+    }
+}
+
+impl DcgHookInspection {
+    pub(crate) fn is_healthy(&self) -> bool {
+        matches!(self.status, ManagedHookStatus::Installed { .. })
+    }
+}
+
+impl GuardPreflightInspection {
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.veil.is_healthy() && self.dcg.is_healthy()
     }
 }
 
@@ -243,7 +335,25 @@ fn managed_hook_command(entry: &Value) -> Option<String> {
         .find_map(managed_hook_command_from_hook)
 }
 
+fn dcg_hook_command(entry: &Value) -> Option<String> {
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(dcg_hook_command_from_hook)
+}
+
 fn managed_hook_command_from_hook(hook: &Value) -> Option<String> {
+    let command = command_hook_command(hook)?;
+    is_managed_veil_command(&command).then_some(command)
+}
+
+fn dcg_hook_command_from_hook(hook: &Value) -> Option<String> {
+    let command = command_hook_command(hook)?;
+    is_dcg_command(&command).then_some(command)
+}
+
+fn command_hook_command(hook: &Value) -> Option<String> {
     let object = hook.as_object()?;
 
     let is_command_hook = object
@@ -254,8 +364,10 @@ fn managed_hook_command_from_hook(hook: &Value) -> Option<String> {
         return None;
     }
 
-    let command = object.get("command").and_then(Value::as_str)?;
-    is_managed_veil_command(command).then(|| command.to_owned())
+    object
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn is_managed_veil_hook(hook: &Value) -> bool {
@@ -275,6 +387,18 @@ fn is_managed_veil_command(command: &str) -> bool {
                 .map(str::to_owned)
         })
         .is_some_and(|stem| stem == "veil")
+}
+
+fn is_dcg_command(command: &str) -> bool {
+    command_program(command)
+        .and_then(|program| {
+            Path::new(&program)
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .map(str::to_owned)
+        })
+        .map(|stem| stem.to_ascii_lowercase())
+        .is_some_and(|stem| DCG_COMMAND_STEMS.iter().any(|candidate| candidate == &stem))
 }
 
 fn set_hook_command(hook: &mut Value, command: &str) {
@@ -697,6 +821,115 @@ mod tests {
                 .matchers
                 .iter()
                 .all(|matcher| { matches!(matcher.status, ManagedHookStatus::Invalid { .. }) })
+        );
+    }
+
+    #[test]
+    fn guard_preflight_requires_dcg_bash_hook() {
+        let path = temp_settings_path("guard-preflight-missing-dcg");
+        let executable_path = temp_executable_path("guard-preflight-missing-dcg");
+        create_executable(&executable_path);
+        let command = quote_test_command(&executable_path);
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook(&command)] },
+                        { "matcher": "Grep", "hooks": [veil_hook(&command)] },
+                        { "matcher": "Bash", "hooks": [veil_hook(&command)] }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        let inspection =
+            inspect_guard_preflight(&path).expect("guard preflight probe should succeed");
+
+        assert!(inspection.veil.is_healthy());
+        assert!(!inspection.is_healthy());
+        assert!(matches!(inspection.dcg.status, ManagedHookStatus::Missing));
+        assert!(guard_preflight_refusal(&path, &inspection).contains("dcg Bash hook is missing"));
+    }
+
+    #[test]
+    fn guard_preflight_finds_dcg_in_later_bash_entry() {
+        let path = temp_settings_path("guard-preflight-split-bash");
+        let veil_path = temp_executable_path("guard-preflight-split-bash");
+        let dcg_path = veil_path
+            .parent()
+            .expect("test executable should have a parent")
+            .join("dcg");
+        create_executable(&veil_path);
+        create_executable(&dcg_path);
+        let veil_command = quote_test_command(&veil_path);
+        let dcg_command = quote_test_command(&dcg_path);
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook(&veil_command)] },
+                        { "matcher": "Grep", "hooks": [veil_hook(&veil_command)] },
+                        { "matcher": "Bash", "hooks": [veil_hook(&veil_command)] },
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                { "type": "command", "command": dcg_command }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        assert!(
+            inspect_guard_preflight(&path)
+                .expect("guard preflight probe should succeed")
+                .is_healthy(),
+            "preflight should scan all active Bash entries"
+        );
+    }
+
+    #[test]
+    fn guard_preflight_accepts_healthy_veil_and_dcg_hooks() {
+        let path = temp_settings_path("guard-preflight-ok");
+        let veil_path = temp_executable_path("guard-preflight-ok");
+        let dcg_path = veil_path
+            .parent()
+            .expect("test executable should have a parent")
+            .join("dcg");
+        create_executable(&veil_path);
+        create_executable(&dcg_path);
+        let veil_command = quote_test_command(&veil_path);
+        let dcg_command = quote_test_command(&dcg_path);
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook(&veil_command)] },
+                        { "matcher": "Grep", "hooks": [veil_hook(&veil_command)] },
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                veil_hook(&veil_command),
+                                { "type": "command", "command": dcg_command }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        assert!(
+            inspect_guard_preflight(&path)
+                .expect("guard preflight probe should succeed")
+                .is_healthy(),
+            "veil and dcg hooks should both be healthy"
         );
     }
 }

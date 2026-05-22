@@ -208,6 +208,10 @@ File access attempt (Read/Grep/Bash)
 - Unknown file outside `[sensitivity] protected` directories is allowed.
 - Unknown file inside a protected directory is treated as sensitive and resolved through `[policy] default`.
 - Classified-sensitive file anywhere is resolved through pack-specific rules or `[policy] default`, with direct reads denied by default.
+- Operator/domain commands fail closed unless the active Claude `PreToolUse`
+  settings contain healthy `veil` Read/Grep/Bash hooks and a healthy `dcg` Bash
+  hook. `veil doctor`, `veil install`, and `veil uninstall` remain available as
+  guard-maintenance commands when the preflight is failing.
 
 ---
 
