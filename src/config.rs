@@ -252,6 +252,7 @@ fn append_unique(target: &mut Vec<String>, items: Vec<String>) {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PartialConfig {
     sensitivity: Option<PartialSensitivityConfig>,
     allowlist: Option<PartialAllowlistConfig>,
@@ -294,21 +295,25 @@ impl PartialConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PartialSensitivityConfig {
     protected: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PartialAllowlistConfig {
     safe_patterns: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PartialSpineConfig {
     authorized_tools: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PartialPolicyConfig {
     #[serde(rename = "default")]
     default: Option<PolicyMode>,
@@ -1153,6 +1158,37 @@ mod tests {
         assert!(
             error.to_string().contains("invalid project config"),
             "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn secret_config_sections_are_rejected() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let error = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            None,
+            Some(
+                r#"
+                [secrets]
+                source = "aws-secrets-manager"
+                "#,
+            ),
+            PartialConfig::default(),
+        )
+        .expect_err("veil config should not accept secret source sections");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("invalid project config"),
+            "unexpected error message: {error}"
+        );
+        assert!(
+            error.to_string().contains("unknown field `secrets`"),
+            "secret config sections must not be silently ignored: {error}"
         );
     }
 

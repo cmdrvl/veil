@@ -140,6 +140,12 @@ state, holon doctor runs, receipts, migration records, and deprecation notices.
 That profile is preserved when user, project, or environment protected patterns
 are supplied.
 
+`veil` configuration intentionally contains no secret-valued fields. Do not put
+API keys, tokens, or cloud secret references in `veil` config files; unknown
+sections such as `[secrets]` are rejected instead of ignored. Because `veil`
+does not require config-file secrets, it does not need an AWS Secrets Manager
+or SSM Parameter Store adapter.
+
 ### Operator Discovery
 
 When `veil` blocks a direct read, use the configured authorized path instead of guessing:
