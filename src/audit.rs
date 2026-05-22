@@ -35,31 +35,21 @@ impl AuditRecord {
 }
 
 pub fn default_audit_path() -> io::Result<PathBuf> {
-    default_audit_path_from(
-        env::var_os("XDG_STATE_HOME").map(PathBuf::from),
-        env::var_os("HOME").map(PathBuf::from),
-    )
+    default_audit_path_from(env::var_os("HOME").map(PathBuf::from))
 }
 
-fn default_audit_path_from(
-    xdg_state_home: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> io::Result<PathBuf> {
-    if let Some(state_home) = xdg_state_home {
-        return Ok(state_home.join("veil").join("audit.jsonl"));
-    }
-
+fn default_audit_path_from(home: Option<PathBuf>) -> io::Result<PathBuf> {
     if let Some(home_dir) = home {
         return Ok(home_dir
-            .join(".local")
-            .join("state")
+            .join(".cmdrvl")
+            .join("logs")
             .join("veil")
             .join("audit.jsonl"));
     }
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "unable to resolve default audit path from XDG_STATE_HOME or HOME",
+        "unable to resolve default CMD+RVL audit path from HOME",
     ))
 }
 
@@ -109,31 +99,19 @@ mod tests {
     }
 
     #[test]
-    fn default_path_prefers_xdg_state_home() {
-        let path = default_audit_path_from(
-            Some(PathBuf::from("/tmp/xdg-state")),
-            Some(PathBuf::from("/tmp/home")),
-        )
-        .expect("xdg state path should resolve");
-
-        assert_eq!(path, PathBuf::from("/tmp/xdg-state/veil/audit.jsonl"));
-    }
-
-    #[test]
-    fn default_path_falls_back_to_home_local_state() {
-        let path =
-            default_audit_path_from(None, Some(PathBuf::from("/tmp/home"))).expect("home path");
+    fn default_path_uses_cmdrvl_logs_root() {
+        let path = default_audit_path_from(Some(PathBuf::from("/tmp/home")))
+            .expect("home path should resolve");
 
         assert_eq!(
             path,
-            PathBuf::from("/tmp/home/.local/state/veil/audit.jsonl")
+            PathBuf::from("/tmp/home/.cmdrvl/logs/veil/audit.jsonl")
         );
     }
 
     #[test]
     fn default_path_errors_without_any_base_directory() {
-        let error =
-            default_audit_path_from(None, None).expect_err("missing env should return an error");
+        let error = default_audit_path_from(None).expect_err("missing HOME should return an error");
 
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
@@ -165,14 +143,14 @@ mod tests {
     #[test]
     fn append_default_path_resolves_outside_the_repo_tree() {
         let temp_home = unique_temp_dir("audit-home");
-        let path = default_audit_path_from(None, Some(temp_home.clone())).expect("path");
+        let path = default_audit_path_from(Some(temp_home.clone())).expect("path");
 
         assert!(path.starts_with(&temp_home));
         assert_eq!(
             path,
             temp_home
-                .join(".local")
-                .join("state")
+                .join(".cmdrvl")
+                .join("logs")
                 .join("veil")
                 .join("audit.jsonl")
         );

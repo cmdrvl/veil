@@ -93,7 +93,7 @@ encouraging ad hoc shell commands.
 ### Configuration
 
 ```toml
-# .veil.toml (project root) or ~/.config/veil/config.toml
+# .veil.toml (project root) or ~/.cmdrvl/config/veil/config.toml
 
 [sensitivity]
 # Paths that are sensitive (glob patterns)
@@ -130,7 +130,7 @@ safe_patterns = [
 # explicitly protected directory)
 default = "deny"           # deny | warn | log
 audit_log = true           # Log all access attempts
-audit_path = "~/.local/state/veil/audit.jsonl"  # default; outside repo
+audit_path = "~/.cmdrvl/logs/veil/audit.jsonl"  # default; outside repo
 ```
 
 veil also ships a built-in CMD+RVL config-protection profile. Direct content

@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::allowlist::DEFAULT_SAFE_PATTERNS;
 
@@ -31,6 +33,12 @@ const DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES: &[&str] = &[
     "migrations",
     "notices",
 ];
+
+const CMDRVL_ROOT_DIR: &str = ".cmdrvl";
+const VEIL_CONFIG_RELATIVE: &[&str] = &["config", "veil", "config.toml"];
+const VEIL_AUDIT_RELATIVE: &[&str] = &["logs", "veil", "audit.jsonl"];
+const MIGRATION_LOG_RELATIVE: &[&str] = &["migrations", "applied.jsonl"];
+const DEPRECATED_NOTICE_RELATIVE: &[&str] = &["notices", "deprecated-paths.jsonl"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -95,7 +103,37 @@ fn load_config_from_paths(
     env_overrides: PartialConfig,
 ) -> io::Result<Config> {
     let mut config = Config::defaults(home, xdg_state_home)?;
-    let user_path = user_config_path(home, xdg_config_home);
+    let user_path = user_config_path(home);
+    let legacy_user_path = legacy_user_config_path(home, xdg_config_home);
+    if legacy_user_path.exists() {
+        migrate_legacy_file(
+            home,
+            &legacy_user_path,
+            &user_path,
+            "veil-user-config",
+            "config",
+        )?;
+    } else {
+        migrate_legacy_file(
+            home,
+            system_path,
+            &user_path,
+            "veil-system-config",
+            "config",
+        )?;
+    }
+
+    let audit_path = default_audit_path(home, xdg_state_home)?;
+    if let Some(legacy_audit_path) = legacy_audit_path(home, xdg_state_home) {
+        migrate_legacy_file(
+            home,
+            &legacy_audit_path,
+            &audit_path,
+            "veil-audit-log",
+            "log",
+        )?;
+    }
+
     let project_path = repo_root.join(".veil.toml");
 
     for (path, layer_name) in [
@@ -175,9 +213,7 @@ impl Config {
 }
 
 fn default_cmdrvl_config_protection_patterns(home: Option<&Path>) -> Vec<String> {
-    let root = home
-        .map(|path| path.join(".cmdrvl"))
-        .unwrap_or_else(|| PathBuf::from(".cmdrvl"));
+    let root = cmdrvl_root(home);
 
     DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES
         .iter()
@@ -309,7 +345,11 @@ fn expand_partial_paths(mut config: PartialConfig, home: Option<&Path>) -> Parti
     config
 }
 
-fn user_config_path(home: Option<&Path>, xdg_config_home: Option<&Path>) -> PathBuf {
+fn user_config_path(home: Option<&Path>) -> PathBuf {
+    join_relative(&cmdrvl_root(home), VEIL_CONFIG_RELATIVE)
+}
+
+fn legacy_user_config_path(home: Option<&Path>, xdg_config_home: Option<&Path>) -> PathBuf {
     match xdg_config_home {
         Some(path) => path.join("veil/config.toml"),
         None => match home {
@@ -319,19 +359,168 @@ fn user_config_path(home: Option<&Path>, xdg_config_home: Option<&Path>) -> Path
     }
 }
 
-fn default_audit_path(home: Option<&Path>, xdg_state_home: Option<&Path>) -> io::Result<PathBuf> {
-    if let Some(path) = xdg_state_home {
-        return Ok(path.join("veil/audit.jsonl"));
-    }
-
+fn default_audit_path(home: Option<&Path>, _xdg_state_home: Option<&Path>) -> io::Result<PathBuf> {
     if let Some(path) = home {
-        return Ok(path.join(".local/state/veil/audit.jsonl"));
+        return Ok(join_relative(&cmdrvl_root(Some(path)), VEIL_AUDIT_RELATIVE));
     }
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "HOME or XDG_STATE_HOME must be set to resolve the default audit path",
+        "HOME must be set to resolve the default CMD+RVL audit path",
     ))
+}
+
+fn legacy_audit_path(home: Option<&Path>, xdg_state_home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = xdg_state_home {
+        return Some(path.join("veil/audit.jsonl"));
+    }
+
+    home.map(|path| path.join(".local/state/veil/audit.jsonl"))
+}
+
+fn cmdrvl_root(home: Option<&Path>) -> PathBuf {
+    home.map(|path| path.join(CMDRVL_ROOT_DIR))
+        .unwrap_or_else(|| PathBuf::from(CMDRVL_ROOT_DIR))
+}
+
+fn join_relative(root: &Path, components: &[&str]) -> PathBuf {
+    components
+        .iter()
+        .fold(root.to_path_buf(), |path, component| path.join(component))
+}
+
+fn migrate_legacy_file(
+    home: Option<&Path>,
+    legacy_path: &Path,
+    canonical_path: &Path,
+    path_class: &str,
+    category: &str,
+) -> io::Result<()> {
+    if legacy_path == canonical_path || !legacy_path.exists() {
+        return Ok(());
+    }
+
+    let root = cmdrvl_root(home);
+    if canonical_path.exists() {
+        append_migration_notice(
+            &root,
+            path_class,
+            category,
+            legacy_path,
+            canonical_path,
+            "canonical-preferred",
+        )?;
+        return Ok(());
+    }
+
+    if let Some(parent) = canonical_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match fs::copy(legacy_path, canonical_path) {
+        Ok(_) => {
+            preserve_permissions(legacy_path, canonical_path)?;
+            append_migration_event(
+                &root,
+                path_class,
+                category,
+                legacy_path,
+                canonical_path,
+                "copied",
+                "ok",
+            )?;
+            append_migration_notice(
+                &root,
+                path_class,
+                category,
+                legacy_path,
+                canonical_path,
+                "copied-to-canonical",
+            )
+        }
+        Err(error) => {
+            append_migration_event(
+                &root,
+                path_class,
+                category,
+                legacy_path,
+                canonical_path,
+                "copy",
+                "error",
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn preserve_permissions(source: &Path, destination: &Path) -> io::Result<()> {
+    let permissions = fs::metadata(source)?.permissions();
+    fs::set_permissions(destination, permissions)
+}
+
+fn append_migration_event(
+    root: &Path,
+    path_class: &str,
+    category: &str,
+    source_path: &Path,
+    destination_path: &Path,
+    action: &str,
+    outcome: &str,
+) -> io::Result<()> {
+    append_jsonl(
+        &join_relative(root, MIGRATION_LOG_RELATIVE),
+        json!({
+            "ts": migration_timestamp(),
+            "tool": "veil",
+            "path_class": path_class,
+            "category": category,
+            "source_path": source_path.display().to_string(),
+            "destination_path": destination_path.display().to_string(),
+            "action": action,
+            "outcome": outcome,
+        }),
+    )
+}
+
+fn append_migration_notice(
+    root: &Path,
+    path_class: &str,
+    category: &str,
+    source_path: &Path,
+    destination_path: &Path,
+    action: &str,
+) -> io::Result<()> {
+    append_jsonl(
+        &join_relative(root, DEPRECATED_NOTICE_RELATIVE),
+        json!({
+            "ts": migration_timestamp(),
+            "tool": "veil",
+            "path_class": path_class,
+            "category": category,
+            "legacy_path": source_path.display().to_string(),
+            "canonical_path": destination_path.display().to_string(),
+            "action": action,
+        }),
+    )
+}
+
+fn append_jsonl(path: &Path, value: Value) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, &value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    file.write_all(b"\n")?;
+    file.flush()
+}
+
+fn migration_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_owned())
 }
 
 fn split_csv_env(name: &str) -> Option<Vec<String>> {
@@ -405,14 +594,22 @@ fn expand_tilde(path: &Path, home: Option<&Path>, xdg_state_home: Option<&Path>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_temp_root(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after the Unix epoch")
             .as_nanos();
-        env::temp_dir().join(format!("veil-{label}-{}-{nanos}", std::process::id()))
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        env::temp_dir().join(format!(
+            "veil-{label}-{}-{nanos}-{counter}",
+            std::process::id()
+        ))
     }
 
     fn write_config(path: &Path, contents: &str) {
@@ -421,6 +618,30 @@ mod tests {
         }
 
         fs::write(path, contents).expect("config file should be writable");
+    }
+
+    fn read_jsonl(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .expect("jsonl file should be readable")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("jsonl line should parse"))
+            .collect()
+    }
+
+    fn canonical_user_config_path(home: &Path) -> PathBuf {
+        user_config_path(Some(home))
+    }
+
+    fn migration_log_path(home: &Path) -> PathBuf {
+        join_relative(&cmdrvl_root(Some(home)), MIGRATION_LOG_RELATIVE)
+    }
+
+    fn notice_log_path(home: &Path) -> PathBuf {
+        join_relative(&cmdrvl_root(Some(home)), DEPRECATED_NOTICE_RELATIVE)
+    }
+
+    fn canonical_audit_path(home: &Path) -> PathBuf {
+        default_audit_path(Some(home), None).expect("audit path should resolve")
     }
 
     fn load_for_test(
@@ -432,7 +653,7 @@ mod tests {
         env_overrides: PartialConfig,
     ) -> io::Result<Config> {
         let system_path = repo_root.join("etc/veil/config.toml");
-        let user_path = home.join(".config/veil/config.toml");
+        let user_path = legacy_user_config_path(Some(home), None);
         let project_path = repo_root.join(".veil.toml");
 
         if let Some(contents) = system_contents {
@@ -486,7 +707,11 @@ mod tests {
         assert_eq!(config.policy.default, PolicyMode::Deny);
         assert_eq!(
             config.policy.audit_path,
-            home.join(".local/state/veil/audit.jsonl")
+            home.join(".cmdrvl/logs/veil/audit.jsonl")
+        );
+        assert!(
+            !canonical_user_config_path(&home).exists(),
+            "missing legacy config should not create canonical config"
         );
     }
 
@@ -540,6 +765,16 @@ mod tests {
             config.sensitivity.protected,
             expected_with_cmdrvl_profile(&home, &["system/**"])
         );
+        assert!(
+            canonical_user_config_path(&home).exists(),
+            "legacy system config should be copied into the canonical user config path"
+        );
+        let migration_events = read_jsonl(&migration_log_path(&home));
+        assert!(migration_events.iter().any(|event| {
+            event["path_class"] == "veil-system-config"
+                && event["action"] == "copied"
+                && event["outcome"] == "ok"
+        }));
     }
 
     #[test]
@@ -568,6 +803,185 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.policy.default, PolicyMode::Warn);
+        assert!(
+            canonical_user_config_path(&home).exists(),
+            "legacy user config should be copied into the canonical root"
+        );
+    }
+
+    #[test]
+    fn legacy_user_config_is_copied_to_cmdrvl_root_on_first_run() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let config = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            Some(
+                r#"
+                [policy]
+                default = "warn"
+                "#,
+            ),
+            None,
+            PartialConfig::default(),
+        )
+        .unwrap();
+
+        let canonical_path = canonical_user_config_path(&home);
+        assert_eq!(config.policy.default, PolicyMode::Warn);
+        assert!(canonical_path.exists());
+
+        let migration_events = read_jsonl(&migration_log_path(&home));
+        assert!(migration_events.iter().any(|event| {
+            event["path_class"] == "veil-user-config"
+                && event["action"] == "copied"
+                && event["outcome"] == "ok"
+        }));
+
+        let notices = read_jsonl(&notice_log_path(&home));
+        assert!(notices.iter().any(|notice| {
+            notice["path_class"] == "veil-user-config" && notice["action"] == "copied-to-canonical"
+        }));
+    }
+
+    #[test]
+    fn canonical_user_config_wins_when_legacy_also_exists() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+        write_config(
+            &canonical_user_config_path(&home),
+            r#"
+            [policy]
+            default = "warn"
+            "#,
+        );
+        write_config(
+            &legacy_user_config_path(Some(&home), None),
+            r#"
+            [policy]
+            default = "log"
+            "#,
+        );
+
+        let config = load_config_from_paths(
+            &repo_root,
+            Some(&home),
+            None,
+            None,
+            &repo_root.join("etc/veil/config.toml"),
+            PartialConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(config.policy.default, PolicyMode::Warn);
+        let notices = read_jsonl(&notice_log_path(&home));
+        assert!(notices.iter().any(|notice| {
+            notice["path_class"] == "veil-user-config" && notice["action"] == "canonical-preferred"
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_user_config_permissions_are_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+        let legacy_path = legacy_user_config_path(Some(&home), None);
+        write_config(
+            &legacy_path,
+            r#"
+            [policy]
+            default = "warn"
+            "#,
+        );
+        fs::set_permissions(&legacy_path, fs::Permissions::from_mode(0o600))
+            .expect("legacy permissions should be writable");
+
+        load_config_from_paths(
+            &repo_root,
+            Some(&home),
+            None,
+            None,
+            &repo_root.join("etc/veil/config.toml"),
+            PartialConfig::default(),
+        )
+        .unwrap();
+
+        let mode = fs::metadata(canonical_user_config_path(&home))
+            .expect("canonical config should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn invalid_legacy_user_config_reports_canonical_parse_failure() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+        write_config(
+            &legacy_user_config_path(Some(&home), None),
+            r#"
+            [policy
+            default = "deny"
+            "#,
+        );
+
+        let error = load_config_from_paths(
+            &repo_root,
+            Some(&home),
+            None,
+            None,
+            &repo_root.join("etc/veil/config.toml"),
+            PartialConfig::default(),
+        )
+        .expect_err("invalid migrated config should return an error");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains(&canonical_user_config_path(&home).display().to_string()),
+            "error should identify the canonical config path: {error}"
+        );
+    }
+
+    #[test]
+    fn legacy_default_audit_log_is_copied_to_cmdrvl_logs() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+        let legacy_path = home.join(".local/state/veil/audit.jsonl");
+        write_config(
+            &legacy_path,
+            r#"{"tool":"Read","decision":"deny","path_class":"fixture"}"#,
+        );
+
+        let config = load_config_from_paths(
+            &repo_root,
+            Some(&home),
+            None,
+            None,
+            &repo_root.join("etc/veil/config.toml"),
+            PartialConfig::default(),
+        )
+        .unwrap();
+
+        let canonical_path = canonical_audit_path(&home);
+        assert_eq!(config.policy.audit_path, canonical_path);
+        assert_eq!(
+            fs::read_to_string(canonical_path).expect("canonical audit should be readable"),
+            r#"{"tool":"Read","decision":"deny","path_class":"fixture"}"#
+        );
+
+        let migration_events = read_jsonl(&migration_log_path(&home));
+        assert!(migration_events.iter().any(|event| {
+            event["path_class"] == "veil-audit-log"
+                && event["action"] == "copied"
+                && event["outcome"] == "ok"
+        }));
     }
 
     #[test]
