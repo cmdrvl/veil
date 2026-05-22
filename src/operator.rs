@@ -1552,7 +1552,31 @@ mod tests {
         let value: Value =
             serde_json::from_str(&rendered).expect("config JSON output should parse");
 
-        assert_eq!(value["sensitivity"]["protected"], json!(["data/**"]));
+        let protected = value["sensitivity"]["protected"]
+            .as_array()
+            .expect("protected patterns should be an array");
+        assert!(
+            protected.iter().any(|pattern| pattern == "data/**"),
+            "project protected pattern should be preserved"
+        );
+        for suffix in [
+            "/.cmdrvl/config/**",
+            "/.cmdrvl/secrets/**",
+            "/.cmdrvl/state/cmdrvl-gtm/email-watch/**",
+            "/.cmdrvl/state/cmdrvl-cli/guard-receipts/**",
+            "/.cmdrvl/state/cmdrvl-holon/doctor-runs/**",
+            "/.cmdrvl/receipts/**",
+            "/.cmdrvl/migrations/**",
+            "/.cmdrvl/notices/**",
+        ] {
+            assert!(
+                protected
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|pattern| pattern.ends_with(suffix)),
+                "missing CMD+RVL protected suffix {suffix}"
+            );
+        }
         assert_eq!(value["policy"]["default"], "warn");
         assert_eq!(value["policy"]["audit_log"], false);
         assert_eq!(value["policy"]["audit_path"], "/tmp/veil-audit.jsonl");

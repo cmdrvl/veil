@@ -523,6 +523,45 @@ mod tests {
     }
 
     #[test]
+    fn cmdrvl_config_path_denied_even_when_toml_is_allowlisted() {
+        let config = Config {
+            sensitivity: SensitivityConfig {
+                protected: vec!["/tmp/home/.cmdrvl/config/**".to_owned()],
+            },
+            allowlist: AllowlistConfig {
+                safe_patterns: vec!["*.toml".to_owned()],
+            },
+            spine: SpineConfig {
+                authorized_tools: vec!["shape".to_owned()],
+            },
+            policy: PolicyConfig {
+                default: PolicyMode::Deny,
+                audit_log: false,
+                audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
+            },
+        };
+
+        let decision = evaluate_access_with_classifier(
+            &read_input("/tmp/home/.cmdrvl/config/cmdrvl-cli/config.toml"),
+            &config,
+            |directory_sensitive| {
+                assert!(directory_sensitive);
+                Ok(None)
+            },
+        );
+
+        assert_eq!(decision.action, DecisionAction::Deny);
+        assert!(
+            decision
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("protected directory")),
+            "reason should mention protected directory, got: {:?}",
+            decision.reason
+        );
+    }
+
+    #[test]
     fn allowlist_still_works_outside_protected_directories() {
         // Files that match the allowlist but are NOT in a protected directory
         // should still be allowed silently.

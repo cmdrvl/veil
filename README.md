@@ -133,6 +133,13 @@ audit_log = true           # Log all access attempts
 audit_path = "~/.local/state/veil/audit.jsonl"  # default; outside repo
 ```
 
+veil also ships a built-in CMD+RVL config-protection profile. Direct content
+reads under the canonical `~/.cmdrvl/` config and secret-bearing subtrees are
+denied by default, including `config/`, `secrets/`, guard receipts, Gmail watch
+state, holon doctor runs, receipts, migration records, and deprecation notices.
+That profile is preserved when user, project, or environment protected patterns
+are supplied.
+
 ### Operator Discovery
 
 When `veil` blocks a direct read, use the configured authorized path instead of guessing:

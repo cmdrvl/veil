@@ -21,6 +21,17 @@ const DEFAULT_AUTHORIZED_TOOLS: &[&str] = &[
     "pack",
 ];
 
+const DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES: &[&str] = &[
+    "config",
+    "secrets",
+    "state/cmdrvl-gtm/email-watch",
+    "state/cmdrvl-cli/guard-receipts",
+    "state/cmdrvl-holon/doctor-runs",
+    "receipts",
+    "migrations",
+    "notices",
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub sensitivity: SensitivityConfig,
@@ -105,7 +116,7 @@ impl Config {
     fn defaults(home: Option<&Path>, xdg_state_home: Option<&Path>) -> io::Result<Self> {
         Ok(Self {
             sensitivity: SensitivityConfig {
-                protected: Vec::new(),
+                protected: default_cmdrvl_config_protection_patterns(home),
             },
             allowlist: AllowlistConfig {
                 safe_patterns: DEFAULT_SAFE_PATTERNS
@@ -131,7 +142,8 @@ impl Config {
         if let Some(sensitivity) = partial.sensitivity
             && let Some(protected) = sensitivity.protected
         {
-            self.sensitivity.protected = protected;
+            self.sensitivity.protected =
+                protected_with_cmdrvl_profile(&self.sensitivity.protected, protected);
         }
 
         if let Some(allowlist) = partial.allowlist
@@ -158,6 +170,47 @@ impl Config {
             if let Some(audit_path) = policy.audit_path {
                 self.policy.audit_path = audit_path;
             }
+        }
+    }
+}
+
+fn default_cmdrvl_config_protection_patterns(home: Option<&Path>) -> Vec<String> {
+    let root = home
+        .map(|path| path.join(".cmdrvl"))
+        .unwrap_or_else(|| PathBuf::from(".cmdrvl"));
+
+    DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES
+        .iter()
+        .map(|subtree| protected_subtree_pattern(&root, subtree))
+        .collect()
+}
+
+fn protected_subtree_pattern(root: &Path, subtree: &str) -> String {
+    let path = root.join(subtree);
+    format!("{}/**", path.to_string_lossy().replace('\\', "/"))
+}
+
+fn protected_with_cmdrvl_profile(existing: &[String], replacement: Vec<String>) -> Vec<String> {
+    let mut protected = existing
+        .iter()
+        .filter(|pattern| is_cmdrvl_config_protection_pattern(pattern))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    append_unique(&mut protected, replacement);
+    protected
+}
+
+fn is_cmdrvl_config_protection_pattern(pattern: &str) -> bool {
+    pattern.starts_with(".cmdrvl/")
+        || pattern.starts_with("~/.cmdrvl/")
+        || pattern.contains("/.cmdrvl/")
+}
+
+fn append_unique(target: &mut Vec<String>, items: Vec<String>) {
+    for item in items {
+        if !target.iter().any(|existing| existing == &item) {
+            target.push(item);
         }
     }
 }
@@ -404,6 +457,16 @@ mod tests {
         )
     }
 
+    fn expected_cmdrvl_profile(home: &Path) -> Vec<String> {
+        default_cmdrvl_config_protection_patterns(Some(home))
+    }
+
+    fn expected_with_cmdrvl_profile(home: &Path, extra: &[&str]) -> Vec<String> {
+        let mut expected = expected_cmdrvl_profile(home);
+        expected.extend(extra.iter().map(|pattern| (*pattern).to_owned()));
+        expected
+    }
+
     #[test]
     fn missing_files_are_ignored_cleanly() {
         let repo_root = unique_temp_root("repo");
@@ -419,12 +482,38 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.sensitivity.protected, Vec::<String>::new());
+        assert_eq!(config.sensitivity.protected, expected_cmdrvl_profile(&home));
         assert_eq!(config.policy.default, PolicyMode::Deny);
         assert_eq!(
             config.policy.audit_path,
             home.join(".local/state/veil/audit.jsonl")
         );
+    }
+
+    #[test]
+    fn default_cmdrvl_config_protection_profile_covers_canonical_subtrees() {
+        let home = PathBuf::from("/tmp/home");
+        let config = Config::defaults(Some(&home), None).unwrap();
+
+        for pattern in [
+            "/tmp/home/.cmdrvl/config/**",
+            "/tmp/home/.cmdrvl/secrets/**",
+            "/tmp/home/.cmdrvl/state/cmdrvl-gtm/email-watch/**",
+            "/tmp/home/.cmdrvl/state/cmdrvl-cli/guard-receipts/**",
+            "/tmp/home/.cmdrvl/state/cmdrvl-holon/doctor-runs/**",
+            "/tmp/home/.cmdrvl/receipts/**",
+            "/tmp/home/.cmdrvl/migrations/**",
+            "/tmp/home/.cmdrvl/notices/**",
+        ] {
+            assert!(
+                config
+                    .sensitivity
+                    .protected
+                    .iter()
+                    .any(|item| item == pattern),
+                "missing protected pattern {pattern}"
+            );
+        }
     }
 
     #[test]
@@ -447,7 +536,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.sensitivity.protected, vec!["system/**"]);
+        assert_eq!(
+            config.sensitivity.protected,
+            expected_with_cmdrvl_profile(&home, &["system/**"])
+        );
     }
 
     #[test]
@@ -546,7 +638,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.sensitivity.protected, vec!["env/**"]);
+        assert_eq!(
+            config.sensitivity.protected,
+            expected_with_cmdrvl_profile(&home, &["env/**"])
+        );
         assert_eq!(config.policy.default, PolicyMode::Warn);
         assert!(!config.policy.audit_log);
     }
@@ -609,7 +704,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.sensitivity.protected, vec!["env/**"]);
+        assert_eq!(
+            config.sensitivity.protected,
+            expected_with_cmdrvl_profile(&home, &["env/**"])
+        );
         assert_eq!(config.allowlist.safe_patterns, vec!["project.md"]);
         assert_eq!(config.spine.authorized_tools, vec!["env-tool"]);
         assert_eq!(config.policy.default, PolicyMode::Warn);
@@ -641,6 +739,51 @@ mod tests {
         assert!(
             error.to_string().contains("invalid project config"),
             "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn cmdrvl_config_protection_profile_survives_all_overrides() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let env_overrides = PartialConfig {
+            sensitivity: Some(PartialSensitivityConfig {
+                protected: Some(vec!["env-only/**".to_owned()]),
+            }),
+            allowlist: None,
+            spine: None,
+            policy: None,
+        };
+
+        let config = load_for_test(
+            &repo_root,
+            &home,
+            Some(
+                r#"
+                [sensitivity]
+                protected = ["system-only/**"]
+                "#,
+            ),
+            Some(
+                r#"
+                [sensitivity]
+                protected = ["user-only/**"]
+                "#,
+            ),
+            Some(
+                r#"
+                [sensitivity]
+                protected = ["project-only/**"]
+                "#,
+            ),
+            env_overrides,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.sensitivity.protected,
+            expected_with_cmdrvl_profile(&home, &["env-only/**"])
         );
     }
 }
