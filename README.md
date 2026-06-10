@@ -151,9 +151,18 @@ or SSM Parameter Store adapter.
 When `veil` blocks a direct read, use the configured authorized path instead of guessing:
 
 ```bash
+veil --robot-triage
+veil capabilities --json
+veil robot-docs guide
 veil operator
 veil operator --json
 ```
+
+`veil --robot-triage` is the fastest read-only machine entrypoint. It returns
+doctor health, recommendations, and the capabilities contract in one JSON
+document. `veil capabilities --json` exposes the stable command contract, exit
+codes, hook-mode expectations, and composition boundaries. `veil robot-docs
+guide` prints the agent-facing quick guide.
 
 `veil operator` reads `[spine] authorized_tools` from the active config, runs
 `--describe` on each installed tool, and prints a combined reference with any
@@ -166,6 +175,9 @@ managed Claude Read/Grep/Bash hook state without installing hooks, rewriting
 settings, appending audit records, or using the network.
 
 ```bash
+veil --robot-triage
+veil capabilities --json
+veil robot-docs guide
 veil doctor health
 veil doctor health --json
 veil doctor capabilities --json
@@ -175,6 +187,10 @@ veil doctor --robot-triage
 
 No `doctor --fix` mode is available yet. Any future repair mode must ship with
 detector, backup, inverse, fixture, and undo coverage before it is exposed.
+
+Bare `veil` remains hook mode for Claude/Gemini/Copilot settings and expects a
+hook payload on stdin. For operator discovery, use `veil --help` or the robot
+surfaces above instead of running bare `veil`.
 
 ### Operator-First Workflow
 

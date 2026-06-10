@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="260" viewBox="0 0 920 260" role="img" aria-label="Veil pass 1 agent ergonomics heatmap">
+  <rect width="920" height="260" fill="#ffffff"/>
+  <text x="24" y="32" font-family="Arial, sans-serif" font-size="18" fill="#111111">Veil Agent Ergonomics, Pass 1</text>
+  <text x="24" y="58" font-family="Arial, sans-serif" font-size="12" fill="#333333">Five standard agent surfaces were added or improved; no regressions detected.</text>
+  <g font-family="Arial, sans-serif" font-size="12" fill="#111111">
+    <text x="24" y="95">--robot-triage</text>
+    <text x="24" y="125">capabilities --json</text>
+    <text x="24" y="155">robot-docs guide</text>
+    <text x="24" y="185">empty stdin hint</text>
+    <text x="24" y="215">--help discovery</text>
+  </g>
+  <g>
+    <rect x="180" y="78" width="680" height="22" fill="#1f9d55"/>
+    <rect x="180" y="108" width="700" height="22" fill="#0f8a4b"/>
+    <rect x="180" y="138" width="650" height="22" fill="#2aa866"/>
+    <rect x="180" y="168" width="640" height="22" fill="#2aa866"/>
+    <rect x="180" y="198" width="630" height="22" fill="#39a96b"/>
+  </g>
+  <g font-family="Arial, sans-serif" font-size="12" fill="#111111">
+    <text x="870" y="95">high</text>
+    <text x="890" y="125">high</text>
+    <text x="840" y="155">high</text>
+    <text x="830" y="185">high</text>
+    <text x="820" y="215">high</text>
+  </g>
+</svg>

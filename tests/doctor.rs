@@ -144,6 +144,66 @@ fn doctor_robot_triage_json_is_machine_readable() {
 }
 
 #[test]
+fn top_level_robot_triage_json_is_machine_readable() {
+    let home = unique_home("top-level-triage");
+    let output = veil_command(&home)
+        .arg("--robot-triage")
+        .output()
+        .expect("top-level robot triage should run");
+
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("triage JSON should parse");
+    assert_eq!(value["schema_version"], "veil.doctor.triage.v1");
+    assert_eq!(value["capabilities"]["read_only"], true);
+}
+
+#[test]
+fn top_level_capabilities_json_is_available_without_guard_hooks() {
+    let home = unique_home("top-level-capabilities");
+    let output = veil_command(&home)
+        .args(["capabilities", "--json"])
+        .output()
+        .expect("top-level capabilities should run");
+
+    assert!(output.status.success());
+    let value: Value =
+        serde_json::from_slice(&output.stdout).expect("capabilities JSON should parse");
+    assert_eq!(value["schema_version"], "veil.capabilities.v1");
+    assert_eq!(
+        value["standard_agent_surfaces"]["capabilities_json"],
+        "veil capabilities --json"
+    );
+}
+
+#[test]
+fn top_level_robot_docs_guide_is_available_without_guard_hooks() {
+    let home = unique_home("top-level-robot-docs");
+    let output = veil_command(&home)
+        .args(["robot-docs", "guide"])
+        .output()
+        .expect("top-level robot docs should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(stdout.contains("veil robot-docs guide"));
+    assert!(stdout.contains("Bare `veil` expects"));
+}
+
+#[test]
+fn bare_empty_stdin_explains_hook_mode_and_discovery_commands() {
+    let home = unique_home("empty-stdin");
+    let output = veil_command(&home)
+        .output()
+        .expect("bare empty stdin should return a diagnostic");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert!(stderr.contains("no hook payload received"));
+    assert!(stderr.contains("veil --robot-triage"));
+    assert!(stderr.contains("veil capabilities --json"));
+}
+
+#[test]
 fn doctor_fix_is_not_available() {
     let home = unique_home("fix");
     let output = veil_command(&home)

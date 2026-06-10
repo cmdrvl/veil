@@ -30,6 +30,14 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
     }
 
     match command {
+        cli::OperatorCommand::Capabilities(args) => {
+            println!("{}", operator::run_capabilities(&args)?);
+            Ok(0)
+        }
+        cli::OperatorCommand::RobotDocs(args) => {
+            println!("{}", operator::run_robot_docs(&args)?);
+            Ok(0)
+        }
         cli::OperatorCommand::Operator(args) => {
             println!("{}", operator::run_operator(&args)?);
             Ok(0)
@@ -79,6 +87,8 @@ fn command_requires_guard_preflight(command: &cli::OperatorCommand) -> bool {
     !matches!(
         command,
         cli::OperatorCommand::Doctor(_)
+            | cli::OperatorCommand::Capabilities(_)
+            | cli::OperatorCommand::RobotDocs(_)
             | cli::OperatorCommand::Install
             | cli::OperatorCommand::Uninstall
     )

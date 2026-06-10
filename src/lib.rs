@@ -50,6 +50,14 @@ fn run_with_io<R: Read, W: Write, E: Write>(
 ) -> io::Result<()> {
     let mut input = String::new();
     reader.read_to_string(&mut input)?;
+
+    if input.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no hook payload received on stdin; bare `veil` is hook mode. Pipe a Claude/Gemini/Copilot hook payload into stdin, or run `veil --robot-triage`, `veil capabilities --json`, or `veil robot-docs guide` for operator discovery. For help with veil, run `veil --help`.",
+        ));
+    }
+
     let hook_input = parse_hook_input(&input)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
@@ -399,6 +407,23 @@ mod tests {
         .expect_err("invalid hook payload should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn run_with_io_rejects_empty_hook_payload_with_operator_guidance() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let error = run_with_io("".as_bytes(), &mut stdout, &mut stderr)
+            .expect_err("empty hook payload should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("no hook payload received"));
+        assert!(message.contains("veil --robot-triage"));
+        assert!(message.contains("veil capabilities --json"));
+        assert!(message.contains("For help with veil"));
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }

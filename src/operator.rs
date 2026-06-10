@@ -17,12 +17,13 @@ use veil::packs::{BUILTIN_PACK_NAMES, PackRegistry};
 use veil::types::{Decision, DecisionAction, SensitivityResult, ToolKind};
 
 use crate::cli::{
-    AuditArgs, ConfigArgs, DirCommandArgs, DoctorAction, DoctorArgs, DoctorCapabilitiesArgs,
-    JsonOutputArgs, PathCommandArgs,
+    AuditArgs, CapabilitiesArgs, ConfigArgs, DirCommandArgs, DoctorAction, DoctorArgs,
+    DoctorCapabilitiesArgs, JsonOutputArgs, PathCommandArgs, RobotDocsArgs,
 };
 use crate::hooks;
 
 const RECENT_AUDIT_LIMIT: usize = 20;
+const CAPABILITIES_SCHEMA_VERSION: &str = "veil.capabilities.v1";
 const DOCTOR_HEALTH_SCHEMA_VERSION: &str = "veil.doctor.health.v1";
 const DOCTOR_CAPABILITIES_SCHEMA_VERSION: &str = "veil.doctor.capabilities.v1";
 const DOCTOR_TRIAGE_SCHEMA_VERSION: &str = "veil.doctor.triage.v1";
@@ -90,6 +91,20 @@ pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>>
     let repo_root = env::current_dir()?;
     let config = config::load_config(&repo_root)?;
     render_audit_for_path(&config.policy.audit_path, args.json, RECENT_AUDIT_LIMIT)
+}
+
+pub fn run_capabilities(args: &CapabilitiesArgs) -> Result<String, Box<dyn std::error::Error>> {
+    let value = capabilities_json_value();
+
+    if args.json {
+        Ok(serde_json::to_string_pretty(&value)?)
+    } else {
+        Ok(render_capabilities_human(&value))
+    }
+}
+
+pub fn run_robot_docs(_args: &RobotDocsArgs) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(render_robot_docs_guide())
 }
 
 pub fn run_doctor(args: &DoctorArgs) -> Result<String, Box<dyn std::error::Error>> {
@@ -926,6 +941,56 @@ fn render_doctor_capabilities_human(value: &Value) -> String {
     output.trim_end().to_owned()
 }
 
+fn render_capabilities_human(value: &Value) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "Capabilities");
+    let _ = writeln!(
+        output,
+        "  schema_version: {}",
+        value["schema_version"].as_str().unwrap_or("<unknown>")
+    );
+    let _ = writeln!(output, "  tool: veil {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(output, "  hook_mode: veil < hook-payload.json");
+    let _ = writeln!(output, "  discovery:");
+    let _ = writeln!(output, "    - veil --robot-triage");
+    let _ = writeln!(output, "    - veil capabilities --json");
+    let _ = writeln!(output, "    - veil robot-docs guide");
+    let _ = writeln!(output, "  commands:");
+    for command in capability_command_lines() {
+        let _ = writeln!(output, "    - {command}");
+    }
+
+    output.trim_end().to_owned()
+}
+
+fn render_robot_docs_guide() -> String {
+    [
+        "veil robot-docs guide",
+        "",
+        "Quick start:",
+        "- `veil --robot-triage` returns one read-only JSON health/capability bundle.",
+        "- `veil capabilities --json` returns the full machine-readable command contract.",
+        "- `veil operator --json` lists configured spine tools after guard hooks are healthy.",
+        "- `veil test PATH --json` predicts the read decision for one path after guard hooks are healthy.",
+        "- `veil explain PATH --json` shows allowlist/protected-pack matching after guard hooks are healthy.",
+        "",
+        "Hook mode:",
+        "- Bare `veil` expects a Claude/Gemini/Copilot hook payload on stdin.",
+        "- Do not run bare `veil` as a discovery command; use `veil --help` or the robot surfaces above.",
+        "",
+        "Guard preflight:",
+        "- Domain commands fail closed unless healthy veil Read/Grep/Bash hooks and a dcg Bash hook are installed.",
+        "- `veil doctor`, `veil --robot-triage`, `veil capabilities --json`, `veil robot-docs guide`, `veil install`, and `veil uninstall` remain available for maintenance.",
+        "",
+        "Composition:",
+        "- Use `dcg` to block destructive shell commands.",
+        "- Use `veil` to block raw local sensitive reads.",
+        "- Use authorized spine tools for metadata-safe local processing.",
+        "- Use `airlock` to attest derived artifacts that later cross a model boundary.",
+    ]
+    .join("\n")
+}
+
 fn render_doctor_robot_docs() -> String {
     [
         "veil doctor robot-docs",
@@ -1418,6 +1483,97 @@ fn doctor_capabilities_json_value() -> Value {
             "gitignored": true
         }
     })
+}
+
+fn capabilities_json_value() -> Value {
+    json!({
+        "schema_version": CAPABILITIES_SCHEMA_VERSION,
+        "tool": "veil",
+        "version": env!("CARGO_PKG_VERSION"),
+        "purpose": "Data exfiltration guard for AI coding agents.",
+        "hook_mode": {
+            "usage": "veil < hook-payload.json",
+            "stdin": "Claude Code, Gemini CLI, or GitHub Copilot hook payload JSON",
+            "stdout": "protocol-specific permission decision JSON",
+            "stderr": "diagnostics only",
+            "writes_audit_log_when_enabled": true
+        },
+        "discovery": {
+            "triage": "veil --robot-triage",
+            "capabilities": "veil capabilities --json",
+            "robot_docs": "veil robot-docs guide",
+            "help": "veil --help"
+        },
+        "exit_codes": [
+            {
+                "code": 0,
+                "meaning": "success or hook allow/deny decision rendered"
+            },
+            {
+                "code": 2,
+                "meaning": "usage error, hook payload error, configuration error, or guard preflight refusal"
+            }
+        ],
+        "commands": capability_command_lines().iter().map(|command| {
+            json!({
+                "command": command,
+                "guard_preflight_required": command_requires_guard_preflight(command),
+                "read_only": command_is_read_only(command),
+            })
+        }).collect::<Vec<_>>(),
+        "standard_agent_surfaces": {
+            "robot_triage": "veil --robot-triage",
+            "capabilities_json": "veil capabilities --json",
+            "robot_docs": "veil robot-docs guide"
+        },
+        "doctor": doctor_capabilities_json_value(),
+        "composition": {
+            "upstream_guards": ["dcg"],
+            "authorized_processing": "configured spine tools from [spine] authorized_tools",
+            "downstream_attestation": ["airlock"]
+        }
+    })
+}
+
+fn capability_command_lines() -> Vec<&'static str> {
+    vec![
+        "veil < hook-payload.json",
+        "veil --robot-triage",
+        "veil capabilities --json",
+        "veil robot-docs guide",
+        "veil operator --json",
+        "veil test <PATH> --json",
+        "veil explain <PATH> --json",
+        "veil scan <DIR> --json",
+        "veil packs --json",
+        "veil config --json",
+        "veil audit --json",
+        "veil doctor health --json",
+        "veil doctor capabilities --json",
+        "veil doctor robot-docs",
+        "veil install",
+        "veil uninstall",
+    ]
+}
+
+fn command_requires_guard_preflight(command: &str) -> bool {
+    matches!(
+        command,
+        "veil operator --json"
+            | "veil test <PATH> --json"
+            | "veil explain <PATH> --json"
+            | "veil scan <DIR> --json"
+            | "veil packs --json"
+            | "veil config --json"
+            | "veil audit --json"
+    )
+}
+
+fn command_is_read_only(command: &str) -> bool {
+    !matches!(
+        command,
+        "veil < hook-payload.json" | "veil install" | "veil uninstall"
+    )
 }
 
 fn doctor_command_lines() -> Vec<&'static str> {
@@ -1951,6 +2107,54 @@ mod tests {
         assert!(rendered.contains("veil doctor health"));
         assert!(rendered.contains("veil doctor capabilities --json"));
         assert!(rendered.contains("No fix mode is available"));
+    }
+
+    #[test]
+    fn top_level_capabilities_json_describes_standard_agent_surfaces() {
+        let rendered = run_capabilities(&CapabilitiesArgs { json: true })
+            .expect("top-level capabilities should render");
+        let value: Value = serde_json::from_str(&rendered).expect("capabilities JSON should parse");
+
+        assert_eq!(value["schema_version"], CAPABILITIES_SCHEMA_VERSION);
+        assert_eq!(
+            value["standard_agent_surfaces"]["robot_triage"],
+            "veil --robot-triage"
+        );
+        assert_eq!(
+            value["standard_agent_surfaces"]["capabilities_json"],
+            "veil capabilities --json"
+        );
+        assert_eq!(
+            value["standard_agent_surfaces"]["robot_docs"],
+            "veil robot-docs guide"
+        );
+        assert_eq!(value["doctor"]["read_only"], true);
+        assert!(
+            value["commands"]
+                .as_array()
+                .expect("commands should be an array")
+                .iter()
+                .any(|command| command["command"] == "veil operator --json"
+                    && command["guard_preflight_required"] == true)
+        );
+        assert!(
+            value["commands"]
+                .as_array()
+                .expect("commands should be an array")
+                .iter()
+                .any(|command| command["command"] == "veil < hook-payload.json"
+                    && command["read_only"] == false)
+        );
+    }
+
+    #[test]
+    fn top_level_robot_docs_guide_explains_hook_mode_and_composition() {
+        let rendered = run_robot_docs(&RobotDocsArgs { action: None })
+            .expect("top-level robot docs should render");
+
+        assert!(rendered.contains("veil --robot-triage"));
+        assert!(rendered.contains("Bare `veil` expects"));
+        assert!(rendered.contains("airlock"));
     }
 
     #[test]

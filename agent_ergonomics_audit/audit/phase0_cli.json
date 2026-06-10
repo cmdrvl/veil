@@ -1,0 +1,17 @@
+{
+  "target_path": "/Users/zac/Source/cmdrvl/veil",
+  "discovered_at": "2026-06-10T16:18:20Z",
+  "languages": [
+    "rust"
+  ],
+  "binaries": [
+    "veil"
+  ],
+  "env_var_prefix": "VEIL",
+  "existing_surfaces": {
+    "robot_mode": true,
+    "capabilities": true,
+    "robot_docs": true
+  },
+  "recommended_mode": "audit-only"
+}

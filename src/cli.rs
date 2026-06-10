@@ -12,27 +12,47 @@ use clap::{Args, Parser, Subcommand};
     about = "Data exfiltration guard for AI coding agents"
 )]
 pub struct Cli {
+    #[arg(long = "robot-triage", help = "Emit read-only JSON triage for agents")]
+    robot_triage: bool,
     #[command(subcommand)]
     command: Option<OperatorCommand>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct CapabilitiesArgs {
+    #[arg(long, help = "Emit the capabilities contract as JSON")]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct RobotDocsArgs {
+    #[command(subcommand)]
+    pub action: Option<RobotDocsAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum RobotDocsAction {
+    #[command(about = "Print the agent quick-start guide")]
+    Guide,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct ConfigArgs {
-    #[arg(long)]
+    #[arg(long, help = "Emit merged config as JSON")]
     pub json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct AuditArgs {
-    #[arg(long)]
+    #[arg(long, help = "Emit recent audit entries as JSON")]
     pub json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct DoctorArgs {
-    #[arg(long = "robot-triage")]
+    #[arg(long = "robot-triage", help = "Emit read-only doctor triage JSON")]
     pub robot_triage: bool,
-    #[arg(long)]
+    #[arg(long, help = "Emit doctor health as JSON")]
     pub json: bool,
     #[command(subcommand)]
     pub action: Option<DoctorAction>,
@@ -40,54 +60,73 @@ pub struct DoctorArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum DoctorAction {
+    #[command(about = "Inspect config, audit path, and hook health")]
     Health(DoctorHealthArgs),
+    #[command(about = "Describe read-only doctor commands and contract")]
     Capabilities(DoctorCapabilitiesArgs),
+    #[command(about = "Print doctor-specific robot guidance")]
     RobotDocs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct DoctorHealthArgs {
-    #[arg(long)]
+    #[arg(long, help = "Emit doctor health as JSON")]
     pub json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct DoctorCapabilitiesArgs {
-    #[arg(long)]
+    #[arg(long, help = "Emit doctor capabilities as JSON")]
     pub json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct PathCommandArgs {
+    #[arg(help = "Path to inspect with veil's read-decision pipeline")]
     pub path: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Emit the path inspection as JSON")]
     pub json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct DirCommandArgs {
+    #[arg(help = "Directory tree to scan with veil's read-decision pipeline")]
     pub dir: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = "Emit scan results as JSON")]
     pub json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct JsonOutputArgs {
-    #[arg(long)]
+    #[arg(long, help = "Emit machine-readable JSON")]
     pub json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum OperatorCommand {
+    #[command(about = "Emit the machine-readable CLI capabilities contract")]
+    Capabilities(CapabilitiesArgs),
+    #[command(about = "Print agent-facing operational guidance")]
+    RobotDocs(RobotDocsArgs),
+    #[command(about = "Discover authorized spine tools for sensitive-file work")]
     Operator(JsonOutputArgs),
+    #[command(about = "Predict whether one path would be allowed or denied")]
     Test(PathCommandArgs),
+    #[command(about = "Explain allowlist, protected-pattern, and pack matches for one path")]
     Explain(PathCommandArgs),
+    #[command(about = "Scan a directory tree and classify each file path")]
     Scan(DirCommandArgs),
+    #[command(about = "List built-in sensitivity packs")]
     Packs(JsonOutputArgs),
+    #[command(about = "Show the merged active configuration")]
     Config(ConfigArgs),
+    #[command(about = "Show recent audit log entries")]
     Audit(AuditArgs),
+    #[command(about = "Inspect local config, audit, and hook health without writing")]
     Doctor(DoctorArgs),
+    #[command(about = "Install managed veil Claude PreToolUse hooks")]
     Install,
+    #[command(about = "Remove managed veil Claude PreToolUse hooks")]
     Uninstall,
 }
 
@@ -99,6 +138,14 @@ pub enum Dispatch {
 
 impl Cli {
     pub fn dispatch(self) -> Dispatch {
+        if self.robot_triage {
+            return Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
+                robot_triage: true,
+                json: false,
+                action: None,
+            }));
+        }
+
         match self.command {
             Some(command) => Dispatch::Operator(command),
             None => Dispatch::HookMode,
@@ -169,6 +216,14 @@ mod tests {
     fn flag_only_subcommands_select_expected_variants() {
         for (name, command) in [
             (
+                "capabilities",
+                OperatorCommand::Capabilities(CapabilitiesArgs { json: false }),
+            ),
+            (
+                "robot-docs",
+                OperatorCommand::RobotDocs(RobotDocsArgs { action: None }),
+            ),
+            (
                 "operator",
                 OperatorCommand::Operator(JsonOutputArgs { json: false }),
             ),
@@ -209,6 +264,8 @@ mod tests {
         let help = String::from_utf8(help).expect("help should be valid UTF-8");
 
         for name in [
+            "capabilities",
+            "robot-docs",
             "operator",
             "test",
             "explain",
@@ -225,6 +282,10 @@ mod tests {
                 "expected help output to mention `{name}`"
             );
         }
+
+        assert!(help.contains("Emit the machine-readable CLI capabilities contract"));
+        assert!(help.contains("Discover authorized spine tools"));
+        assert!(help.contains("Inspect local config, audit, and hook health"));
     }
 
     #[test]
@@ -301,6 +362,38 @@ mod tests {
                 robot_triage: true,
                 json: false,
                 action: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn top_level_robot_triage_flag_selects_doctor_triage() {
+        assert_eq!(
+            parse(&["veil", "--robot-triage"]),
+            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
+                robot_triage: true,
+                json: false,
+                action: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn capabilities_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "capabilities", "--json"]),
+            Dispatch::Operator(OperatorCommand::Capabilities(CapabilitiesArgs {
+                json: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn robot_docs_guide_subcommand_selects_expected_variant() {
+        assert_eq!(
+            parse(&["veil", "robot-docs", "guide"]),
+            Dispatch::Operator(OperatorCommand::RobotDocs(RobotDocsArgs {
+                action: Some(RobotDocsAction::Guide),
             }))
         );
     }

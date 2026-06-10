@@ -36,6 +36,9 @@ jobs:
 
       - name: Smoke doctor surface
         run: |
+          cargo run --locked -- --robot-triage
+          cargo run --locked -- capabilities --json
+          cargo run --locked -- robot-docs guide
           cargo run --locked -- doctor health
           cargo run --locked -- doctor capabilities --json
           cargo run --locked -- doctor robot-docs
