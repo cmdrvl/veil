@@ -173,6 +173,24 @@ fn top_level_capabilities_json_is_available_without_guard_hooks() {
         value["standard_agent_surfaces"]["capabilities_json"],
         "veil capabilities --json"
     );
+    assert_eq!(
+        value["composition"]["family"]["name"],
+        "cmdrvl-boundary-guard"
+    );
+    assert_eq!(
+        value["composition"]["role"],
+        "pre-tool guard that keeps raw sensitive files out of agent context"
+    );
+    assert!(
+        value["composition"]["canonical_chain"][1]
+            .as_str()
+            .is_some_and(|step| step.contains("authorized spine subprocesses"))
+    );
+    assert!(
+        value["composition"]["agent_rules"][2]
+            .as_str()
+            .is_some_and(|step| step.contains("airlock"))
+    );
 }
 
 #[test]
@@ -187,6 +205,8 @@ fn top_level_robot_docs_guide_is_available_without_guard_hooks() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("veil robot-docs guide"));
     assert!(stdout.contains("Bare `veil` expects"));
+    assert!(stdout.contains("Use `dcg` to block destructive shell commands."));
+    assert!(stdout.contains("Use `airlock` to attest derived artifacts"));
 }
 
 #[test]

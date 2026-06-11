@@ -1528,9 +1528,30 @@ fn capabilities_json_value() -> Value {
         },
         "doctor": doctor_capabilities_json_value(),
         "composition": {
+            "family": {
+                "name": "cmdrvl-boundary-guard",
+                "siblings": [
+                    {"tool": "dcg", "role": "destructive shell command guard"},
+                    {"tool": "veil", "capabilities": "veil capabilities --json"},
+                    {"tool": "airlock", "capabilities": "airlock capabilities --json"},
+                    {"tool": "pack", "capabilities": "pack capabilities --json"}
+                ]
+            },
+            "role": "pre-tool guard that keeps raw sensitive files out of agent context",
             "upstream_guards": ["dcg"],
             "authorized_processing": "configured spine tools from [spine] authorized_tools",
-            "downstream_attestation": ["airlock"]
+            "downstream_attestation": ["airlock"],
+            "canonical_chain": [
+                "dcg blocks destructive Bash before commands execute",
+                "veil blocks raw Read/Grep/Bash exfiltration while allowing authorized spine subprocesses",
+                "airlock attests derived artifacts before they cross a model boundary",
+                "pack seals boundary manifests and downstream evidence"
+            ],
+            "agent_rules": [
+                "Do not bypass veil by reading protected files directly; run authorized spine tools instead.",
+                "Use veil operator --json to inspect authorized tool configuration after guard preflight is healthy.",
+                "Use airlock when derived artifacts are ready to cross the model boundary."
+            ]
         }
     })
 }
