@@ -271,7 +271,20 @@ fn matcher_matches(entry: &Value, matcher: &str) -> bool {
     entry
         .get("matcher")
         .and_then(Value::as_str)
-        .is_some_and(|value| value == matcher)
+        .is_some_and(|value| matcher_covers_tool(value, matcher))
+}
+
+/// Claude Code (and compatible agents) parse a `PreToolUse` matcher as a
+/// `|`-delimited alternation of tool names, not a literal string -- a hook
+/// registered under `"Bash|PowerShell"` covers both `Bash` and `PowerShell`
+/// calls. Managed-hook detection must match that semantics, or a
+/// well-behaved combined-matcher hook (e.g. dcg's `Bash|PowerShell` entry)
+/// is invisible to exact-equality checks even though it is fully installed
+/// and working.
+fn matcher_covers_tool(entry_matcher: &str, tool: &str) -> bool {
+    entry_matcher
+        .split('|')
+        .any(|alternative| alternative.trim() == tool)
 }
 
 fn entry_hooks(entry: &mut Value) -> &mut Vec<Value> {
@@ -931,5 +944,53 @@ mod tests {
                 .is_healthy(),
             "veil and dcg hooks should both be healthy"
         );
+    }
+
+    #[test]
+    fn guard_preflight_finds_dcg_under_combined_bash_powershell_matcher() {
+        // dcg's real installer registers a single PreToolUse entry with
+        // matcher "Bash|PowerShell" rather than a bare "Bash" entry. That
+        // combined matcher must still satisfy the dcg Bash-hook check
+        // (bd-nff): Claude Code treats `|` as an alternation, and a
+        // literal-equality check on "Bash" alone produced a permanent false
+        // "missing dcg Bash hook" even when dcg was fully installed.
+        let path = temp_settings_path("guard-preflight-combined-matcher");
+        let veil_path = temp_executable_path("guard-preflight-combined-matcher");
+        let dcg_path = veil_path
+            .parent()
+            .expect("test executable should have a parent")
+            .join("dcg");
+        create_executable(&veil_path);
+        create_executable(&dcg_path);
+        let veil_command = quote_test_command(&veil_path);
+        let dcg_command = quote_test_command(&dcg_path);
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook(&veil_command)] },
+                        { "matcher": "Grep", "hooks": [veil_hook(&veil_command)] },
+                        { "matcher": "Bash", "hooks": [veil_hook(&veil_command)] },
+                        {
+                            "matcher": "Bash|PowerShell",
+                            "hooks": [
+                                { "type": "command", "command": dcg_command }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        let inspection =
+            inspect_guard_preflight(&path).expect("guard preflight probe should succeed");
+
+        assert!(
+            matches!(inspection.dcg.status, ManagedHookStatus::Installed { .. }),
+            "dcg hook under a combined Bash|PowerShell matcher should be recognized as installed"
+        );
+        assert!(inspection.is_healthy());
     }
 }
