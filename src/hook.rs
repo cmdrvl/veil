@@ -10,6 +10,8 @@ use crate::types::{HookInput, HookProtocol, ToolKind};
 
 const CLAUDE_PRE_TOOL_EVENT: &str = "PreToolUse";
 const GEMINI_BEFORE_TOOL_EVENT: &str = "BeforeTool";
+const GROK_PRE_TOOL_EVENT: &str = "pre_tool_use";
+const GROK_BASH_TOOL_NAMES: &[&str] = &["run_terminal_command", "run_terminal_cmd"];
 
 #[derive(Debug)]
 pub struct HookParseError {
@@ -44,12 +46,16 @@ pub fn parse_hook_input(input: &str) -> Result<HookInput, HookParseError> {
         return parse_snake_case_payload(&payload, HookProtocol::GeminiCli);
     }
 
+    if is_grok_payload(&payload) {
+        return parse_grok_payload(&payload);
+    }
+
     if is_copilot_payload(&payload) {
         return parse_camel_case_payload(&payload, HookProtocol::GitHubCopilot);
     }
 
     Err(HookParseError::new(
-        "unsupported hook payload: could not detect Claude Code, Gemini CLI, or GitHub Copilot",
+        "unsupported hook payload: could not detect Claude Code, Gemini CLI, Grok, or GitHub Copilot",
     ))
 }
 
@@ -76,6 +82,24 @@ fn is_gemini_payload(payload: &Value) -> bool {
     snake_case_tool_fields && (hook_event_matches || explicit_marker)
 }
 
+/// xAI Grok CLI / Grok Build TUI `PreToolUse` payload. Wire shape: camelCase
+/// `hookEventName: "pre_tool_use"`, `toolName`, `toolInput` (a JSON object,
+/// not a string like GitHub Copilot's `toolArgs`), `cwd`, `sessionId`. Grok
+/// also reads `~/.claude/settings.json` directly for hook compatibility, so
+/// a payload reaching this binary via that route is genuinely Grok's own
+/// wire format, not a translated Claude Code payload. See
+/// `~/.grok/docs/user-guide/10-hooks.md`.
+fn is_grok_payload(payload: &Value) -> bool {
+    let event_matches =
+        string_field(payload, "hookEventName").is_some_and(|value| value == GROK_PRE_TOOL_EVENT);
+    let bash_tool_matches = string_field(payload, "toolName")
+        .is_some_and(|value| GROK_BASH_TOOL_NAMES.contains(&value));
+    let camel_case_tool_fields =
+        payload.get("toolName").is_some() && payload.get("toolInput").is_some();
+
+    camel_case_tool_fields && (event_matches || bash_tool_matches)
+}
+
 fn parse_snake_case_payload(
     payload: &Value,
     protocol: HookProtocol,
@@ -89,6 +113,20 @@ fn parse_snake_case_payload(
         tool: normalize_tool_kind(protocol, tool_name)?,
         cwd,
         session_id: string_field(payload, "session_id").map(str::to_owned),
+        raw_args,
+    })
+}
+
+fn parse_grok_payload(payload: &Value) -> Result<HookInput, HookParseError> {
+    let tool_name = required_string(payload, "toolName")?;
+    let cwd = required_path(payload, "cwd")?;
+    let raw_args = required_json(payload, "toolInput")?;
+
+    Ok(HookInput {
+        protocol: HookProtocol::Grok,
+        tool: normalize_tool_kind(HookProtocol::Grok, tool_name)?,
+        cwd,
+        session_id: string_field(payload, "sessionId").map(str::to_owned),
         raw_args,
     })
 }
@@ -206,6 +244,16 @@ fn normalize_tool_kind(protocol: HookProtocol, name: &str) -> Result<ToolKind, H
                 )));
             }
         },
+        HookProtocol::Grok => match lower.as_str() {
+            "read_file" => ToolKind::Read,
+            "grep" => ToolKind::Grep,
+            "run_terminal_command" | "run_terminal_cmd" => ToolKind::Bash,
+            _ => {
+                return Err(HookParseError::new(format!(
+                    "unsupported Grok tool `{name}` in hook payload"
+                )));
+            }
+        },
         HookProtocol::Unknown => {
             return Err(HookParseError::new(format!(
                 "unsupported tool `{name}` in hook payload"
@@ -286,6 +334,89 @@ mod tests {
         assert_eq!(parsed.cwd, Path::new("/tmp"));
         assert_eq!(parsed.session_id, None);
         assert_eq!(parsed.raw_args, r#"{"path":"docs/plan.md"}"#);
+    }
+
+    #[test]
+    fn parses_grok_pre_tool_use_read_payload() {
+        let parsed = parse_hook_input(
+            r#"{
+              "hookEventName": "pre_tool_use",
+              "sessionId": "abc-123",
+              "cwd": "/repo",
+              "workspaceRoot": "/repo",
+              "permissionMode": "default",
+              "toolName": "read_file",
+              "toolInput": { "path": "secret.txt" },
+              "timestamp": "2026-04-14T12:00:00Z"
+            }"#,
+        )
+        .expect("Grok read_file payload should parse");
+
+        assert_eq!(parsed.protocol, HookProtocol::Grok);
+        assert_eq!(parsed.tool, ToolKind::Read);
+        assert_eq!(parsed.cwd, Path::new("/repo"));
+        assert_eq!(parsed.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(parsed.raw_args, r#"{"path":"secret.txt"}"#);
+    }
+
+    #[test]
+    fn parses_grok_pre_tool_use_grep_payload() {
+        let parsed = parse_hook_input(
+            r#"{
+              "hookEventName": "pre_tool_use",
+              "sessionId": "abc-123",
+              "cwd": "/repo",
+              "toolName": "grep",
+              "toolInput": { "pattern": "TODO", "path": "." }
+            }"#,
+        )
+        .expect("Grok grep payload should parse");
+
+        assert_eq!(parsed.protocol, HookProtocol::Grok);
+        assert_eq!(parsed.tool, ToolKind::Grep);
+    }
+
+    #[test]
+    fn parses_grok_pre_tool_use_bash_payload_via_tool_name_alias() {
+        // dcg's own Grok integration documents both the abbreviated and full
+        // spellings of Grok's shell tool name (issue #319 history); veil
+        // must recognize both.
+        for tool_name in ["run_terminal_command", "run_terminal_cmd"] {
+            let payload = format!(
+                r#"{{
+                  "hookEventName": "pre_tool_use",
+                  "sessionId": "abc-123",
+                  "cwd": "/repo",
+                  "toolName": "{tool_name}",
+                  "toolInput": {{ "command": "npm test" }}
+                }}"#
+            );
+            let parsed =
+                parse_hook_input(&payload).expect("Grok terminal-command payload should parse");
+
+            assert_eq!(parsed.protocol, HookProtocol::Grok);
+            assert_eq!(parsed.tool, ToolKind::Bash);
+        }
+    }
+
+    #[test]
+    fn grok_payload_is_not_misclassified_as_copilot_or_claude() {
+        // Grok's camelCase toolName + object-valued toolInput must not be
+        // swallowed by Copilot's toolName+toolArgs check, and its camelCase
+        // field names must not accidentally satisfy Claude's snake_case
+        // hook_event_name/tool_name/tool_input check.
+        let parsed = parse_hook_input(
+            r#"{
+              "hookEventName": "pre_tool_use",
+              "sessionId": "abc-123",
+              "cwd": "/repo",
+              "toolName": "read_file",
+              "toolInput": { "path": "secret.txt" }
+            }"#,
+        )
+        .expect("Grok payload should parse");
+
+        assert_eq!(parsed.protocol, HookProtocol::Grok);
     }
 
     #[test]

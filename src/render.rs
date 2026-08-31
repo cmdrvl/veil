@@ -16,7 +16,10 @@ pub fn render_decision(protocol: HookProtocol, decision: &Decision) -> RenderedD
     let stdout = match protocol {
         HookProtocol::ClaudeCode => render_claude_stdout(decision),
         HookProtocol::GitHubCopilot | HookProtocol::Unknown => render_permission_stdout(decision),
-        HookProtocol::GeminiCli => render_gemini_stdout(decision),
+        // Grok's documented PreToolUse output is `{"decision":"allow"}` /
+        // `{"decision":"deny","reason":"..."}` -- byte-identical to Gemini's
+        // shape (see `~/.grok/docs/user-guide/10-hooks.md`).
+        HookProtocol::GeminiCli | HookProtocol::Grok => render_gemini_stdout(decision),
     };
 
     let stderr = match decision.action {
@@ -190,6 +193,30 @@ mod tests {
     #[test]
     fn gemini_deny_output_includes_reason_and_guidance() {
         let rendered = render_decision(HookProtocol::GeminiCli, &deny_decision());
+
+        assert_eq!(
+            rendered.stdout,
+            r#"{"decision":"deny","reason":"matched by core.filesystem"}"#
+        );
+        assert!(
+            rendered
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("Reason: matched by core.filesystem"))
+        );
+    }
+
+    #[test]
+    fn grok_allow_output_is_silent_on_stderr() {
+        let rendered = render_decision(HookProtocol::Grok, &allow_decision());
+
+        assert_eq!(rendered.stdout, r#"{"decision":"allow"}"#);
+        assert_eq!(rendered.stderr, None);
+    }
+
+    #[test]
+    fn grok_deny_output_includes_reason_and_guidance() {
+        let rendered = render_decision(HookProtocol::Grok, &deny_decision());
 
         assert_eq!(
             rendered.stdout,

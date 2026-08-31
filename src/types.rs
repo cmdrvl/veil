@@ -22,6 +22,7 @@ pub enum HookProtocol {
     ClaudeCode,
     GeminiCli,
     GitHubCopilot,
+    Grok,
     Unknown,
 }
 
