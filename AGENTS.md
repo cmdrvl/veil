@@ -189,7 +189,7 @@ When Agent Mail is available:
 
 ### How to Use
 
-1. Register: call `ensure_project` then `register_agent` using `/Users/zac/Source/cmdrvl/veil` as `project_key`
+1. Register: call `ensure_project` then `register_agent` using the absolute path of this repo's working directory (`git rev-parse --show-toplevel`) as `project_key`. It must be a real absolute path — Agent Mail validates it and derives project identity from it, so do not pass a shell expression or a slug.
 2. Reserve files before editing: `file_reservation_paths(project_key, agent_name, ["src/hook.rs"], ttl_seconds=3600, exclusive=true)`
 3. Communicate with threads: `send_message(..., thread_id="bd-1cp")`
 4. Check inbox: `fetch_inbox(project_key, agent_name)`
