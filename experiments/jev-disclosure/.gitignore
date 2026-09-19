@@ -1,0 +1,7 @@
+/target/
+/runs/
+*.key
+.env
+.env.*
+# Cargo.lock is intentionally NOT ignored. Commit the resolved lock before a
+# frozen evaluation; the runner records its exact hash with every run.
