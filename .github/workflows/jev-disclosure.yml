@@ -1,0 +1,32 @@
+name: Jev disclosure benchmark (offline)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'experiments/jev-disclosure/**'
+      - '.github/workflows/jev-disclosure.yml'
+  pull_request:
+    paths:
+      - 'experiments/jev-disclosure/**'
+      - '.github/workflows/jev-disclosure.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unit tests (no model calls)
+        run: cargo test --manifest-path experiments/jev-disclosure/Cargo.toml
+      - name: Validate all synthetic scenarios
+        run: cargo run --locked --manifest-path experiments/jev-disclosure/Cargo.toml -- validate
+      - name: Prepare development requests without sending
+        run: cargo run --locked --manifest-path experiments/jev-disclosure/Cargo.toml -- prepare --split dev --out "$RUNNER_TEMP/jev-dev"
+      - name: Freeze and prepare holdout without sending
+        run: |
+          cargo run --locked --manifest-path experiments/jev-disclosure/Cargo.toml -- freeze --out "$RUNNER_TEMP/jev-freeze.json"
+          cargo run --locked --manifest-path experiments/jev-disclosure/Cargo.toml -- prepare --split holdout --freeze "$RUNNER_TEMP/jev-freeze.json" --out "$RUNNER_TEMP/jev-holdout"
