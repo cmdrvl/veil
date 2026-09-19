@@ -1,0 +1,7 @@
+{
+  "version": "veil.jev.thresholds.v1-uncalibrated",
+  "allow_violation_at_most": 0.1,
+  "deny_violation_at_least": 0.9,
+  "visibility_at_most": 0.1,
+  "note": "Exploratory, not validated security limits. Visibility above its limit requires REVIEW; otherwise policy_violation controls the three-way decision. Other questions remain diagnostic, not additive. Tune only on dev, freeze before holdout. No automatic production promotion."
+}
