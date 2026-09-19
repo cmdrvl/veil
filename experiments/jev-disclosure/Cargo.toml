@@ -1,0 +1,18 @@
+[package]
+name = "veil-jev-disclosure-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Synthetic, opt-in Jev disclosure benchmark; not the VEIL hook"
+
+[[bin]]
+name = "jev-disclosure-bench"
+path = "bench.rs"
+
+[dependencies]
+serde_json = "=1.0.149"
+sha2 = "=0.10.9"
+
+# Deliberately independent of VEIL's production package and dependency graph.
+[workspace]
