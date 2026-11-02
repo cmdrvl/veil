@@ -91,6 +91,7 @@ jobs:
           package_dir="dist/${archive_stem}"
           mkdir -p "${package_dir}"
           cp "target/${{ matrix.target }}/release/veil" "${package_dir}/veil"
+          cp LICENSE "${package_dir}/"
           chmod +x "${package_dir}/veil"
           tar -czf "dist/${archive_stem}.tar.gz" -C dist "${archive_stem}"
           echo "asset_name=${archive_stem}.tar.gz" >> "${GITHUB_OUTPUT}"
