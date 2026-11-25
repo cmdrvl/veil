@@ -709,15 +709,23 @@ mod tests {
                 &commands,
             ))
         });
+        // The same hook work for a command that names two files.
+        let few = format!("awk 1 {} {}", words[0], words[1]);
+        let mut few_best = std::time::Duration::MAX;
+        for _ in 0..50 {
+            let start = std::time::Instant::now();
+            let (decision, _) = judge(&few, &repo_root, &config);
+            few_best = few_best.min(start.elapsed());
+            assert_eq!(decision.action, DecisionAction::Allow);
+        }
         eprintln!(
-            "64 words, 1 pattern: whole {best:?} = registry {registry_time:?} + extract {extract_time:?} + evaluate {evaluate_time:?}"
+            "64 words, 1 pattern: whole {best:?} = registry {registry_time:?} + extract {extract_time:?} + evaluate {evaluate_time:?}; 2 words: {few_best:?}"
         );
         assert_eq!(decision.action, DecisionAction::Deny);
         assert_eq!(records, 1, "only the protected word is worth a record");
         // About 1 ms in a release build for the most words one command gets
-        // resolved (a typical command names a few and takes a tenth of that).
-        // The bound is a guard against a regression, loose enough for a debug
-        // build on a busy machine; the measurement is in the line above.
+        // resolved. The bound is a guard against a regression, loose enough for
+        // a debug build on a busy machine; the measurement is in the line above.
         let bound = if cfg!(debug_assertions) { 20 } else { 3 };
         assert!(
             best < std::time::Duration::from_millis(bound),

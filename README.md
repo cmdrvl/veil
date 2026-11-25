@@ -174,13 +174,14 @@ Limits to know about:
 `[sensitivity] protected` patterns are held in an index (names, a trie of path
 components, and globs filed by a literal part they must contain), so a lookup
 costs the depth of the path rather than the number of patterns. With 10,000
-patterns, 64 lookups take about 56 µs in a release build, against about 24 ms
+patterns, 64 lookups take about 60 µs in a release build, against about 27 ms
 for trying every pattern; building the index once per hook call takes about
-5 ms. The index answers exactly what trying each pattern in turn answers, and a
+5.6 ms. The index answers exactly what trying each pattern in turn answers, and a
 differential test checks that on random patterns and paths. Judging a command that
-names 64 files takes about 0.8 ms in a release build (a few words take a tenth of
-that); with 10,000 patterns the index build brings the same command to about 4.5
-ms.
+names 64 files (the most one command gets resolved) takes 0.75 to 1.06 ms in a
+release build on the machine it was measured on, and a command that names two
+files takes about 80 µs; with 10,000 patterns the index build brings the 64-file
+command to about 4.5 ms.
 
 ### Configuration
 
