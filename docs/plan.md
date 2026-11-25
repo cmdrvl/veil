@@ -444,38 +444,52 @@ into an attestable artifact that composes with airlock.
 
 ### Threat model, stated per adversary class
 
-| Adversary | Example | Hook-only (today) | Track A | Track B |
-|-----------|---------|-------------------|---------|---------|
-| A0 accidental | agent `cat`s a CSV "to check the header" | stops most | stops all listed | stops all reads |
-| A1 prompt-injected | a document tells the agent to `curl -F file=@…` | stops only listed vectors | stops listed + egress class | stops reads; egress needs the airlock gate (Track D) |
-| A2 adversarial agent | writes a script, encodes, uses an unlisted binary | does not stop | raises cost, does not stop | stops all reads |
-| A3 compromised host | attacker has the operator's shell | out of scope | out of scope | out of scope |
+| Adversary | Hook-only today (H) | Planned Track A (H+A) | Planned macOS Track B (H+S) | Planned Linux Track B (H+S) |
+|-----------|---------------|---------------|---------------------|---------------------|
+| A0 accidental direct read | Blocks direct protected reads on supported hook events; shell indirection remains a gap. | Blocks enumerated argv, shell, script, and content-search vectors; remains parser coverage, not an OS boundary. | Denies opens of compiled protected paths by the sandboxed process tree, independent of reader program. | Allows reads only inside configured read-allowlisted hierarchies. A protected-glob deny policy is not yet expressible with the current file layout. |
+| A1 prompt-injected known vector | Blocks only recognized read/upload vectors. | Blocks listed read and egress classes; unknown binaries and encodings remain possible. | Prevents protected-path reads; does not stop egress of readable or broker-returned data. Network egress needs Track D. | Same read claim only for a correctly restricted allowlist; egress remains separate. |
+| A2 adversarial arbitrary code | Does not stop arbitrary readers. | Raises cost but does not stop arbitrary code. | Blocks protected-path opens by the confined tree if profile coverage is complete and no protected descriptor or alternate accessible alias was inherited. Broker mistakes remain a trusted-boundary risk. | Can make an A2 read claim only when every readable hierarchy is explicitly allowed and protected data is outside those hierarchies. Landlock cannot allow a broad parent and then subtract a protected child. |
+| A3 compromised host | Out of scope. | Out of scope. | Out of scope: the host operator can change policy or read source files outside the confined tree. | Out of scope for the same reason. |
 
-Every public claim is made per row. Today veil is an A0 tool. After Track B
-it is an A2 tool for reads and, composed with airlock, an A1/A2 tool for
-model-bound egress.
+Every public claim is made per row and names the active enforcement level.
+Planned columns describe target behavior, not shipped features. Today veil is a
+hook-mode A0 tool. Track B can make an A2 read claim only on a backend whose
+complete filesystem policy is installed before the harness starts. That claim
+does not include model-bound egress: Track D/airlock is still required.
 
 ### Formal model (what "correct" means)
 
-Treat every file as carrying a **label** from a small lattice
-`public < derived < protected`, and every process as running at a
+Treat every file or registered content object as carrying a **label** from a
+small lattice `public < derived < protected`, and every process as running at a
 **clearance**. Rules:
 
 - `Read(f)` by the agent is allowed iff `label(f) ≤ clearance(agent)`, and the
-  agent's clearance is `derived`.
-- The broker runs at clearance `protected`. Its outputs are labelled by the
-  tool's declared output class (spine tools default to `derived`; `--explicit`
-  output is `protected`), and their content hashes are registered so the
-  label is attached to *content*, not to a filename glob.
-- Labels are monotone under copy: `cp`, `tar`, `base64`, redirection produce
-  outputs with the join of their input labels. A hook cannot track that, so
-  Track A denies the copy; Track B makes the copy impossible.
+  agent's clearance is `derived`. A Track B harness receives that clearance
+  only after its OS policy is applied; hook mode alone does not establish it.
+- The broker runs at clearance `protected`. Each authorized tool declares an
+  output class; the broker labels its output accordingly, registers the output
+  hash with that label, and returns it only when the label is at most
+  `derived`. Raw flags such as `--explicit`, `--raw`, `--dump`, or
+  `--show-values` classify the result as `protected` and are refused. A content
+  scan can catch known secrets or PII, but cannot prove that an output is safe
+  to declassify.
+- Labels are monotone under copy: `cp`, `tar`, `base64`, and redirection produce
+  outputs with the join of their input labels. Hooks can deny known copy
+  vectors but cannot track arbitrary copies. Track B prevents a copy only when
+  the protected source is unreadable to the sandboxed process and the launcher
+  does not pass it an already-open descriptor or another accessible alias.
+- OS policy is path-based, not a general content-taint engine. The compiler
+  must map configured protected paths and aliases to the effective filesystem
+  policy; the broker's content-hash registry records provenance for broker
+  outputs, not labels for arbitrary files an agent creates.
 
 This is a cut-down decentralized label model. It replaces three ad hoc
 notions (protected globs, safe globs, spine allowlist) with one invariant and
 gives the property tests something to check: **enforcement dominance**, i.e.
-every decision the hook denies is also denied by the compiled sandbox
-profile, and every broker output is readable.
+every protected-read decision the hook denies is also denied by the compiled
+sandbox policy, and every broker output labelled `public` or `derived` is
+readable inside the sandbox. Egress denials and unsupported path mappings are
+not covered by that property.
 
 ### Track A — hook hardening (0.5): honest, measured, generated claims
 
@@ -533,45 +547,133 @@ profile, and every broker output is readable.
     Bash entries under the new rules and reports allow→deny flips, so the
     false-positive cost of every rule is a number in the release notes.
 
-### Track B — OS sandbox enforcement (1.0): the mechanical claim
+### Track B — OS sandbox enforcement (1.0): ADR B-1
 
-```
-veil sandbox -- claude              # harness runs with protected paths unreadable
-   │  macOS: seatbelt profile (deny file-read* subpath/literal)
-   │  Linux: Landlock ruleset (+ optional netns, Track D)
-   │  hooks still run for UX + audit; enforcement stamped 'sandbox'
-   └─ veil exec shape data/x.csv    # broker runs authorized spine tools
-                                    # OUTSIDE the sandbox, returns stdout only,
-                                    # registers output hashes as 'derived'
+**Status (2026-11-25):** Adopt the hybrid direction below; implementation and
+platform claims remain gated. This ADR chooses an architecture, not a shipped
+security feature. The current CLI has hook/operator commands but no `sandbox`
+or `exec` command ([`src/cli.rs`](../src/cli.rs)); hook evaluation is in
+[`src/lib.rs`](../src/lib.rs). The spine authorization and denied-flag table
+already in [`src/spine.rs`](../src/spine.rs) is reusable by a future broker.
+[`src/protected_corpus.rs`](../src/protected_corpus.rs) prepares an egress
+filter for airlock; it does not prevent local reads.
+
+#### Decision
+
+Keep hook mode as the default and supported compatibility path. Add an explicit
+`veil sandbox -- <harness command>` mode that launches the harness and its
+children under an OS policy, while keeping hooks inside the sandbox for UX and
+audit. Start the broker before confinement so authorized spine tools can read
+protected inputs without giving that access to the harness process tree. Stamp
+`enforcement: sandbox` only after the requested backend is applied and verified;
+an explicit sandbox request fails if policy compilation or application fails.
+It must never silently fall back to hook-only enforcement.
+
+#### Options and costs
+
+| Option | Cost and limits | Decision |
+|--------|-----------------|----------|
+| **H — Hook-only** (current) | Lowest deployment cost and works through supported hook integrations. It depends on parser coverage, so unlisted readers, shell indirection, and alternate runtimes remain gaps. | Keep as the default and describe it as hook-only. |
+| **H+A — Hook plus Track A hardening** | Medium, continuing cost: shell/argv decomposition, script inspection, egress classification, harness integration, and replay-driven false-positive work. It improves known-vector coverage but cannot constrain arbitrary code. | Keep as defense-in-depth; do not call it OS enforcement. |
+| **S — Replace hooks with a mandatory sandbox launcher** | High migration cost: every harness must be launched through veil; hook UX and maintenance flows disappear outside that launcher. It still needs a broker and does not solve Linux path-policy semantics. | Reject as the product-wide replacement. |
+| **H+S — Hook plus opt-in sandbox launcher and broker** | Highest engineering and support cost: two OS backends, path/pattern compilation, child lifecycle, inherited-descriptor hygiene, broker protocol and output policy, plus per-OS/kernel testing. It preserves hook compatibility and can provide an A2 read boundary on a verified backend. | **Recommend.** Keep H as default until a backend ships; gate the Linux A2 claim on a viable Landlock policy model. |
+
+A sandbox without a broker is also rejected: it would prevent authorized spine
+tools from reading protected inputs and break veil's core processing path. The
+broker is a narrow capability boundary, not a general shell service.
+
+#### Claims by adversary class
+
+The table above names the options; this table states their security claims.
+“Track B” is platform-specific. A successful macOS profile does not prove a
+Linux policy, and neither backend controls network egress by itself.
+
+#### Process and broker sequence
+
+```mermaid
+sequenceDiagram
+    actor Agent
+    participant V as veil sandbox launcher
+    participant B as veil broker (protected clearance)
+    participant OS as Seatbelt or Landlock
+    participant H as Harness process tree (derived clearance)
+    participant T as Authorized spine tool
+
+    V->>V: Load policy; resolve protected paths and aliases
+    V->>B: Start per-session broker outside confinement
+    V->>B: Create private socket (0600)
+    V->>OS: Compile and apply filesystem policy
+    OS->>H: Launch harness; descendants inherit confinement
+    H->>OS: Open protected file directly
+    OS-->>H: Deny read
+    H->>B: veil exec sends typed {tool, argv}
+    B->>B: Check tool, flags, output class, and size limit
+    B->>T: Run authorized tool with protected access
+    T-->>B: Return output
+    B->>B: Scan, label, hash, and audit output
+    B-->>H: Return only output labelled public or derived
+    H-->>V: Exit; launcher stops broker and closes session state
 ```
 
-- Policy compiler emits the profile from the merged config; compiled output
-  cached by config hash; `--print-profile` for review. Symlinks resolved at
-  compile time and both paths denied.
-- Broker: per-session unix socket (0600), `{tool, argv}` only, never a shell
-  string, tool must be in `[spine] authorized_tools`, output size-capped
-  (16 MiB), dies with the parent. Every call audited with input and output
-  hashes; outputs registered as `derived`.
-- Broker flag policy: each authorized tool declares flags that raise its
-  output label to `protected` (`--explicit`, `--raw`, `--dump`); the broker
-  refuses them. Without this the broker is a `cat` with extra steps.
-- Broker output scanning: before returning stdout, the broker runs the shared
-  `boundary-detectors` packs (same crate airlock uses) and refuses or redacts
-  output that trips a secrets/PII/tabular-dump detector, recording the
-  refusal. A misconfigured spine tool cannot leak through the broker.
-- Linux hardening: a seccomp filter on the sandboxed tree denies `ptrace`,
-  `process_vm_readv` and `/proc/<pid>/mem` access so an A2 agent cannot read
-  the broker's memory; Landlock ABI 4 network rules restrict `connect` to the
-  airlock gate port when Track D is on.
-- Rollout: 0.5 ships the new rules in `warn` for two weeks with replay
-  numbers published; 0.6 flips `dynamic_args` and egress to `deny`.
-- Harness-agnostic: Claude Code, Codex, Gemini, Grok, or a plain shell,
-  because enforcement is the process boundary, not a hook protocol.
-- `sandbox-exec` is deprecated but functional on macOS 26; Landlock is the
-  reference backend. Endpoint Security is out of scope (entitlements).
-- Property tests (proptest): for random configs and random paths,
-  hook-deny ⇒ profile-deny (enforcement dominance); broker-registered
-  outputs are always readable inside the sandbox.
+The request contains an executable identity and an argv vector, never a shell
+string. Reuse `src/spine.rs`'s authorization and denied-flag logic. The broker
+socket is session-scoped and mode `0600`; calls are capped, audited with input
+and output hashes, and the broker exits with its launcher. Output scanning
+using `boundary-detectors` is a secondary check, not proof that a declared
+`derived` result contains no protected information. Each tool therefore needs
+an explicit output-class contract; protected-class results are refused.
+
+#### Backend constraints and costs
+
+- **macOS / Seatbelt:** Generate a profile from merged config using `deny
+  file-read*` for resolved protected paths. Resolve symlinks and deny both the
+  configured path and its resolved target. `sandbox-exec` is deprecated, so
+  availability and profile behavior must be checked on every supported macOS
+  release. On this machine, macOS 15.8.3 has `/usr/bin/sandbox-exec`; the
+  evidence below proves only a literal-path deny inherited by a child process.
+  It does not establish profile portability or future OS support.
+- **Linux / Landlock:** The existing plan's “deny protected directories” model
+  is not a direct Landlock translation. Landlock denies handled rights by
+  default and filesystem rules grant access to hierarchies; it has no negative
+  child rule that subtracts a protected glob after a broad parent is allowed.
+  This follows from the kernel's [Landlock userspace API](https://docs.kernel.org/userspace-api/landlock.html): a path rule grants the listed rights, and access requires an allowing rule in each enforced policy layer. Therefore a broad read allow for `/` or a home/workspace root would also include protected descendants. A Linux design must either use an explicit read-allowlist whose hierarchies exclude protected data, constrain the data/workspace layout, or choose a different backend. Until that tradeoff is accepted and tested, Linux Track B has no general protected-glob A2 claim. Runtime ABI/support probing is mandatory. Landlock also does not revoke file descriptors opened before confinement; the launcher must not pass read-capable descriptors for protected files.
+- **Egress:** Filesystem confinement does not prevent sending data that the
+  agent can already read or that a broker returns. Track D/airlock owns the
+  network boundary. Linux Landlock TCP-port rules require ABI 4; network
+  namespace or macOS `pf` composition remains a separate Track D decision.
+- **Identity and failure:** Keep the broker outside the harness policy, deny
+  ptrace/process-memory paths where supported, use a private socket, and never
+  label output `derived` solely because a detector found no match. If any
+  protected path cannot be covered, the backend must fail its sandbox request
+  rather than stamp a stronger enforcement level.
+
+#### Decision evidence and rollout gates
+
+Minimal local Seatbelt spike (2026-11-25, macOS 15.8.3 / Darwin 24.6.0):
+reading this repo's `README.md` with `/bin/cat` succeeded outside the sandbox.
+A profile `(version 1) (allow default) (deny file-read* (literal
+"<repo>/README.md"))` then ran `/bin/sh` which launched `/bin/cat`; the child
+reported `Operation not permitted` and the wrapper printed `seatbelt read:
+denied`. This makes a macOS process-boundary mode technically viable enough to
+recommend as an opt-in direction. It did not test a generated profile, globs,
+symlink/hardlink aliases, the veil broker or `veil exec` round-trip, Linux
+Landlock, or a Linux CI job. No spike binary or fixture file was created.
+
+Before advertising Track B on a platform, require: (1) property/bypass tests
+show every supported protected-read rule is denied; (2) tests show ordinary
+workspace reads and required harness startup continue to work; (3) symlinks,
+hard links, pre-opened descriptors, mounts, and policy-update races have an
+explicit treatment; (4) the broker round-trip accepts only registered tools
+and returns only `public`/`derived` output; (5) failures are visible and never
+downgrade `sandbox` to `hook-only`; and (6) each README claim points to the
+matching adversary row above. Linux additionally needs a documented choice
+between a restricted allowlist workspace and a different backend, plus a real
+Landlock test in Linux CI.
+
+Other alternatives remain rejected: FUSE overlays add a second filesystem
+view and mount/metadata complexity; ptrace is slow and fragile; `LD_PRELOAD`
+can be bypassed by static binaries or direct syscalls. Endpoint Security is
+out of scope because it requires entitlements.
 
 ### Track C — twin mode for zero-retention work
 
