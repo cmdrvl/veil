@@ -448,7 +448,7 @@ into an attestable artifact that composes with airlock.
 |-----------|---------------|---------------|---------------------|---------------------|
 | A0 accidental direct read | Blocks direct protected reads on supported hook events; shell indirection remains a gap. | Blocks enumerated argv, shell, script, and content-search vectors; remains parser coverage, not an OS boundary. | Denies opens of compiled protected paths by the sandboxed process tree, independent of reader program. | Allows reads only inside configured read-allowlisted hierarchies. A protected-glob deny policy is not yet expressible with the current file layout. |
 | A1 prompt-injected known vector | Blocks only recognized read/upload vectors. | Blocks listed read and egress classes; unknown binaries and encodings remain possible. | Prevents protected-path reads; does not stop egress of readable or broker-returned data. Network egress needs Track D. | Same read claim only for a correctly restricted allowlist; egress remains separate. |
-| A2 adversarial arbitrary code | Does not stop arbitrary readers. | Raises cost but does not stop arbitrary code. | Blocks protected-path opens by the confined tree if profile coverage is complete and no protected descriptor or alternate accessible alias was inherited. Broker mistakes remain a trusted-boundary risk. | Can make an A2 read claim only when every readable hierarchy is explicitly allowed and protected data is outside those hierarchies. Landlock cannot allow a broad parent and then subtract a protected child. |
+| A2 adversarial arbitrary code | Does not stop arbitrary readers. | Raises cost but does not stop arbitrary code. | A literal-path deny blocked direct, child-shell, and symlink reads, but an orchestrator's follow-up read a hardlink alias successfully. No A2 claim until a link/volume mitigation and descriptor hygiene are tested. Broker mistakes remain a trusted-boundary risk. | Can make an A2 read claim only when every readable hierarchy is explicitly allowed and protected data is outside those hierarchies. Landlock cannot allow a broad parent and then subtract a protected child. |
 | A3 compromised host | Out of scope. | Out of scope. | Out of scope: the host operator can change policy or read source files outside the confined tree. | Out of scope for the same reason. |
 
 Every public claim is made per row and names the active enforcement level.
@@ -630,8 +630,20 @@ an explicit output-class contract; protected-class results are refused.
   configured path and its resolved target. `sandbox-exec` is deprecated, so
   availability and profile behavior must be checked on every supported macOS
   release. On this machine, macOS 15.8.3 has `/usr/bin/sandbox-exec`; the
-  evidence below proves only a literal-path deny inherited by a child process.
-  It does not establish profile portability or future OS support.
+  evidence below proves a literal-path deny inherited by a child process, but
+  a separate hardlink test bypassed that deny. A literal-path policy is not an
+  A2 boundary by itself. Candidate mitigations are: deny the `file-link`
+  operation (or otherwise prevent link creation) and test the actual profile;
+  deny `file-read*` over the whole volume subpath containing protected files
+  (covers same-volume aliases but can block unrelated reads); or put protected
+  data on a dedicated volume inaccessible for both reads and link creation by
+  the agent. Making only the source directory read-only is insufficient when
+  the agent can create a hardlink in another writable directory on the same
+  volume. The local system profile
+  `/System/Library/Sandbox/Profiles/appsandbox-common.sb` contains `(deny
+  file-link)`, which makes that rule a concrete candidate, not a tested veil
+  mitigation. None of these mitigations was tested in the spike. The evidence
+  does not establish profile portability or future OS support.
 - **Linux / Landlock:** The existing plan's “deny protected directories” model
   is not a direct Landlock translation. Landlock denies handled rights by
   default and filesystem rules grant access to hierarchies; it has no negative
@@ -655,20 +667,35 @@ A profile `(version 1) (allow default) (deny file-read* (literal
 "<repo>/README.md"))` then ran `/bin/sh` which launched `/bin/cat`; the child
 reported `Operation not permitted` and the wrapper printed `seatbelt read:
 denied`. This makes a macOS process-boundary mode technically viable enough to
-recommend as an opt-in direction. It did not test a generated profile, globs,
-symlink/hardlink aliases, the veil broker or `veil exec` round-trip, Linux
-Landlock, or a Linux CI job. No spike binary or fixture file was created.
+recommend as an opt-in direction, but the literal-path rule did not cover every
+name for the same file.
+
+**Measured hardlink bypass (orchestrator follow-up, same Mac, 2026-11-25):**
+with a literal-path deny on the protected fixture, direct `cat`, `cat` from a
+child of `sh -c`, and a symlink alias all returned `Operation not permitted`;
+an unprotected file remained readable. The orchestrator then created a
+hardlink with `ln protected hard.txt` and read `hard.txt` inside the sandbox:
+the read succeeded and the command exited 0. This is a measured bypass of the
+literal-path profile, not an untested concern. It means the Mac A2 claim stays
+gated until one of the link/volume mitigations above is implemented and the
+hardlink case is rerun under that mitigation.
+
+The initial spike did not test a generated profile, path globs, the veil broker
+or `veil exec` round-trip, Linux Landlock, or a Linux CI job. The follow-up
+tested a symlink and hardlink alias, but did not test a mitigation, mount or
+policy-update race. No spike binary or fixture file was created.
 
 Before advertising Track B on a platform, require: (1) property/bypass tests
 show every supported protected-read rule is denied; (2) tests show ordinary
-workspace reads and required harness startup continue to work; (3) symlinks,
-hard links, pre-opened descriptors, mounts, and policy-update races have an
-explicit treatment; (4) the broker round-trip accepts only registered tools
-and returns only `public`/`derived` output; (5) failures are visible and never
-downgrade `sandbox` to `hook-only`; and (6) each README claim points to the
-matching adversary row above. Linux additionally needs a documented choice
-between a restricted allowlist workspace and a different backend, plus a real
-Landlock test in Linux CI.
+workspace reads and required harness startup continue to work; (3) symlink
+coverage, the measured hardlink bypass, pre-opened descriptors, mounts, and
+policy-update races have explicit treatment, with the selected hardlink
+mitigation passing the same alias test; (4) the broker round-trip accepts only
+registered tools and returns only `public`/`derived` output; (5) failures are
+visible and never downgrade `sandbox` to `hook-only`; and (6) each README
+claim points to the matching adversary row above. Linux additionally needs a
+documented choice between a restricted allowlist workspace and a different
+backend, plus a real Landlock test in Linux CI.
 
 Other alternatives remain rejected: FUSE overlays add a second filesystem
 view and mount/metadata complexity; ptrace is slow and fragile; `LD_PRELOAD`
