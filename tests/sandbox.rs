@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(target_os = "macos")]
+use std::process::Output;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -39,6 +42,7 @@ fn veil(root: &Path) -> Command {
     command
 }
 
+#[cfg(target_os = "macos")]
 fn sandbox_exec(profile: &str, root: &Path, program: &str, args: &[&str]) -> Output {
     Command::new("/usr/bin/sandbox-exec")
         .arg("-p")

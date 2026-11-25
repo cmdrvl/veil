@@ -54,3 +54,22 @@ jobs:
           # Deprecated aliases stay working for at least one release.
           cargo run --locked -- --robot-triage
           cargo run --locked -- doctor health
+
+  # The real sandbox-exec checks are macOS-only, including the file-link denial.
+  macos-seatbelt-sandbox:
+    name: macos-seatbelt-sandbox
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prove Seatbelt read and hardlink restrictions
+        run: cargo test --locked --test sandbox
