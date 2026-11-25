@@ -630,6 +630,28 @@ fn vectors() -> Vec<Vector> {
             "confirmed denied: the quoted literal is found inside the program text",
         ),
         row(
+            "awk-system-call",
+            Unlisted,
+            Since,
+            bash("awk 'BEGIN{system(\"cat .env\")}'"),
+            allowed(
+                "the command is a string inside the awk program, which veil does not judge as a command",
+            ),
+            SB_BLOCKED,
+            "`gawk` is the same",
+        ),
+        row(
+            "awk-pipe-getline",
+            Unlisted,
+            Since,
+            bash("awk 'BEGIN{\"cat .env\" | getline x; print x}'"),
+            allowed(
+                "the command is a string inside the awk program, which veil does not judge as a command",
+            ),
+            SB_BLOCKED,
+            "`print | \"cmd\"` is the same",
+        ),
+        row(
             "jq-import-data",
             Unlisted,
             Since,
@@ -922,6 +944,41 @@ fn vectors() -> Vec<Vector> {
             Since,
             bash("node -e 'require(\"fs\").readFileSync(\"data/clients/holdings.csv\")'"),
             blocked("direct_read"),
+            SB_BLOCKED,
+            "",
+        ),
+        // A command string inside the program is run by the interpreter, and veil
+        // does not judge it as a command (found while checking awk for bd-pm8).
+        row(
+            "script-python-os-system",
+            Interpreters,
+            Since,
+            bash("python3 -c \"import os; os.system('cat .env')\""),
+            allowed(
+                "the command is a string inside the program, which veil does not judge as a command",
+            ),
+            SB_BLOCKED,
+            "the same string as a `cat .env` typed directly is blocked; GNU sed's `e` is refused, these are not",
+        ),
+        row(
+            "script-perl-system",
+            Interpreters,
+            Since,
+            bash("perl -e 'system(\"cat .env\")'"),
+            allowed(
+                "the command is a string inside the program, which veil does not judge as a command",
+            ),
+            SB_BLOCKED,
+            "ruby -e is the same",
+        ),
+        row(
+            "script-node-exec",
+            Interpreters,
+            Since,
+            bash("node -e \"require('child_process').execSync('cat .env')\""),
+            allowed(
+                "the command is a string inside the program, which veil does not judge as a command",
+            ),
             SB_BLOCKED,
             "",
         ),

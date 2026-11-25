@@ -66,15 +66,15 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 133 vectors run against the real binary, **96** are blocked and **26** are still allowed: 16 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 138 vectors run against the real binary, **96** are blocked and **31** are still allowed: 21 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
 | Direct readers | 10 | 9 | 0 / 0 / 0 | 9 / 0 / 0 |
-| Other readers and tools | 28 | 20 | 3 / 0 / 2 | 24 / 0 / 1 |
+| Other readers and tools | 30 | 20 | 5 / 0 / 2 | 26 / 0 / 1 |
 | Shell indirection | 12 | 12 | 0 / 0 / 0 | 12 / 0 / 0 |
 | Copies and aliases | 10 | 8 | 2 / 0 / 0 | 7 / 3 / 0 |
-| Interpreters and scripts | 13 | 8 | 4 / 0 / 0 | 12 / 0 / 0 |
+| Interpreters and scripts | 16 | 8 | 7 / 0 / 0 | 15 / 0 / 0 |
 | Egress | 17 | 13 | 2 / 0 / 0 | 15 / 0 / 0 |
 | Content search | 9 | 5 | 0 / 0 / 4 | 7 / 0 / 2 |
 | Dynamic and hidden paths | 6 | 6 | 0 / 0 / 0 | 6 / 0 / 0 |

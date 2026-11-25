@@ -5,7 +5,7 @@
 
 Enforcement level today: **hook-only** (advisory; parser-based). `veil` reads the text of a tool call before it runs and decides from the paths that text names. It does not sandbox anything, so anything it cannot see in that text it cannot stop.
 
-133 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **96** are blocked, **26** are still ALLOWED and are listed below (16 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 11 are controls that must stay allowed.
+138 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **96** are blocked, **31** are still ALLOWED and are listed below (21 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 11 are controls that must stay allowed.
 
 How to read the columns:
 
@@ -19,7 +19,7 @@ How to read the columns:
 
 These are listed, not hidden. They are grouped by what they let out, because a file listing and a `git push` are not the same thing.
 
-### Contents can get out (16)
+### Contents can get out (21)
 
 The contents of a protected file can get out this way.
 
@@ -27,11 +27,16 @@ The contents of a protected file can get out this way.
 |---|---|---|
 | `sqlite3 :memory: ".import data/clients/holdings.csv t" "select * from t"` | the path is inside one quoted `.import` argument, which veil let through | blocked (design, not run) |
 | `sed -f scripts/read.sed notes.md` | the script file is not protected and veil does not read sed script files | blocked (design, not run) |
+| `awk 'BEGIN{system("cat .env")}'` | the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) |
+| `awk 'BEGIN{"cat .env" \| getline x; print x}'` | the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) |
 | `jq -L . -n 'import "secret" as $d; $d'` | the file is named by an import in the jq program, which veil does not parse | blocked (design, not run) |
 | `cat hard.csv` | a hardlink is the same file under another name, and the name is not protected | **ALLOWED** (measured, ADR B-1): ADR B-1 measured the hardlink read succeeding under a literal-path profile |
 | `cat copy.csv` | a copy made earlier is a different, unprotected path: labels do not follow copies | **ALLOWED** (design, not run): the copy is at an unprotected path |
 | `python3 scripts/build_path.py` | the path is built from pieces that never spell a protected name; veil reads scripts as text | blocked (design, not run) |
 | `python3 scripts/encoded_path.py` | the script decodes the path at run time; veil reads scripts as text | blocked (design, not run) |
+| `python3 -c "import os; os.system('cat .env')"` | the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) |
+| `perl -e 'system("cat .env")'` | the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) |
+| `node -e "require('child_process').execSync('cat .env')"` | the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) |
 | `make read` | the Makefile is not read | blocked (design, not run) |
 | `echo Y2F0IGRhdGEvY2xpZW50cy9ob2xkaW5ncy5jc3YK \| base64 -d \| sh` | the command is decoded at run time | blocked (design, not run) |
 | `curl -K curl.conf` | the config is not read: curl.conf names the file, the command does not | blocked (design, not run) |
@@ -114,6 +119,8 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `sed-control-substitute` | `sed 's/a/b/' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control |
 | `sed-control-text-is-not-a-command` | `sed 's/r .env/x/' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: `r .env` is the pattern of a substitution, not a command; a parser sees that, a text search would not |
 | `awk-getline-file` | `awk 'BEGIN{while((getline l < ".env")>0) print l}'` | blocked: argv_path | blocked (design, not run) | found since | confirmed denied: the quoted literal is found inside the program text |
+| `awk-system-call` | `awk 'BEGIN{system("cat .env")}'` | **ALLOWED**: the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) | found since | `gawk` is the same |
+| `awk-pipe-getline` | `awk 'BEGIN{"cat .env" \| getline x; print x}'` | **ALLOWED**: the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) | found since | `print \| "cmd"` is the same |
 | `jq-import-data` | `jq -L . -n 'import "secret" as $d; $d'` | **ALLOWED**: the file is named by an import in the jq program, which veil does not parse | blocked (design, not run) | found since | reads ./secret.json, a credentials-pack name |
 
 ### Shell indirection
@@ -160,6 +167,9 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `script-python-c` | `python3 -c 'print(open("data/clients/holdings.csv").read())'` | blocked: direct_read | blocked (design, not run) | plan class |  |
 | `script-uv-run` | `uv run python -c 'print(open("data/clients/holdings.csv").read())'` | blocked: direct_read | blocked (design, not run) | plan class |  |
 | `script-node-e` | `node -e 'require("fs").readFileSync("data/clients/holdings.csv")'` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-python-os-system` | `python3 -c "import os; os.system('cat .env')"` | **ALLOWED**: the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) | found since | the same string as a `cat .env` typed directly is blocked; GNU sed's `e` is refused, these are not |
+| `script-perl-system` | `perl -e 'system("cat .env")'` | **ALLOWED**: the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) | found since | ruby -e is the same |
+| `script-node-exec` | `node -e "require('child_process').execSync('cat .env')"` | **ALLOWED**: the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) | found since |  |
 | `script-bash-file` | `bash scripts/read.sh` | blocked: direct_read | blocked (design, not run) | found since |  |
 | `script-source` | `source scripts/read.sh` | blocked: direct_read | blocked (design, not run) | found since |  |
 | `script-too-large` | `python3 scripts/huge.py` | blocked: script_too_large_to_inspect | blocked (design, not run) | found since | past 256 KiB veil does not read it, and judges it like a copy of its directory |
