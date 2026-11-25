@@ -27,6 +27,11 @@ pub struct AuditRecord {
     /// command: `awk 1 x.csv`, `cp x.csv /tmp`, `curl -F f=@x.csv`). Lets an
     /// operator tell the readers veil knew about from the generic rule.
     pub reason_class: Option<String>,
+    /// `egress` when the command sends what it is given somewhere else (`curl`,
+    /// `scp`, `aws`, a mail client...) and the path it names is protected: the
+    /// record `veil audit --class egress` answers "did anything try to leave"
+    /// from. Null for every other record, whatever its `reason_class`.
+    pub class: Option<String>,
 }
 
 impl AuditRecord {
@@ -42,6 +47,7 @@ impl AuditRecord {
             "session_id": self.session_id,
             "origin": self.origin,
             "reason_class": self.reason_class,
+            "class": self.class,
         })
     }
 }
@@ -101,6 +107,7 @@ mod tests {
             session_id: Some("session-123".to_owned()),
             origin: Some("top".to_owned()),
             reason_class: Some("direct_read".to_owned()),
+            class: None,
         }
     }
 
@@ -189,6 +196,7 @@ mod tests {
                 session_id: Some("session-456".to_owned()),
                 origin: Some("wrapper".to_owned()),
                 reason_class: Some("argv_path".to_owned()),
+                class: Some("egress".to_owned()),
             },
         )
         .expect("second append should succeed");
@@ -210,5 +218,8 @@ mod tests {
         assert_eq!(second["origin"], "wrapper");
         assert_eq!(first["reason_class"], "direct_read");
         assert_eq!(second["reason_class"], "argv_path");
+        // `class` is its own field, null unless the record is an egress attempt
+        assert!(first["class"].is_null());
+        assert_eq!(second["class"], "egress");
     }
 }

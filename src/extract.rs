@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::types::ToolKind;
 
 mod decompose;
+mod egress;
 mod expand;
 mod wrappers;
 
@@ -123,6 +124,10 @@ pub struct CommandExtraction {
     /// paths. A protected one puts every command of the string in a protected
     /// context (bd-2mi).
     pub assigned_paths: Vec<PathBuf>,
+    /// The command sends what it is given somewhere else (`curl`, `scp`,
+    /// `aws`, a mail client...). A protected path it names is an egress
+    /// attempt, which the audit log records as such (bd-x8o).
+    pub egress: bool,
 }
 
 /// A path a command names in its words. `resolved` says veil followed symlinks
@@ -154,6 +159,7 @@ impl CommandExtraction {
             opaque: false,
             dynamic_strict: false,
             assigned_paths: Vec::new(),
+            egress: false,
         }
     }
 
@@ -197,6 +203,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             opaque: true,
             dynamic_strict: true,
             assigned_paths,
+            egress: false,
         };
     };
 
@@ -216,7 +223,9 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
     paths.extend(collect_inline_interpreter_paths(program, args));
     if let Some(body) = &command.heredoc_body {
         paths.extend(heredoc_script_paths(program, body));
+        paths.extend(egress::script_paths(program, body));
     }
+    paths.extend(egress::here_string_paths(program, args));
 
     // A reader veil parses names its files exactly, so an unresolved word that
     // is a pattern or an option's value (`grep "$p" file`, `head -n $n file`)
@@ -263,6 +272,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         opaque: false,
         dynamic_strict: is_dynamic_strict(program),
         assigned_paths,
+        egress: egress::is_egress(program, args),
     }
 }
 
@@ -592,6 +602,12 @@ fn argv_path_words(program: &str, args: &[String]) -> Vec<PathWord> {
                 add(literal);
             }
         }
+    }
+
+    // A file named inside a word taken whole: `-F f=@x.csv;type=text/csv`,
+    // `--data-urlencode name@x.csv`, `x.csv#label` (bd-x8o).
+    for file in egress::operand_paths(program, args) {
+        add(&file);
     }
 
     words

@@ -22,7 +22,7 @@
       "veil scan <DIR> [--json]",
       "veil packs [--json]",
       "veil config [--json]",
-      "veil audit [--json]",
+      "veil audit [--json] [--class <class>]",
       "veil doctor [--json]",
       "veil doctor capabilities --json",
       "veil doctor triage --json",
@@ -105,7 +105,10 @@
     {
       "name": "audit",
       "description": "Show recent audit log entries.",
-      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit recent audit entries as JSON" }],
+      "options": [
+        { "name": "json", "flag": "--json", "type": "flag", "description": "Emit recent audit entries as JSON" },
+        { "name": "class", "flag": "--class", "type": "string", "description": "Only entries of one class: egress (a command that sends a protected path off the machine), or a reason_class: direct_read, argv_path, dynamic_path_unresolvable" }
+      ],
       "read_only": true,
       "guard_preflight_required": true
     },

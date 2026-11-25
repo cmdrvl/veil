@@ -56,6 +56,13 @@ pub struct ConfigArgs {
 pub struct AuditArgs {
     #[arg(long, help = "Emit recent audit entries as JSON")]
     pub json: bool,
+    #[arg(
+        long,
+        value_name = "CLASS",
+        value_parser = ["egress", "direct_read", "argv_path", "dynamic_path_unresolvable"],
+        help = "Only entries of one class: `egress` (a command that sends a protected path), or a reason_class"
+    )]
+    pub class: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
@@ -269,7 +276,13 @@ mod tests {
                 "config",
                 OperatorCommand::Config(ConfigArgs { json: false }),
             ),
-            ("audit", OperatorCommand::Audit(AuditArgs { json: false })),
+            (
+                "audit",
+                OperatorCommand::Audit(AuditArgs {
+                    json: false,
+                    class: None,
+                }),
+            ),
             (
                 "doctor",
                 OperatorCommand::Doctor(DoctorArgs {
@@ -334,7 +347,36 @@ mod tests {
     fn audit_subcommand_accepts_json_flag() {
         assert_eq!(
             parse(&["veil", "audit", "--json"]),
-            Dispatch::Operator(OperatorCommand::Audit(AuditArgs { json: true }))
+            Dispatch::Operator(OperatorCommand::Audit(AuditArgs {
+                json: true,
+                class: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn audit_subcommand_accepts_a_class_and_nothing_else() {
+        assert_eq!(
+            parse(&["veil", "audit", "--class", "egress", "--json"]),
+            Dispatch::Operator(OperatorCommand::Audit(AuditArgs {
+                json: true,
+                class: Some("egress".to_owned()),
+            }))
+        );
+        for class in ["direct_read", "argv_path", "dynamic_path_unresolvable"] {
+            assert_eq!(
+                parse(&["veil", "audit", "--class", class]),
+                Dispatch::Operator(OperatorCommand::Audit(AuditArgs {
+                    json: false,
+                    class: Some(class.to_owned()),
+                }))
+            );
+        }
+
+        // a typo is an error, not an empty result that reads as "nothing left"
+        assert!(
+            Cli::try_parse_from(["veil", "audit", "--class", "egres"]).is_err(),
+            "an unknown class must be refused"
         );
     }
 

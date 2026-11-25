@@ -43,6 +43,24 @@ struct CandidateOutcome {
     /// How the command that reached this path was reached (bd-2kr).
     origin: Origin,
     reason_class: ReasonClass,
+    /// A command that sends what it is given somewhere else was denied for
+    /// naming this path (bd-x8o). The audit log's `class`.
+    egress: bool,
+}
+
+/// What an egress denial tells the agent besides the reason: the path is on its
+/// way off the machine, so a copy or an encoding of it is no way around the rule.
+const EGRESS_REMEDIATION: &str = "Egress blocked: this command would send a protected path off this machine. Do not send the protected file itself, or a copy, archive or encoding of it. Run `veil operator` to discover the authorized spine tools and derive a metadata-safe artifact instead; `airlock` attests which derived artifacts later cross the model boundary. If the data really must leave, stop and ask the operator to do the transfer outside this session.";
+
+/// Marks the denial of a command that sends what it is given (`curl`, `scp`,
+/// `aws`, a mail client...) as an egress attempt: its remediation says so and
+/// the audit record carries `class: egress`. Any other decision is unchanged.
+fn classify_egress(command: &CommandExtraction, mut decision: Decision) -> (Decision, bool) {
+    let egress = command.egress && decision.action == DecisionAction::Deny;
+    if egress {
+        decision.remediation = Some(EGRESS_REMEDIATION.to_owned());
+    }
+    (decision, egress)
 }
 
 /// How a path came to be judged (bd-29r, bd-2mi): read by something veil
@@ -195,12 +213,17 @@ fn evaluate_commands(
                 evaluation_input = evaluation_input.with_spine_invocation(invocation);
             }
 
+            let (decision, egress) = classify_egress(
+                command,
+                evaluate_access_with(&evaluation_input, config, registry, &matchers),
+            );
             outcomes.push(CandidateOutcome {
                 path: path.clone(),
-                decision: evaluate_access_with(&evaluation_input, config, registry, &matchers),
+                decision,
                 sensitivity: sensitivity_pack(registry, &matchers, path),
                 origin: command.origin,
                 reason_class: ReasonClass::DirectRead,
+                egress,
             });
         }
 
@@ -234,12 +257,14 @@ fn evaluate_commands(
                 continue;
             }
 
+            let (decision, egress) = classify_egress(command, decision);
             outcomes.push(CandidateOutcome {
                 path: argv.path.clone(),
                 decision,
                 sensitivity: sensitivity_pack(registry, &matchers, &argv.path),
                 origin: command.origin,
                 reason_class: ReasonClass::ArgvPath,
+                egress,
             });
         }
 
@@ -358,6 +383,9 @@ fn dynamic_outcome(
         sensitivity: None,
         origin: command.origin,
         reason_class: ReasonClass::DynamicPath,
+        // An argument veil cannot resolve is not an attempt to send a
+        // protected path, so it stays out of the egress class.
+        egress: false,
     })
 }
 
@@ -460,6 +488,7 @@ fn append_audit_records(
                 session_id: hook_input.session_id.clone(),
                 origin: Some(outcome.origin.as_str().to_owned()),
                 reason_class: Some(outcome.reason_class.as_str().to_owned()),
+                class: outcome.egress.then(|| "egress".to_owned()),
             },
         )?;
     }

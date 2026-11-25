@@ -142,7 +142,12 @@ pub fn run_config(args: &ConfigArgs) -> Result<String, Box<dyn std::error::Error
 pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
     let config = config::load_config(&repo_root)?;
-    render_audit_for_path(&config.policy.audit_path, args.json, RECENT_AUDIT_LIMIT)
+    render_audit_for_path(
+        &config.policy.audit_path,
+        args.json,
+        args.class.as_deref(),
+        RECENT_AUDIT_LIMIT,
+    )
 }
 
 /// `veil --describe`: the operator manifest, byte-for-byte the repo's `operator.json`.
@@ -240,17 +245,22 @@ fn render_config_for_repo(
 fn render_audit_for_path(
     audit_path: &Path,
     json_output: bool,
+    class: Option<&str>,
     limit: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let entries = read_recent_audit_entries(audit_path, limit)?;
+    let entries = read_recent_audit_entries(audit_path, class, limit)?;
 
     if json_output {
-        Ok(serde_json::to_string_pretty(&json!({
+        let mut value = json!({
             "path": audit_path.display().to_string(),
             "entries": entries,
-        }))?)
+        });
+        if let (Some(class), Some(object)) = (class, value.as_object_mut()) {
+            object.insert("class".to_owned(), json!(class));
+        }
+        Ok(serde_json::to_string_pretty(&value)?)
     } else {
-        Ok(render_audit_human(audit_path, &entries))
+        Ok(render_audit_human(audit_path, class, &entries))
     }
 }
 
@@ -670,7 +680,21 @@ fn render_string_list(output: &mut String, heading: &str, label: &str, values: &
     }
 }
 
-fn read_recent_audit_entries(path: &Path, limit: usize) -> io::Result<Vec<Value>> {
+/// Whether an audit entry is of `class`: its `class` (`egress`) or its
+/// `reason_class` (`direct_read`, `argv_path`, `dynamic_path_unresolvable`).
+fn entry_has_class(entry: &Value, class: &str) -> bool {
+    string_field(entry, "class") == Some(class)
+        || string_field(entry, "reason_class") == Some(class)
+}
+
+/// The last `limit` entries of the audit log, or of its entries of `class`: the
+/// filter comes first, so an old attempt is not pushed out of the window by
+/// newer records of another class.
+fn read_recent_audit_entries(
+    path: &Path,
+    class: Option<&str>,
+    limit: usize,
+) -> io::Result<Vec<Value>> {
     if limit == 0 || !path.exists() {
         return Ok(Vec::new());
     }
@@ -695,6 +719,10 @@ fn read_recent_audit_entries(path: &Path, limit: usize) -> io::Result<Vec<Value>
             )
         })?;
 
+        if class.is_some_and(|class| !entry_has_class(&value, class)) {
+            continue;
+        }
+
         if recent.len() == limit {
             recent.pop_front();
         }
@@ -704,10 +732,13 @@ fn read_recent_audit_entries(path: &Path, limit: usize) -> io::Result<Vec<Value>
     Ok(recent.into_iter().collect())
 }
 
-fn render_audit_human(path: &Path, entries: &[Value]) -> String {
+fn render_audit_human(path: &Path, class: Option<&str>, entries: &[Value]) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "Audit");
     let _ = writeln!(output, "  path: {}", path.display());
+    if let Some(class) = class {
+        let _ = writeln!(output, "  class: {class}");
+    }
     let _ = writeln!(output, "  entries: {}", entries.len());
 
     if entries.is_empty() {
@@ -2049,8 +2080,8 @@ mod tests {
             ),
         );
 
-        let rendered =
-            render_audit_for_path(&audit_path, false, 20).expect("audit rendering should succeed");
+        let rendered = render_audit_for_path(&audit_path, false, None, 20)
+            .expect("audit rendering should succeed");
 
         assert!(rendered.contains("Audit"));
         assert!(rendered.contains("entries: 2"));
@@ -2066,13 +2097,100 @@ mod tests {
             "{\"ts\":\"2026-03-01T16:00:00Z\",\"tool\":\"Read\",\"path\":\"data/a.csv\",\"decision\":\"deny\"}\n",
         );
 
-        let rendered =
-            render_audit_for_path(&audit_path, true, 20).expect("audit rendering should succeed");
+        let rendered = render_audit_for_path(&audit_path, true, None, 20)
+            .expect("audit rendering should succeed");
         let value: Value = serde_json::from_str(&rendered).expect("audit JSON should parse");
 
         assert_eq!(value["path"], audit_path.display().to_string());
         assert_eq!(value["entries"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["entries"][0]["tool"], "Read");
+        // no filter, no `class` key
+        assert!(value.get("class").is_none());
+    }
+
+    /// Three egress denials, interleaved with other records, the newest of them
+    /// followed by more records of other classes than the window holds.
+    fn egress_audit_fixture(name: &str) -> PathBuf {
+        let audit_path = unique_temp_dir(name).join("audit.jsonl");
+        let line = |ts: u32, path: &str, reason_class: &str, class: &str| {
+            format!(
+                "{{\"ts\":\"2026-03-01T16:{ts:02}:00Z\",\"tool\":\"Bash\",\"path\":\"{path}\",\"decision\":\"deny\",\"reason_class\":\"{reason_class}\",\"class\":{class}}}\n"
+            )
+        };
+        let mut text = String::new();
+        text.push_str(&line(0, "first-egress", "argv_path", "\"egress\""));
+        text.push_str(&line(1, "read-one", "direct_read", "null"));
+        text.push_str(&line(2, "second-egress", "direct_read", "\"egress\""));
+        text.push_str(&line(3, "read-two", "direct_read", "null"));
+        text.push_str(&line(4, "third-egress", "argv_path", "\"egress\""));
+        for minute in 5..12 {
+            text.push_str(&line(minute, "later", "argv_path", "null"));
+        }
+        write_file(&audit_path, &text);
+        audit_path
+    }
+
+    #[test]
+    fn audit_class_egress_lists_only_egress_attempts() {
+        let audit_path = egress_audit_fixture("audit-class-egress");
+
+        let rendered = render_audit_for_path(&audit_path, true, Some("egress"), 20)
+            .expect("audit rendering should succeed");
+        let value: Value = serde_json::from_str(&rendered).expect("audit JSON should parse");
+
+        let paths: Vec<&str> = value["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(paths, ["first-egress", "second-egress", "third-egress"]);
+        assert_eq!(value["class"], "egress");
+
+        let human = render_audit_for_path(&audit_path, false, Some("egress"), 20)
+            .expect("audit rendering should succeed");
+        assert!(human.contains("class: egress"), "{human}");
+        assert!(human.contains("entries: 3"), "{human}");
+        assert!(!human.contains("read-one"), "{human}");
+    }
+
+    #[test]
+    fn the_class_filter_comes_before_the_window() {
+        // seven newer records of another class must not push the attempts out
+        let audit_path = egress_audit_fixture("audit-class-window");
+
+        let rendered = render_audit_for_path(&audit_path, true, Some("egress"), 2)
+            .expect("audit rendering should succeed");
+        let value: Value = serde_json::from_str(&rendered).expect("audit JSON should parse");
+        let paths: Vec<&str> = value["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry["path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(paths, ["second-egress", "third-egress"]);
+
+        // the unfiltered window is the last two records of the log
+        let unfiltered = render_audit_for_path(&audit_path, true, None, 2)
+            .expect("audit rendering should succeed");
+        let value: Value = serde_json::from_str(&unfiltered).expect("audit JSON should parse");
+        assert_eq!(value["entries"][0]["path"], "later");
+        assert_eq!(value["entries"][1]["path"], "later");
+    }
+
+    #[test]
+    fn audit_class_also_matches_a_reason_class_and_may_match_nothing() {
+        let audit_path = egress_audit_fixture("audit-class-reason");
+
+        let rendered = render_audit_for_path(&audit_path, true, Some("direct_read"), 20)
+            .expect("audit rendering should succeed");
+        let value: Value = serde_json::from_str(&rendered).expect("audit JSON should parse");
+        assert_eq!(value["entries"].as_array().map(Vec::len), Some(3));
+
+        let none = render_audit_for_path(&audit_path, false, Some("dynamic_path_unresolvable"), 20)
+            .expect("audit rendering should succeed");
+        assert!(none.contains("entries: 0"), "{none}");
+        assert!(none.contains("(none)"), "{none}");
     }
 
     #[test]
