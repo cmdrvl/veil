@@ -68,8 +68,19 @@ pub fn detect_spine_invocation(
     cwd: &Path,
 ) -> Option<SpineInvocation> {
     let tokens = shlex::split(command)?;
-    let pipeline = left_pipeline(&tokens);
-    let (program, args) = pipeline.split_first()?;
+    detect_spine_argv(left_pipeline(&tokens), authorized_tools, denied_flags, cwd)
+}
+
+/// Like [`detect_spine_invocation`] for one simple command whose words are
+/// already split, such as each command of a decomposed Bash command (bd-2kr).
+/// The words are the command's own, so nothing here looks for a pipeline.
+pub fn detect_spine_argv(
+    argv: &[String],
+    authorized_tools: &[String],
+    denied_flags: &DeniedFlags,
+    cwd: &Path,
+) -> Option<SpineInvocation> {
+    let (program, args) = argv.split_first()?;
 
     let tool_name = authorized_tool_name(program, authorized_tools)?;
     let target_path = extract_target_path(args, cwd)?;

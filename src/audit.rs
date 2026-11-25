@@ -17,6 +17,10 @@ pub struct AuditRecord {
     pub sensitivity: Option<String>,
     pub confidence: Option<f32>,
     pub session_id: Option<String>,
+    /// How the evaluated command was reached: `top`, `subshell` (inside `$( )`
+    /// or backticks) or `wrapper` (`sh -c`, `xargs`, `find -exec`, `uv run`...).
+    /// A Read or Grep call is `top`.
+    pub origin: Option<String>,
 }
 
 impl AuditRecord {
@@ -30,6 +34,7 @@ impl AuditRecord {
             "sensitivity": self.sensitivity,
             "confidence": self.confidence,
             "session_id": self.session_id,
+            "origin": self.origin,
         })
     }
 }
@@ -87,6 +92,7 @@ mod tests {
             sensitivity: Some("data.tabular".to_owned()),
             confidence: Some(0.95),
             session_id: Some("session-123".to_owned()),
+            origin: Some("top".to_owned()),
         }
     }
 
@@ -138,6 +144,7 @@ mod tests {
         assert_eq!(value["tool"], "Read");
         assert_eq!(value["decision"], "deny");
         assert_eq!(value["session_id"], "session-123");
+        assert_eq!(value["origin"], "top");
     }
 
     #[test]
@@ -172,6 +179,7 @@ mod tests {
                 sensitivity: None,
                 confidence: Some(0.42),
                 session_id: Some("session-456".to_owned()),
+                origin: Some("wrapper".to_owned()),
             },
         )
         .expect("second append should succeed");
@@ -190,5 +198,6 @@ mod tests {
         assert_eq!(first["tool"], "Read");
         assert_eq!(second["tool"], "Bash");
         assert_eq!(second["decision"], "allow");
+        assert_eq!(second["origin"], "wrapper");
     }
 }

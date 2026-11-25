@@ -8,6 +8,11 @@ use serde_json::Value;
 
 use crate::types::ToolKind;
 
+mod decompose;
+mod wrappers;
+
+pub use decompose::{MAX_DEPTH, MAX_SEGMENTS, Origin, SimpleCommand, decompose};
+
 const PYTHON_DIRECT_READ_CALLS: &[&str] = &[
     "open",
     "read_csv",
@@ -75,43 +80,94 @@ pub fn extract_read_or_grep_paths(tool: ToolKind, raw_args: &str, cwd: &Path) ->
     }
 }
 
-pub fn extract_bash_read_paths(command: &str, cwd: &Path) -> PathExtraction {
-    if parse_heredoc(command).is_some() {
-        return extract_heredoc_bash_paths(command, cwd);
-    }
-
-    extract_tokenized_bash_paths(command, cwd)
+/// What one simple command of a Bash tool command would read, and how it was
+/// reached. Each one is evaluated on its own (bd-2kr).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandExtraction {
+    pub origin: Origin,
+    /// The command's words, for the checks that look at the command rather than
+    /// at a path (an authorized spine tool). Empty for Read and Grep, and for
+    /// text that could not be analysed.
+    pub argv: Vec<String>,
+    pub exposure: PathExposure,
+    pub candidates: Vec<PathBuf>,
 }
 
-fn extract_tokenized_bash_paths(command: &str, cwd: &Path) -> PathExtraction {
-    let Some(tokens) = shlex::split(command) else {
-        return PathExtraction::none();
+impl CommandExtraction {
+    /// A Read or Grep call: one path source with no command words.
+    pub fn from_path_extraction(extraction: PathExtraction) -> Self {
+        Self {
+            origin: Origin::Top,
+            argv: Vec::new(),
+            exposure: extraction.exposure,
+            candidates: extraction.candidates,
+        }
+    }
+}
+
+/// The simple commands of a Bash tool command, in the order they would run,
+/// each with the paths it reads. A command that reads nothing is still listed:
+/// its words may name an authorized spine tool.
+pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction> {
+    decompose(command)
+        .iter()
+        .map(|simple| command_extraction(simple, cwd))
+        .collect()
+}
+
+fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction {
+    let Some((program, args)) = command.argv.split_first() else {
+        // Text that could not be analysed: nothing to check yet (bd-2mi).
+        return CommandExtraction {
+            origin: command.origin,
+            argv: Vec::new(),
+            exposure: PathExposure::None,
+            candidates: Vec::new(),
+        };
     };
 
-    let pipeline = left_pipeline(&tokens);
-    let Some((program, args)) = resolve_invocation(pipeline) else {
-        return PathExtraction::none();
-    };
-
-    let (mut paths, exposure) = match search_command_paths(program, args) {
+    let (mut paths, exposure) = match search_command_paths(
+        program,
+        args,
+        !command.redirects_in.is_empty(),
+        command.stdin_piped,
+    ) {
         Some(search) => (search.paths, search.exposure),
         None => (
             command_paths(program, args).unwrap_or_default(),
             PathExposure::ReadsContents,
         ),
     };
-    paths.extend(collect_input_redirect_paths(args));
+    paths.extend(command.redirects_in.iter().cloned());
     paths.extend(collect_inline_interpreter_paths(program, args));
+    if let Some(body) = &command.heredoc_body {
+        paths.extend(heredoc_script_paths(program, body));
+    }
 
     let candidates = normalize_candidates(paths, cwd);
-
-    if candidates.is_empty() {
-        PathExtraction::none()
+    let exposure = if candidates.is_empty() {
+        PathExposure::None
     } else {
-        PathExtraction {
-            exposure,
-            candidates,
-        }
+        exposure
+    };
+
+    CommandExtraction {
+        origin: command.origin,
+        argv: command.argv.clone(),
+        exposure,
+        candidates,
+    }
+}
+
+/// Paths an interpreter reads when its script arrives as a here-document.
+/// Shells are handled by the decomposer, which runs the body as a script.
+fn heredoc_script_paths(program: &str, body: &str) -> Vec<String> {
+    match interpreter_kind(command_name(program)) {
+        Some(InterpreterKind::Python) => extract_python_script_paths(body),
+        Some(InterpreterKind::Node) => extract_node_script_paths(body),
+        Some(InterpreterKind::Perl) => extract_perl_script_paths(body),
+        Some(InterpreterKind::Ruby) => extract_ruby_script_paths(body),
+        Some(InterpreterKind::Shell) | None => Vec::new(),
     }
 }
 
@@ -198,68 +254,6 @@ fn normalize_candidates(paths: Vec<String>, cwd: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-fn left_pipeline(tokens: &[String]) -> &[String] {
-    for (index, token) in tokens.iter().enumerate() {
-        if is_pipeline_separator(token) {
-            return &tokens[..index];
-        }
-    }
-
-    tokens
-}
-
-fn resolve_invocation(tokens: &[String]) -> Option<(&str, &[String])> {
-    let mut index = 0;
-
-    while index < tokens.len() {
-        let token = tokens[index].as_str();
-        if is_env_assignment(token) {
-            index += 1;
-            continue;
-        }
-
-        match command_name(token) {
-            "env" => {
-                index += 1;
-                while index < tokens.len() {
-                    let token = tokens[index].as_str();
-                    if token == "--" {
-                        index += 1;
-                        break;
-                    }
-
-                    if token.starts_with('-') || is_env_assignment(token) {
-                        index += 1;
-                        continue;
-                    }
-
-                    break;
-                }
-            }
-            "command" | "builtin" | "nohup" => {
-                index += 1;
-                while index < tokens.len() {
-                    let token = tokens[index].as_str();
-                    if token == "--" {
-                        index += 1;
-                        break;
-                    }
-
-                    if token.starts_with('-') {
-                        index += 1;
-                        continue;
-                    }
-
-                    break;
-                }
-            }
-            _ => return Some((token, &tokens[index + 1..])),
-        }
-    }
-
-    None
-}
-
 fn command_paths(program: &str, args: &[String]) -> Option<Vec<String>> {
     match command_name(program) {
         "cat" => Some(collect_simple_reader_paths(args)),
@@ -284,6 +278,9 @@ struct SearchSpec {
     short_with_value: &'static [char],
     long_with_value: &'static [&'static str],
     /// Searches directories recursively without being asked (rg, ag, ack).
+    /// These three also search standard input, not the working directory, when
+    /// given no path and fed by a pipe; `grep -r` and `ugrep -r` search the
+    /// working directory regardless.
     recursive_by_default: bool,
     recursive_short: &'static [char],
     recursive_long: &'static [&'static str],
@@ -535,14 +532,20 @@ struct SearchPaths {
 }
 
 /// The files and directories a grep-family command searches, and whether it
-/// prints their content. Only the first simple command of a pipeline reaches
-/// here, like the other readers.
+/// prints their content. `has_input_redirect` is a `<` on the command and
+/// `stdin_piped` is a pipe feeding it.
 ///
-/// A recursive search with no operand searches the working directory. An
-/// operand with a shell wildcard is kept literally and, when the search
-/// recurses, also as the directory before its first wildcard, since the shell
-/// will expand it into names this function cannot see.
-fn search_command_paths(program: &str, args: &[String]) -> Option<SearchPaths> {
+/// A recursive search with no operand searches the working directory, unless
+/// it reads a redirect or, for the tools that do so, a pipe. An operand with a
+/// shell wildcard is kept literally and, when the search recurses, also as the
+/// directory before its first wildcard, since the shell will expand it into
+/// names this function cannot see.
+fn search_command_paths(
+    program: &str,
+    args: &[String],
+    has_input_redirect: bool,
+    stdin_piped: bool,
+) -> Option<SearchPaths> {
     let spec = search_spec(command_name(program))?;
 
     let mut operands: Vec<&str> = Vec::new();
@@ -633,7 +636,8 @@ fn search_command_paths(program: &str, args: &[String]) -> Option<SearchPaths> {
     }
     operands.retain(|operand| *operand != "-" && !looks_like_redirection(operand));
 
-    if operands.is_empty() && recursive && collect_input_redirect_paths(args).is_empty() {
+    let reads_pipe = stdin_piped && spec.recursive_by_default;
+    if operands.is_empty() && recursive && !has_input_redirect && !reads_pipe {
         operands.push(".");
     }
 
@@ -852,58 +856,6 @@ fn collect_inline_interpreter_paths(program: &str, args: &[String]) -> Vec<Strin
     }
 
     Vec::new()
-}
-
-fn extract_heredoc_bash_paths(command: &str, cwd: &Path) -> PathExtraction {
-    let Some(heredoc) = parse_heredoc(command) else {
-        return PathExtraction::none();
-    };
-
-    let pipeline = left_pipeline(&heredoc.header_tokens);
-    let Some((program, args)) = pipeline.split_first() else {
-        return PathExtraction::none();
-    };
-
-    let mut candidates = normalize_candidates(collect_input_redirect_paths(args), cwd);
-
-    match interpreter_kind(command_name(program)) {
-        Some(InterpreterKind::Python) => candidates.extend(normalize_candidates(
-            extract_python_script_paths(heredoc.body),
-            cwd,
-        )),
-        Some(InterpreterKind::Node) => candidates.extend(normalize_candidates(
-            extract_node_script_paths(heredoc.body),
-            cwd,
-        )),
-        Some(InterpreterKind::Perl) => candidates.extend(normalize_candidates(
-            extract_perl_script_paths(heredoc.body),
-            cwd,
-        )),
-        Some(InterpreterKind::Ruby) => candidates.extend(normalize_candidates(
-            extract_ruby_script_paths(heredoc.body),
-            cwd,
-        )),
-        Some(InterpreterKind::Shell) => {
-            for line in heredoc.body.lines() {
-                let extraction = extract_bash_read_paths(line, cwd);
-                for candidate in extraction.candidates {
-                    if !candidates.contains(&candidate) {
-                        candidates.push(candidate);
-                    }
-                }
-            }
-        }
-        None => {}
-    }
-
-    if candidates.is_empty() {
-        PathExtraction::none()
-    } else {
-        PathExtraction {
-            exposure: PathExposure::ReadsContents,
-            candidates,
-        }
-    }
 }
 
 fn interpreter_kind(program: &str) -> Option<InterpreterKind> {
@@ -1225,91 +1177,6 @@ fn parse_quoted_literal(script: &str, start: usize) -> Option<(String, usize)> {
     None
 }
 
-struct Heredoc<'a> {
-    header_tokens: Vec<String>,
-    body: &'a str,
-}
-
-fn parse_heredoc(command: &str) -> Option<Heredoc<'_>> {
-    let header_end = command.find('\n')?;
-    let header = &command[..header_end];
-    let (delimiter, strip_tabs) = parse_heredoc_delimiter(header)?;
-    let header_tokens = shlex::split(header)?;
-    let body_start = header_end + 1;
-    let mut body_end = None;
-
-    for (offset, line) in command[body_start..].split_inclusive('\n').enumerate() {
-        let absolute_start = body_start
-            + command[body_start..]
-                .split_inclusive('\n')
-                .take(offset)
-                .map(str::len)
-                .sum::<usize>();
-        let trimmed = line.strip_suffix('\n').unwrap_or(line);
-        let candidate = if strip_tabs {
-            trimmed.trim_start_matches('\t')
-        } else {
-            trimmed
-        };
-
-        if candidate == delimiter {
-            body_end = Some(absolute_start);
-            break;
-        }
-    }
-
-    let body_end = body_end?;
-
-    Some(Heredoc {
-        header_tokens,
-        body: &command[body_start..body_end],
-    })
-}
-
-fn parse_heredoc_delimiter(header: &str) -> Option<(String, bool)> {
-    let marker = header.find("<<")?;
-    let bytes = header.as_bytes();
-    let mut index = marker + 2;
-    let mut strip_tabs = false;
-
-    if bytes.get(index) == Some(&b'-') {
-        strip_tabs = true;
-        index += 1;
-    }
-
-    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
-        index += 1;
-    }
-
-    let quote = match bytes.get(index) {
-        Some(b'\'') | Some(b'"') => {
-            let quote = bytes[index];
-            index += 1;
-            Some(quote)
-        }
-        _ => None,
-    };
-    let start = index;
-
-    while let Some(&byte) = bytes.get(index) {
-        if Some(byte) == quote {
-            return Some((header[start..index].to_owned(), strip_tabs));
-        }
-
-        if quote.is_none() && byte.is_ascii_whitespace() {
-            break;
-        }
-
-        index += 1;
-    }
-
-    if quote.is_some() || index == start {
-        return None;
-    }
-
-    Some((header[start..index].to_owned(), strip_tabs))
-}
-
 fn is_redirection(arg: &str) -> bool {
     matches!(arg, "<" | ">" | ">>" | "1>" | "1>>" | "2>" | "2>>")
 }
@@ -1385,10 +1252,6 @@ fn is_fd_indirection(path: &Path) -> bool {
     raw.starts_with("/dev/fd/") || raw.starts_with("/proc/self/fd/")
 }
 
-fn is_pipeline_separator(token: &str) -> bool {
-    token.len() == 1 && token.as_bytes()[0] == b'|'
-}
-
 fn is_env_assignment(token: &str) -> bool {
     let Some((name, _value)) = token.split_once('=') else {
         return false;
@@ -1421,6 +1284,34 @@ mod tests {
             .expect("system clock should be after the unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("veil-extract-{label}-{nanos}"))
+    }
+
+    /// The paths of a Bash command as one flat extraction: the strongest
+    /// exposure of any command that reads something, and every candidate in
+    /// order. The single-command tests below read this; the hook itself
+    /// evaluates `extract_bash_commands` one command at a time.
+    fn extract_bash_read_paths(command: &str, cwd: &Path) -> PathExtraction {
+        let mut flat = PathExtraction::none();
+        for extracted in extract_bash_commands(command, cwd) {
+            if extracted.candidates.is_empty() {
+                continue;
+            }
+            flat.exposure = match (flat.exposure, extracted.exposure) {
+                (PathExposure::ReadsContents, _) | (_, PathExposure::ReadsContents) => {
+                    PathExposure::ReadsContents
+                }
+                (PathExposure::MetadataOnly, _) | (_, PathExposure::MetadataOnly) => {
+                    PathExposure::MetadataOnly
+                }
+                _ => PathExposure::None,
+            };
+            for candidate in extracted.candidates {
+                if !flat.candidates.contains(&candidate) {
+                    flat.candidates.push(candidate);
+                }
+            }
+        }
+        flat
     }
 
     #[test]
@@ -2100,6 +1991,199 @@ mod tests {
             PathExposure::ReadsContents,
             &["data/x.csv"],
         );
+    }
+
+    // --- bd-2kr: shell decomposition and wrapper unwrapping ---
+
+    /// Each command that reads something: how it was reached, its exposure and
+    /// its candidates relative to the workspace.
+    fn reads(command: &str) -> Vec<(&'static str, PathExposure, Vec<String>)> {
+        extract_bash_commands(command, workspace())
+            .into_iter()
+            .filter(|extracted| !extracted.candidates.is_empty())
+            .map(|extracted| {
+                let candidates = extracted
+                    .candidates
+                    .iter()
+                    .map(|path| match path.strip_prefix(workspace()) {
+                        Ok(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
+                        Ok(relative) => relative.to_string_lossy().into_owned(),
+                        Err(_) => path.to_string_lossy().into_owned(),
+                    })
+                    .collect();
+                (extracted.origin.as_str(), extracted.exposure, candidates)
+            })
+            .collect()
+    }
+
+    fn assert_reads(command: &str, expected: &[(&str, PathExposure, &[&str])]) {
+        let expected: Vec<(&str, PathExposure, Vec<String>)> = expected
+            .iter()
+            .map(|(origin, exposure, paths)| {
+                (
+                    *origin,
+                    *exposure,
+                    paths.iter().map(|path| (*path).to_owned()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(reads(command), expected, "command: {command}");
+    }
+
+    #[test]
+    fn the_bypasses_the_bead_names_now_reach_the_reader() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_reads(
+            r#"sh -c "cat data/x.csv""#,
+            &[("wrapper", Reads, &["data/x.csv"])],
+        );
+        assert_reads(
+            r"find data -type f -exec cat {} \;",
+            &[("wrapper", Reads, &["data"])],
+        );
+        assert_reads(
+            "ls data | xargs -I{} cat data/{}",
+            &[("wrapper", Reads, &["data/{}"])],
+        );
+        assert_reads(
+            "echo $(cat data/x.csv)",
+            &[("subshell", Reads, &["data/x.csv"])],
+        );
+        assert_reads(
+            r#"uv run python3 -c "print(open('data/x.csv').read())""#,
+            &[("wrapper", Reads, &["data/x.csv"])],
+        );
+        assert_reads(
+            r#"sh -c "find . -exec cat {} \;""#,
+            &[("wrapper", Reads, &["."])],
+        );
+        // Quote splicing was already caught and stays caught.
+        assert_reads(r#"cat da""ta/x.csv"#, &[("top", Reads, &["data/x.csv"])]);
+    }
+
+    #[test]
+    fn a_reader_after_any_separator_is_found() {
+        use PathExposure::ReadsContents as Reads;
+
+        for command in [
+            "echo hi; cat data/x.csv",
+            "true && cat data/x.csv",
+            "false || cat data/x.csv",
+            "echo hi | cat data/x.csv",
+            "echo hi\ncat data/x.csv",
+            "echo hi & cat data/x.csv",
+            "(cat data/x.csv)",
+            "{ cat data/x.csv; }",
+            "if true; then cat data/x.csv; fi",
+            "for f in a; do cat data/x.csv; done",
+            "echo hi # note\ncat data/x.csv",
+            "cat <<EOF\nhi\nEOF\ncat data/x.csv",
+        ] {
+            assert_reads(command, &[("top", Reads, &["data/x.csv"])]);
+        }
+    }
+
+    #[test]
+    fn each_command_keeps_its_own_exposure_and_origin() {
+        use PathExposure::{MetadataOnly as Meta, ReadsContents as Reads};
+
+        assert_reads(
+            "grep -rl ssn data; cat notes.md",
+            &[("top", Meta, &["data"]), ("top", Reads, &["notes.md"])],
+        );
+        assert_reads(
+            "cat a.txt; echo $(cat b.txt) | sh -c 'cat c.txt'",
+            &[
+                ("top", Reads, &["a.txt"]),
+                ("subshell", Reads, &["b.txt"]),
+                ("wrapper", Reads, &["c.txt"]),
+            ],
+        );
+        assert_reads(
+            "find data other -exec grep -l ssn {} +",
+            &[("wrapper", Meta, &["data"]), ("wrapper", Meta, &["other"])],
+        );
+    }
+
+    #[test]
+    fn wrapper_chains_reach_the_reader_with_its_redirections() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_reads(
+            "FOO=1 timeout 5 nice -n 3 sudo -u root env A=1 cat data/x.csv",
+            &[("wrapper", Reads, &["data/x.csv"])],
+        );
+        assert_reads(
+            "sudo -u root cat < data/x.csv",
+            &[("wrapper", Reads, &["data/x.csv"])],
+        );
+        assert_reads(
+            "eval \"cat data/x.csv\"",
+            &[("wrapper", Reads, &["data/x.csv"])],
+        );
+        assert_reads(
+            "bash <<< \"cat data/x.csv\"",
+            &[("wrapper", Reads, &["data/x.csv"])],
+        );
+        assert_reads(
+            "bash < data/script.sh",
+            &[("top", Reads, &["data/script.sh"])],
+        );
+        assert_reads(
+            "xargs -n1 cat data/x.csv",
+            &[("wrapper", Reads, &["data/x.csv"])],
+        );
+    }
+
+    #[test]
+    fn a_reader_fed_by_xargs_has_no_path_to_check_but_is_flagged_dynamic() {
+        assert_eq!(reads("ls data | xargs cat"), vec![]);
+
+        let decomposed = decompose("ls data | xargs cat");
+        assert!(decomposed[1].has_dynamic_args);
+        assert_eq!(decomposed[1].argv, vec!["cat".to_owned()]);
+    }
+
+    #[test]
+    fn a_search_fed_by_a_pipe_reads_the_pipe_not_the_working_directory() {
+        use PathExposure::ReadsContents as Reads;
+
+        // rg, ag and ack search a pipe when given no path.
+        assert_eq!(reads("git log | rg ssn"), vec![]);
+        assert_eq!(reads("git log | ag ssn"), vec![]);
+        assert_eq!(reads("git log | ack ssn"), vec![]);
+        assert_eq!(reads("git ls-files | xargs rg ssn"), vec![]);
+        // At the head of a pipeline they search the working directory.
+        assert_reads("rg ssn | head", &[("top", Reads, &["."])]);
+        // grep -r searches the working directory whatever feeds it.
+        assert_reads("git log | grep -r ssn", &[("top", Reads, &["."])]);
+        // A pipe does not stop an explicit path from being searched.
+        assert_reads("git log | rg ssn data", &[("top", Reads, &["data"])]);
+    }
+
+    #[test]
+    fn text_that_cannot_be_analysed_reads_nothing_and_is_marked_opaque() {
+        let commands = extract_bash_commands("cat \"data/x.csv", workspace());
+
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].argv.is_empty());
+        assert!(commands[0].candidates.is_empty());
+        assert_eq!(commands[0].exposure, PathExposure::None);
+    }
+
+    #[test]
+    fn a_heredoc_to_an_interpreter_is_data_for_that_interpreter_not_commands() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_reads(
+            "python3 <<'PY'\nopen('data/x.csv').read()\nPY\ncat data/y.csv",
+            &[
+                ("top", Reads, &["data/x.csv"]),
+                ("top", Reads, &["data/y.csv"]),
+            ],
+        );
+        assert_eq!(reads("cat <<'EOF'\ncat data/x.csv\nEOF"), vec![]);
     }
 
     #[cfg(unix)]

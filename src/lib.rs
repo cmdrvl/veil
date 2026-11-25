@@ -21,12 +21,12 @@ use allowlist::SafePathMatcher;
 use audit::{AuditRecord, append_audit_record};
 use config::load_config;
 use evaluator::{EvaluationInput, evaluate_access};
-use extract::{PathExposure, extract_bash_read_paths, extract_read_or_grep_paths};
+use extract::{CommandExtraction, Origin, extract_bash_commands, extract_read_or_grep_paths};
 use hook::parse_hook_input;
 use packs::PackRegistry;
 use render::{RenderedDecision, render_decision};
 use serde_json::Value;
-use spine::detect_spine_invocation;
+use spine::detect_spine_argv;
 use types::{Decision, DecisionAction, HookInput, ToolKind};
 
 #[derive(Clone, Debug)]
@@ -34,6 +34,8 @@ struct CandidateOutcome {
     path: PathBuf,
     decision: Decision,
     sensitivity: Option<String>,
+    /// How the command that reached this path was reached (bd-2kr).
+    origin: Origin,
 }
 
 const BARE_INVOCATION_GUIDANCE: &str = "no hook payload received on stdin; bare `veil` is hook mode. Pipe a Claude/Gemini/Copilot hook payload into stdin, or run `veil --robot-triage`, `veil capabilities --json`, or `veil robot-docs guide` for operator discovery. For help with veil, run `veil --help`.";
@@ -94,8 +96,8 @@ fn run_with_io<R: Read, W: Write, E: Write>(
 fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
     let config = load_config(&hook_input.cwd)?;
     let registry = PackRegistry::with_built_ins();
-    let extraction = extract_candidates(hook_input);
-    let outcomes = evaluate_candidates(hook_input, &config, &registry, &extraction);
+    let commands = extract_commands(hook_input);
+    let outcomes = evaluate_commands(hook_input, &config, &registry, &commands);
     let decision = select_decision(&outcomes);
     let mut rendered = render_decision(hook_input.protocol, &decision);
 
@@ -108,22 +110,18 @@ fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
     Ok(rendered)
 }
 
-fn extract_candidates(hook_input: &HookInput) -> extract::PathExtraction {
+/// What the tool call would read, one entry per simple command. A Read or Grep
+/// call is one entry; a Bash command is split into the commands that would run
+/// (`sh -c`, `$( )`, `xargs`, `find -exec`, pipelines...), each judged alone.
+fn extract_commands(hook_input: &HookInput) -> Vec<CommandExtraction> {
     match hook_input.tool {
-        ToolKind::Read | ToolKind::Grep => {
-            extract_read_or_grep_paths(hook_input.tool, &hook_input.raw_args, &hook_input.cwd)
-        }
+        ToolKind::Read | ToolKind::Grep => vec![CommandExtraction::from_path_extraction(
+            extract_read_or_grep_paths(hook_input.tool, &hook_input.raw_args, &hook_input.cwd),
+        )],
         ToolKind::Bash => command_from_raw_args(&hook_input.raw_args)
-            .map(|command| extract_bash_read_paths(&command, &hook_input.cwd))
-            .unwrap_or_else(no_path_extraction),
-        ToolKind::Unknown => no_path_extraction(),
-    }
-}
-
-fn no_path_extraction() -> extract::PathExtraction {
-    extract::PathExtraction {
-        exposure: PathExposure::None,
-        candidates: Vec::new(),
+            .map(|command| extract_bash_commands(&command, &hook_input.cwd))
+            .unwrap_or_default(),
+        ToolKind::Unknown => Vec::new(),
     }
 }
 
@@ -135,53 +133,63 @@ fn command_from_raw_args(raw_args: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn evaluate_candidates(
+/// Evaluates every path of every command. An authorized spine tool authorizes
+/// only the command that names it, so `shape data/a.csv; cat data/b.csv` still
+/// denies the `cat`.
+fn evaluate_commands(
     hook_input: &HookInput,
     config: &config::Config,
     registry: &PackRegistry,
-    extraction: &extract::PathExtraction,
+    commands: &[CommandExtraction],
 ) -> Vec<CandidateOutcome> {
     let protected_matcher = SafePathMatcher::from_patterns(config.sensitivity.protected.iter());
-    let spine_invocation = detect_spine(hook_input, config);
-    let mut candidates = extraction.candidates.clone();
+    let mut outcomes = Vec::new();
 
-    if candidates.is_empty()
-        && let Some(invocation) = spine_invocation.as_ref()
-    {
-        candidates.push(invocation.target_path.clone());
-    }
+    for command in commands {
+        let spine_invocation = detect_spine(hook_input, config, command);
+        let mut candidates = command.candidates.clone();
 
-    candidates
-        .iter()
-        .map(|path| {
+        if candidates.is_empty()
+            && let Some(invocation) = spine_invocation.as_ref()
+        {
+            candidates.push(invocation.target_path.clone());
+        }
+
+        for path in &candidates {
             let directory_sensitive = protected_matcher.is_safe(path);
             let sensitivity = registry
                 .classify(path, directory_sensitive)
                 .map(|result| result.pack);
             let mut evaluation_input =
-                EvaluationInput::new(hook_input.tool, path.clone(), extraction.exposure);
+                EvaluationInput::new(hook_input.tool, path.clone(), command.exposure);
 
             if let Some(invocation) = spine_invocation.clone() {
                 evaluation_input = evaluation_input.with_spine_invocation(invocation);
             }
 
-            CandidateOutcome {
+            outcomes.push(CandidateOutcome {
                 path: path.clone(),
                 decision: evaluate_access(&evaluation_input, config, registry),
                 sensitivity,
-            }
-        })
-        .collect()
+                origin: command.origin,
+            });
+        }
+    }
+
+    outcomes
 }
 
-fn detect_spine(hook_input: &HookInput, config: &config::Config) -> Option<spine::SpineInvocation> {
+fn detect_spine(
+    hook_input: &HookInput,
+    config: &config::Config,
+    command: &CommandExtraction,
+) -> Option<spine::SpineInvocation> {
     if hook_input.tool != ToolKind::Bash {
         return None;
     }
 
-    let command = command_from_raw_args(&hook_input.raw_args)?;
-    detect_spine_invocation(
-        &command,
+    detect_spine_argv(
+        &command.argv,
         &config.spine.authorized_tools,
         &config.spine.denied_flags,
         &hook_input.cwd,
@@ -236,6 +244,7 @@ fn append_audit_records(
                 sensitivity: outcome.sensitivity.clone(),
                 confidence: outcome.decision.confidence,
                 session_id: hook_input.session_id.clone(),
+                origin: Some(outcome.origin.as_str().to_owned()),
             },
         )?;
     }

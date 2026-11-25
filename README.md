@@ -84,7 +84,7 @@ veil hooks into Claude Code's `PreToolUse` event for multiple tool types:
 |-------------|----------------|
 | `Read` | Direct file reads into context |
 | `Grep` | Content-mode grep exposing file contents, including a search of a directory that holds protected paths |
-| `Bash` | Common shell-reader patterns that would expose file contents directly, including `grep`, `rg`, `ag`, `ack` and `ugrep` content searches |
+| `Bash` | Common shell-reader patterns that would expose file contents directly, including `grep`, `rg`, `ag`, `ack` and `ugrep` content searches, in every command the line would run (see below) |
 
 Treat `veil` as an operator-first guardrail: it blocks direct reads, then points
 you to the configured authorized path for sensitive-file work instead of
@@ -99,6 +99,28 @@ limits to know about: the Grep tool's `glob` and `type` filters are not
 honored, so a search of a directory that holds protected data is denied even
 if the filter would have skipped it (search a narrower path instead); and a
 directory with more than 200,000 entries is refused rather than assumed clean.
+
+A Bash tool call is judged one command at a time, not by its first word. veil
+splits the line on `;`, `&`, `&&`, `||`, `|` and newlines, looks inside `$( )`,
+backticks and `<( )`, runs the string given to `sh`/`bash`/`zsh`/`dash -c`,
+`eval` and here-strings or here-documents fed to a shell back through the same
+steps, and looks through `env`, `nice`, `nohup`, `time`, `timeout`, `sudo`,
+`doas`, `exec`, `xargs`, `find -exec`/`-execdir`/`-ok`, `uv run`, `uvx`,
+`pipx run`, `poetry run`, `pdm run`, `npx`, `bunx` and `deno run` to the command
+they run. Every command is evaluated, the first denial wins, and each is
+written to the audit log with an `origin` of `top`, `subshell` or `wrapper`.
+An authorized spine tool authorizes only its own command: `shape data/a.csv;
+cat data/b.csv` still denies the `cat`.
+
+`find data -exec cat {} \;` is treated as a content read of `data`, because the
+files `{}` stands for are unknown; `-name`, `-type` and `-prune` filters are not
+honored, so it is denied if `data` holds anything protected. What veil does not
+follow: variables and other expansions (`cat $f`), a script piped into a shell
+(`echo '...' | sh`), `source`, a `cd` earlier in the line (paths resolve against
+the directory the hook started in), programs that run a command but are not in
+the list above (`docker exec`, `ssh host cmd`, `git grep`), command text it
+cannot parse, and anything past the 64th command of one line or the 8th level of
+nesting. Those are allowed today.
 
 ### Configuration
 

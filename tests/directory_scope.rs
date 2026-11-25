@@ -4,9 +4,10 @@
 //! `PreToolUse` payloads against real directories on disk.
 //!
 //! What they do not cover: searches the extractor does not recognise as
-//! searches (`git grep`, `find -exec grep`, anything after the first command of
-//! a pipeline or `&&`), and built-in packs such as `.env` found beneath a
+//! searches (`git grep`), and built-in packs such as `.env` found beneath a
 //! searched directory. Those are separate gaps, named in the bd-1si comment.
+//! Searches after the first command of a line, inside `sh -c` and behind
+//! `find -exec` are covered since bd-2kr; see `tests/shell_decomposition.rs`.
 
 use std::fs;
 use std::io::Write;
