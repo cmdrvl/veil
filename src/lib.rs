@@ -1134,50 +1134,108 @@ mod tests {
 
     #[test]
     fn ten_thousand_protected_patterns_do_not_slow_a_command_by_the_number_of_patterns() {
-        let repo_root = unique_temp_dir("hook-10k");
-        fs::create_dir_all(repo_root.join("src")).expect("src dir");
-        let audit_path = repo_root.join("state").join("audit.jsonl");
-        let patterns = (0..10_000)
-            .map(|index| format!("\"zone{index}/**\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        fs::write(
-            repo_root.join(".veil.toml"),
-            format!(
-                "[sensitivity]\nprotected = [{patterns}]\n\n[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
-                audit_path.to_string_lossy().replace('\\', "\\\\")
-            ),
-        )
-        .expect("config should be written");
-        let mut words = Vec::new();
-        for index in 0..63 {
-            let name = format!("src/file{index}.rs");
-            fs::write(repo_root.join(&name), "fn f() {}\n").expect("source file");
-            words.push(name);
-        }
-        let repo_root = fs::canonicalize(&repo_root).expect("canonical root");
-        let config = load_config(&repo_root).expect("config should load");
+        // A repo of 63 ordinary files whose config protects `count` patterns, and
+        // the words that name the files.
+        let repo_with = |label: &str, count: usize| {
+            let repo_root = unique_temp_dir(label);
+            fs::create_dir_all(repo_root.join("src")).expect("src dir");
+            let audit_path = repo_root.join("state").join("audit.jsonl");
+            let patterns = (0..count)
+                .map(|index| format!("\"zone{index}/**\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            fs::write(
+                repo_root.join(".veil.toml"),
+                format!(
+                    "[sensitivity]\nprotected = [{patterns}]\n\n[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
+                    audit_path.to_string_lossy().replace('\\', "\\\\")
+                ),
+            )
+            .expect("config should be written");
+            let mut words = Vec::new();
+            for index in 0..63 {
+                let name = format!("src/file{index}.rs");
+                fs::write(repo_root.join(&name), "fn f() {}\n").expect("source file");
+                words.push(name);
+            }
+            let repo_root = fs::canonicalize(&repo_root).expect("canonical root");
+            let config = load_config(&repo_root).expect("config should load");
+
+            (repo_root, config, words)
+        };
+        let (small_root, small, words) = repo_with("hook-10", 10);
+        let (big_root, big, _) = repo_with("hook-10k", 10_000);
         // the config adds a few built-in patterns to the 10,000 above
-        assert!(config.sensitivity.protected.len() >= 10_000);
+        assert!(big.sensitivity.protected.len() >= 10_000);
+        assert!(small.sensitivity.protected.len() < 1_000);
+
         let clean = format!("awk 1 {}", words.join(" "));
+        let few = format!("awk 1 {} {}", words[0], words[1]);
         let dirty = format!("{clean} zone9999/x.csv");
 
-        let mut best = std::time::Duration::MAX;
-        for _ in 0..20 {
+        // Four measurements of one command each, taken in turn so that load on the
+        // machine lands on all of them alike, each the best of 20: 63 words and 2
+        // words, against 10 patterns and against 10,000.
+        let measure = |command: &str, root: &Path, config: &config::Config| {
             let start = std::time::Instant::now();
-            let (decision, _) = judge(&clean, &repo_root, &config);
-            best = best.min(start.elapsed());
+            let (decision, _) = judge(command, root, config);
             assert_eq!(decision.action, DecisionAction::Allow);
+            start.elapsed()
+        };
+        let mut calibration = std::time::Duration::MAX;
+        let mut few_small = std::time::Duration::MAX;
+        let mut many = std::time::Duration::MAX;
+        let mut few_many = std::time::Duration::MAX;
+        for _ in 0..20 {
+            calibration = calibration.min(measure(&clean, &small_root, &small));
+            few_small = few_small.min(measure(&few, &small_root, &small));
+            many = many.min(measure(&clean, &big_root, &big));
+            few_many = few_many.min(measure(&few, &big_root, &big));
         }
-        let (decision, _) = judge(&dirty, &repo_root, &config);
+        let (decision, _) = judge(&dirty, &big_root, &big);
+        assert_eq!(decision.action, DecisionAction::Deny);
 
         // The matchers are built once per command: that build, not a lookup per
-        // word, is what the patterns cost.
-        eprintln!("64 words, 10k patterns: {best:?}");
-        assert_eq!(decision.action, DecisionAction::Deny);
+        // word, is what the patterns cost. So what 61 more words cost must not
+        // depend on the number of patterns, and the build is a fixed price.
+        //
+        // None of the bounds is a clock time, because a clock time fails on a
+        // busy machine without a regression (the old bound was 100 ms; at a load
+        // of 5 the build alone is 115 ms in a debug build). Each is relative to
+        // measurements made here, in this test, under the same load. Measured at
+        // load 5: debug 10 patterns 5.2 ms, 10k patterns 120 ms; release 0.9 ms
+        // and 25 ms; the cost of 61 more words is the same at both counts.
+        eprintln!(
+            "10 patterns: 63 words {calibration:?}, 2 words {few_small:?}; \
+             10k patterns: 63 words {many:?}, 2 words {few_many:?}"
+        );
+
+        // 1. 61 more words cost about what they cost against 10 patterns. The
+        // patterns are 1,000 times as many: a lookup that scans them, or a
+        // matcher built for each word, would make this a ratio in the hundreds.
+        // The slack is a tenth of the build, the noise of timing it twice.
+        let per_word_small = calibration.saturating_sub(few_small);
+        let per_word_many = many.saturating_sub(few_many);
         assert!(
-            best < std::time::Duration::from_millis(100),
-            "judging 63 clean words against 10,000 patterns took {best:?}"
+            per_word_many <= per_word_small * 5 + few_many / 10,
+            "61 more words cost {per_word_many:?} against 10,000 patterns and {per_word_small:?} \
+             against 10 (63 words {many:?} and {calibration:?}, 2 words {few_many:?} and {few_small:?})"
+        );
+
+        // 2. The build is a fixed price for the command: 63 words against 10,000
+        // patterns cost at most a hundred times what they cost against 10. They
+        // cost 23 to 29 times as much, debug or release.
+        assert!(
+            many < calibration * 100,
+            "63 words against 10,000 patterns took {many:?}, more than 100 times the {calibration:?} \
+             they take against 10 patterns"
+        );
+
+        // 3. A backstop for a calibration that is itself wrong: two seconds is
+        // seventeen times what a debug build takes at a load of 5.
+        assert!(
+            many < std::time::Duration::from_secs(2),
+            "judging 63 clean words against 10,000 patterns took {many:?}"
         );
     }
 }
