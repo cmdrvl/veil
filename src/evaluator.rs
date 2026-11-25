@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::allowlist::{DirectoryScan, SafePathMatcher};
-use crate::config::{Config, PolicyMode};
+use crate::config::{Config, DynamicArgsMode, PolicyMode};
 use crate::extract::PathExposure;
 use crate::packs::PackRegistry;
 use crate::spine::SpineInvocation;
@@ -17,6 +17,8 @@ const RAW_FLAG_REMEDIATION: &str = "Raw-value flag blocked. Re-run the spine too
 const ARGV_PATH_REMEDIATION: &str = "Command names a protected path. Run `veil operator` to discover the authorized spine tools available in this repo, then choose the right metadata-safe path for this file. Do not copy, convert, archive or upload the protected file to get around this; if no listed tool fits, stop and ask the operator.";
 
 const DIRECTORY_SEARCH_REMEDIATION: &str = "Content search blocked: this directory holds, or may hold, protected data. Search a narrower directory that holds none, or ask for file names or counts only (Grep output_mode files_with_matches or count; `grep -l` or `grep -c`). Run `veil operator` to discover the authorized spine tools for protected data. Do not look for another way to read it; if no listed tool fits, stop and ask the operator.";
+
+const DYNAMIC_ARGS_REMEDIATION: &str = "Command blocked: an argument cannot be resolved to a path (a variable veil was not given, a `$( )` result, or names read from standard input), so veil cannot show that it stays clear of protected data. Rewrite with a literal path, one that needs no variable, substitution or pipe. If the file is protected, run `veil operator` to discover the authorized spine tools; do not build the path another way to get around this, and if no listed tool fits, stop and ask the operator.";
 
 /// How many directory entries a content search of one directory makes veil
 /// inspect before it stops vouching for the directory. The hook runs before
@@ -98,6 +100,11 @@ impl PolicyMatchers {
     /// Whether `path` is covered by `[sensitivity] protected`.
     pub fn is_protected(&self, path: &Path) -> bool {
         self.protected.is_safe(path)
+    }
+
+    /// Whether `directory` is itself inside a `[sensitivity] protected` root.
+    pub fn covers_directory(&self, directory: &Path) -> bool {
+        self.protected.covers_directory(directory)
     }
 }
 
@@ -436,6 +443,72 @@ fn directory_scope_with(
     ))
 }
 
+/// Why a command with an argument veil cannot resolve is judged (bd-2mi).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DynamicReason {
+    /// The command reads or ships the files it is given, or its program is
+    /// itself unresolved: it is judged wherever it runs.
+    Strict,
+    /// Any other command, run with the working directory inside a protected
+    /// root.
+    ProtectedDirectory,
+    /// Any other command, in a command string that sets a variable to a
+    /// protected path.
+    ProtectedValue,
+    /// The command could not be analysed at all.
+    Unanalysable,
+}
+
+/// The decision for a command with an argument veil cannot resolve to a path,
+/// under `[policy] dynamic_args`. `None` when the mode is `allow`. `what`
+/// describes the argument; `program` is the command it was given to.
+pub(crate) fn dynamic_args_decision(
+    config: &Config,
+    program: &str,
+    what: &str,
+    why: DynamicReason,
+) -> Option<Decision> {
+    let cause = match why {
+        DynamicReason::Strict => format!(
+            "`{program}` is given {what}, which veil cannot resolve to a path, so veil cannot \
+             show that it reads nothing protected (label: protected)"
+        ),
+        DynamicReason::ProtectedDirectory => format!(
+            "`{program}` is given {what}, which veil cannot resolve to a path, and it runs \
+             inside a protected directory, so veil cannot show that it stays clear of \
+             protected data (label: protected)"
+        ),
+        DynamicReason::ProtectedValue => format!(
+            "`{program}` is given {what}, which veil cannot resolve to a path, and this \
+             command sets a variable to a protected path, so veil cannot show that it stays \
+             clear of protected data (label: protected)"
+        ),
+        DynamicReason::Unanalysable => {
+            "veil cannot analyse this command (unbalanced quotes, or more commands or levels \
+             of nesting than it follows), so it cannot show that it reads nothing protected \
+             (label: protected)"
+                .to_owned()
+        }
+    };
+
+    match config.policy.dynamic_args {
+        DynamicArgsMode::Allow => None,
+        DynamicArgsMode::Warn => Some(Decision {
+            action: DecisionAction::Allow,
+            reason: Some(format!("[policy] dynamic_args = warn: {cause}")),
+            severity: None,
+            confidence: None,
+            remediation: Some(DYNAMIC_ARGS_REMEDIATION.to_owned()),
+        }),
+        DynamicArgsMode::Deny => Some(resolve_policy(
+            &config.policy.default,
+            None,
+            format!("{cause}; blocked by policy default"),
+            DYNAMIC_ARGS_REMEDIATION,
+        )),
+    }
+}
+
 fn is_authorized_spine_invocation(input: &EvaluationInput) -> bool {
     input.tool == ToolKind::Bash
         && input.spine_invocation.as_ref().is_some_and(|invocation| {
@@ -461,7 +534,7 @@ fn raw_flag_reason(tool: &str, flag: &str, target: &str) -> String {
     )
 }
 
-fn resolve_policy(
+pub(crate) fn resolve_policy(
     policy_mode: &PolicyMode,
     sensitivity: Option<&SensitivityResult>,
     reason: String,
@@ -529,7 +602,9 @@ mod tests {
     use super::*;
 
     use crate::allowlist::DEFAULT_SAFE_PATTERNS;
-    use crate::config::{AllowlistConfig, PolicyConfig, SensitivityConfig, SpineConfig};
+    use crate::config::{
+        AllowlistConfig, DynamicArgsMode, PolicyConfig, SensitivityConfig, SpineConfig,
+    };
     use crate::protected_corpus::CorpusLimits;
     use crate::spine::DeniedFlags;
 
@@ -553,6 +628,7 @@ mod tests {
                 audit_log: true,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
+                dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
         }
@@ -854,6 +930,7 @@ mod tests {
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
+                dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
         };
@@ -899,6 +976,7 @@ mod tests {
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
+                dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
         };
@@ -943,6 +1021,7 @@ mod tests {
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
+                dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
         };
@@ -974,6 +1053,7 @@ mod tests {
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
+                dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
         };
@@ -1049,6 +1129,7 @@ mod tests {
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
+                dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
         };
@@ -1119,6 +1200,7 @@ mod tests {
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
+                dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
         };

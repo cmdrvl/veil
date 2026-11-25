@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// A file name no real pattern is expected to name. Joined under a directory,
 /// it asks whether the directory itself is covered by a `dir/**` pattern.
-const DIRECTORY_PROBE: &str = ".veil-directory-probe";
+pub const DIRECTORY_PROBE: &str = ".veil-directory-probe";
 
 pub const DEFAULT_SAFE_PATTERNS: &[&str] = &[
     "*.md",
@@ -67,6 +67,12 @@ impl SafePathMatcher {
     {
         let normalized = NormalizedPath::from_path(path.as_ref());
         self.index.matches(&normalized, true)
+    }
+
+    /// Whether `directory` is itself covered, so that anything created in it
+    /// would be: the working directory is inside a `dir/**` root.
+    pub fn covers_directory(&self, directory: &Path) -> bool {
+        self.is_safe(directory.join(DIRECTORY_PROBE))
     }
 
     /// `is_safe` by trying every pattern in turn: the definition the index must
@@ -638,6 +644,24 @@ mod tests {
         let scan = matcher(&["data/**"]).scan_directory(&root.join("data"), 1_000);
 
         assert_eq!(scan, DirectoryScan::Protected(root.join("data")));
+    }
+
+    #[test]
+    fn a_directory_is_covered_when_a_file_created_in_it_would_be() {
+        let root = unique_dir("covers");
+        put(&root, "data/clients/a.csv");
+        put(&root, "src/main.rs");
+        let matcher = matcher(&["data/**"]);
+
+        // inside the protected root, at any depth, but not the root's parent
+        assert!(matcher.covers_directory(&root.join("data")));
+        assert!(matcher.covers_directory(&root.join("data/clients")));
+        assert!(!matcher.covers_directory(&root));
+        assert!(!matcher.covers_directory(&root.join("src")));
+        // a name that only starts like the root is not the root
+        assert!(!matcher.covers_directory(&root.join("database")));
+        // nothing is covered by no patterns
+        assert!(!self::matcher(&[]).covers_directory(&root.join("data")));
     }
 
     #[test]

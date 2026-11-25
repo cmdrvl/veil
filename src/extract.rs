@@ -9,9 +9,13 @@ use serde_json::Value;
 use crate::types::ToolKind;
 
 mod decompose;
+mod expand;
 mod wrappers;
 
-pub use decompose::{MAX_DEPTH, MAX_SEGMENTS, Origin, SimpleCommand, decompose};
+pub use decompose::{
+    MAX_DEPTH, MAX_SEGMENTS, Origin, STDIN_ARGUMENTS, SUBSTITUTION, ShellEnv, SimpleCommand,
+    decompose, decompose_in,
+};
 
 const PYTHON_DIRECT_READ_CALLS: &[&str] = &[
     "open",
@@ -103,6 +107,22 @@ pub struct CommandExtraction {
     /// Whether a directory among `argv_paths` stands for everything beneath it.
     /// True for the commands that copy, archive or upload whole trees.
     pub argv_scans_directories: bool,
+    /// Words that depend on something veil cannot resolve to a path: a
+    /// variable it was not told the value of, a `$( )` result, or what `xargs`
+    /// reads from standard input ([`STDIN_ARGUMENTS`]). As written (bd-2mi).
+    pub unresolved: Vec<String>,
+    /// The command could not be analysed at all: unbalanced quotes, or more
+    /// segments or nesting than veil follows (bd-2mi).
+    pub opaque: bool,
+    /// The command is one that reads or ships the files it is given, or its
+    /// program is itself unresolved: an unresolved argument is blocked even
+    /// when nothing protected is in play. Any other command is blocked only
+    /// where a protected path is (bd-2mi).
+    pub dynamic_strict: bool,
+    /// What the command string assigns to variables (`d=data/clients`), as
+    /// paths. A protected one puts every command of the string in a protected
+    /// context (bd-2mi).
+    pub assigned_paths: Vec<PathBuf>,
 }
 
 /// A path a command names in its words. `resolved` says veil followed symlinks
@@ -130,7 +150,17 @@ impl CommandExtraction {
             argv_paths: Vec::new(),
             argv_exposure: PathExposure::None,
             argv_scans_directories: false,
+            unresolved: Vec::new(),
+            opaque: false,
+            dynamic_strict: false,
+            assigned_paths: Vec::new(),
         }
+    }
+
+    /// Some argument depends on something veil could not resolve, or the whole
+    /// command could not be analysed.
+    pub fn has_dynamic_args(&self) -> bool {
+        !self.unresolved.is_empty() || self.opaque
     }
 }
 
@@ -138,15 +168,23 @@ impl CommandExtraction {
 /// each with the paths it reads. A command that reads nothing is still listed:
 /// its words may name an authorized spine tool.
 pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction> {
-    decompose(command)
+    let env = ShellEnv {
+        cwd: Some(cwd.to_path_buf()),
+        home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
+    };
+
+    decompose_in(command, &env)
         .iter()
         .map(|simple| command_extraction(simple, cwd))
         .collect()
 }
 
 fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction {
+    let assigned_paths = assigned_paths(&command.assigned, cwd);
+
     let Some((program, args)) = command.argv.split_first() else {
-        // Text that could not be analysed: nothing to check yet (bd-2mi).
+        // Text that could not be analysed: there is nothing to read paths
+        // from, and the dynamic-argument stance decides what to do with it.
         return CommandExtraction {
             origin: command.origin,
             argv: Vec::new(),
@@ -155,6 +193,10 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             argv_paths: Vec::new(),
             argv_exposure: PathExposure::None,
             argv_scans_directories: false,
+            unresolved: Vec::new(),
+            opaque: true,
+            dynamic_strict: true,
+            assigned_paths,
         };
     };
 
@@ -175,6 +217,15 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
     if let Some(body) = &command.heredoc_body {
         paths.extend(heredoc_script_paths(program, body));
     }
+
+    // A reader veil parses names its files exactly, so an unresolved word that
+    // is a pattern or an option's value (`grep "$p" file`, `head -n $n file`)
+    // is no file at all.
+    let unresolved = if is_known_reader(program) {
+        unresolved_files(&command.unresolved, &paths)
+    } else {
+        command.unresolved.clone()
+    };
 
     let candidates = normalize_candidates(paths, cwd);
     let exposure = if candidates.is_empty() {
@@ -208,7 +259,105 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         argv_paths,
         argv_exposure,
         argv_scans_directories,
+        unresolved,
+        opaque: false,
+        dynamic_strict: is_dynamic_strict(program),
+        assigned_paths,
     }
+}
+
+/// What is unresolved among the files a reader will open: the words `paths`
+/// that still carry a variable, a `$( )` result or a brace list too long to
+/// expand, and what `xargs` appends from standard input.
+fn unresolved_files(unresolved: &[String], paths: &[String]) -> Vec<String> {
+    let mut files: Vec<String> = unresolved
+        .iter()
+        .filter(|word| word.as_str() == STDIN_ARGUMENTS)
+        .cloned()
+        .collect();
+
+    files.extend(
+        paths
+            .iter()
+            .filter(|path| {
+                path.contains(['$', SUBSTITUTION])
+                    || (path.contains('{') && (path.contains(',') || path.contains("..")))
+            })
+            .cloned(),
+    );
+    files
+}
+
+/// Commands that print or ship the contents of the files they are given, besides
+/// the readers and bulk transfers veil already knows. With an argument veil
+/// cannot resolve, any of them may be reading a protected file.
+const CONTENT_FILTER_COMMANDS: &[&str] = &[
+    "awk",
+    "gawk",
+    "mawk",
+    "sed",
+    "jq",
+    "yq",
+    "cut",
+    "sort",
+    "uniq",
+    "tr",
+    "paste",
+    "join",
+    "comm",
+    "column",
+    "nl",
+    "fold",
+    "fmt",
+    "rev",
+    "tac",
+    "xxd",
+    "od",
+    "hexdump",
+    "strings",
+    "base64",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "cksum",
+    "diff",
+    "cmp",
+    "split",
+    "iconv",
+    "dd",
+    "sqlite3",
+    "duckdb",
+    "zcat",
+    "gzcat",
+    "bzcat",
+    "xzcat",
+    "zgrep",
+];
+
+/// Whether an argument veil cannot resolve is blocked for this program even
+/// where nothing protected is in play (bd-2mi): a reader, a filter or a bulk
+/// transfer, or a program that is itself a variable or a `$( )` result.
+fn is_dynamic_strict(program: &str) -> bool {
+    let name = command_name(program);
+
+    program.contains(['$', SUBSTITUTION])
+        || is_known_reader(program)
+        || CONTENT_FILTER_COMMANDS.contains(&name)
+        || BULK_TRANSFER_COMMANDS.contains(&name)
+}
+
+/// The values a command string assigns to variables, as the paths they would
+/// name from `cwd`. A value of several words stands for each of them.
+fn assigned_paths(values: &[String], cwd: &Path) -> Vec<PathBuf> {
+    normalize_candidates(
+        values
+            .iter()
+            .flat_map(|value| value.split_whitespace())
+            .map(str::to_owned)
+            .collect(),
+        cwd,
+    )
 }
 
 /// Commands whose own parser tells veil exactly which words are paths, so the
@@ -2594,7 +2743,7 @@ mod tests {
         assert_eq!(reads("ls data | xargs cat"), vec![]);
 
         let decomposed = decompose("ls data | xargs cat");
-        assert!(decomposed[1].has_dynamic_args);
+        assert!(decomposed[1].has_dynamic_args());
         assert_eq!(decomposed[1].argv, vec!["cat".to_owned()]);
     }
 

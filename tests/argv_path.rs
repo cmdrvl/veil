@@ -3,10 +3,11 @@
 //! command is an authorized spine tool. These tests drive the real `veil` binary
 //! with Claude Code `PreToolUse` payloads against real files and directories.
 //!
-//! What they do not cover: a path built by the shell (`cat $f`), a command that
-//! reads a path it was never given (`xargs`, a script that opens files), and a
-//! bare word (no slash, no known extension) past the 64th word of a command.
-//! Those are separate gaps; see the bd-29r comment.
+//! What they do not cover: a path built by the shell (`cat $f`) or read from
+//! standard input by `xargs`, which the dynamic-argument stance judges
+//! (bd-2mi, tests/dynamic_args.rs); a script that opens files it was never
+//! given (bd-1bk); and a bare word (no slash, no known extension) past the
+//! 64th word of a command. See the bd-29r comment.
 
 use std::fs;
 use std::io::Write;

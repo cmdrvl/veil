@@ -12,15 +12,22 @@ pub mod render;
 pub mod spine;
 pub mod types;
 
+use std::cell::OnceCell;
 use std::error::Error;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use allowlist::DIRECTORY_PROBE;
 use audit::{AuditRecord, append_audit_record};
 use config::load_config;
-use evaluator::{EvaluationInput, PolicyMatchers, evaluate_access_with};
-use extract::{CommandExtraction, Origin, extract_bash_commands, extract_read_or_grep_paths};
+use evaluator::{
+    DynamicReason, EvaluationInput, PolicyMatchers, dynamic_args_decision, evaluate_access_with,
+};
+use extract::{
+    CommandExtraction, Origin, STDIN_ARGUMENTS, SUBSTITUTION, extract_bash_commands,
+    extract_read_or_grep_paths,
+};
 use hook::parse_hook_input;
 use packs::PackRegistry;
 use render::{RenderedDecision, render_decision};
@@ -38,12 +45,14 @@ struct CandidateOutcome {
     reason_class: ReasonClass,
 }
 
-/// How a path came to be judged (bd-29r): read by something veil recognises as
-/// a reader, or merely named in the words of some other command.
+/// How a path came to be judged (bd-29r, bd-2mi): read by something veil
+/// recognises as a reader, named in the words of some other command, or not a
+/// path veil could work out at all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReasonClass {
     DirectRead,
     ArgvPath,
+    DynamicPath,
 }
 
 impl ReasonClass {
@@ -51,6 +60,7 @@ impl ReasonClass {
         match self {
             Self::DirectRead => "direct_read",
             Self::ArgvPath => "argv_path",
+            Self::DynamicPath => "dynamic_path_unresolvable",
         }
     }
 }
@@ -162,9 +172,11 @@ fn evaluate_commands(
     // Built once: a command can name dozens of paths, and building the
     // matchers is linear in the number of configured patterns.
     let matchers = PolicyMatchers::new(config);
+    let context = ProtectedContext::new(&hook_input.cwd, registry, &matchers);
     let mut outcomes = Vec::new();
 
     for command in commands {
+        let first_outcome = outcomes.len();
         let spine_invocation = detect_spine(hook_input, config, command);
         let mut candidates = command.candidates.clone();
 
@@ -230,9 +242,138 @@ fn evaluate_commands(
                 reason_class: ReasonClass::ArgvPath,
             });
         }
+
+        // A path that was already denied needs no second reason. An authorized
+        // spine tool takes a protected path and prints metadata, so an
+        // argument it is given needs no resolving either.
+        let already_denied = outcomes[first_outcome..]
+            .iter()
+            .any(|outcome| outcome.decision.action == DecisionAction::Deny);
+        if command.has_dynamic_args()
+            && !already_denied
+            && spine_invocation.is_none()
+            && let Some(outcome) = dynamic_outcome(config, command, &context)
+        {
+            outcomes.push(outcome);
+        }
     }
 
     outcomes
+}
+
+/// Whether the commands of one Bash call run where a protected path is in play
+/// (bd-2mi): in a protected directory, or in a string that sets a variable to a
+/// protected path. Asked only for a command that carries an argument veil
+/// cannot resolve and is not one that reads or ships files anyway.
+struct ProtectedContext<'a> {
+    cwd: &'a Path,
+    registry: &'a PackRegistry,
+    matchers: &'a PolicyMatchers,
+    directory: OnceCell<bool>,
+}
+
+impl<'a> ProtectedContext<'a> {
+    fn new(cwd: &'a Path, registry: &'a PackRegistry, matchers: &'a PolicyMatchers) -> Self {
+        Self {
+            cwd,
+            registry,
+            matchers,
+            directory: OnceCell::new(),
+        }
+    }
+
+    /// The working directory is inside a `[sensitivity] protected` root or one
+    /// a sensitivity pack recognises (`~/.ssh`, a credentials directory...).
+    fn in_protected_directory(&self) -> bool {
+        *self.directory.get_or_init(|| {
+            let covered = self.matchers.covers_directory(self.cwd);
+            covered
+                || self
+                    .registry
+                    .classify(self.cwd.join(DIRECTORY_PROBE), false)
+                    .is_some()
+        })
+    }
+
+    /// Some value the command string assigns to a variable is a protected
+    /// path, or sits in a protected directory.
+    fn assigns_protected_path(&self, assigned: &[PathBuf]) -> bool {
+        assigned.iter().any(|path| {
+            let covered = self.matchers.is_protected(path);
+            covered
+                || self.registry.classify(path, false).is_some()
+                || self.matchers.covers_directory(path)
+                || self
+                    .registry
+                    .classify(path.join(DIRECTORY_PROBE), false)
+                    .is_some()
+        })
+    }
+}
+
+/// The outcome for a command with an argument veil cannot resolve to a path:
+/// `None` when the stance has nothing to say about it. A reader, a filter, a
+/// bulk transfer or an unresolved program is judged wherever it runs; any
+/// other command only where a protected path is in play.
+fn dynamic_outcome(
+    config: &config::Config,
+    command: &CommandExtraction,
+    context: &ProtectedContext<'_>,
+) -> Option<CandidateOutcome> {
+    let why = if command.opaque {
+        DynamicReason::Unanalysable
+    } else if command.dynamic_strict {
+        DynamicReason::Strict
+    } else if context.in_protected_directory() {
+        DynamicReason::ProtectedDirectory
+    } else if context.assigns_protected_path(&command.assigned_paths) {
+        DynamicReason::ProtectedValue
+    } else {
+        return None;
+    };
+
+    let program = command
+        .argv
+        .first()
+        .map(|word| readable(command_basename(word)))
+        .unwrap_or_default();
+    let (label, what) = match command.unresolved.first() {
+        _ if command.opaque => (UNANALYSABLE_LABEL.to_owned(), String::new()),
+        Some(word) if word == STDIN_ARGUMENTS => (
+            "<arguments read from standard input>".to_owned(),
+            "the names it reads from standard input".to_owned(),
+        ),
+        Some(word) => {
+            let label = readable(word);
+            let what = format!("`{label}`");
+            (label, what)
+        }
+        // The program itself is the unresolved word.
+        None => (program.clone(), format!("`{program}` as its program")),
+    };
+
+    Some(CandidateOutcome {
+        path: PathBuf::from(label),
+        decision: dynamic_args_decision(config, &program, &what, why)?,
+        sensitivity: None,
+        origin: command.origin,
+        reason_class: ReasonClass::DynamicPath,
+    })
+}
+
+const UNANALYSABLE_LABEL: &str = "<command veil cannot analyse>";
+
+/// How many characters of an unresolved word a reason or an audit record shows.
+const READABLE_WORD_LIMIT: usize = 80;
+
+/// A word as the person wrote it: the markers veil leaves for a `$( )` result
+/// spelled out, and cut short if it is long.
+fn readable(word: &str) -> String {
+    let text = word.replace(SUBSTITUTION, "$(...)");
+    match text.char_indices().nth(READABLE_WORD_LIMIT) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text,
+    }
 }
 
 fn sensitivity_pack(

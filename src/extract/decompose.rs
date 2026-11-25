@@ -8,20 +8,24 @@
 //! unwraps `sh -c` and the wrapper programs in [`super::wrappers`], and hands
 //! back one [`SimpleCommand`] per command that would run.
 //!
-//! It reads the text only. It does not expand variables, globs, aliases or
-//! functions: a word that depends on one is flagged in
-//! [`SimpleCommand::has_dynamic_args`] and left as written, and what to do about
-//! that is the dynamic-argument stance (bd-2mi), not decided here.
+//! It reads the text only. It follows the variables the command string sets
+//! itself, `$HOME`, `$PWD`, `~` and brace lists (see [`super::expand`]), and
+//! nothing else: not globs (a glob is judged by the directory it starts in),
+//! aliases or functions. A word that still depends on something it could not
+//! resolve is listed in [`SimpleCommand::unresolved`] as it was written, and
+//! what to do about that is the dynamic-argument stance (bd-2mi, in `lib.rs`).
 //!
 //! Text it cannot analyse (unbalanced quotes, more than [`MAX_DEPTH`] levels of
 //! nesting, more than [`MAX_SEGMENTS`] segments) comes back as an *opaque*
-//! command: empty `argv`, `has_dynamic_args` true. Nothing downstream denies an
-//! opaque command yet, so today that fails open, as an unparseable command
-//! always has. The caps mean padding a command with 64 `true;` cannot hide a
-//! reader after them from the first 64 segments, but it does hide one past them.
+//! command: empty `argv`. The caps mean padding a command with 64 `true;`
+//! cannot hide a reader after them from the first 64 segments, but it does hide
+//! one past them, which is why the stance treats an opaque command as unknown.
 
+use super::expand::{self, Vars, Word};
 use super::wrappers;
 use super::{collect_input_redirect_paths, is_env_assignment};
+
+pub use super::expand::ShellEnv;
 
 /// Levels of nesting (substitutions, `-c` strings, wrappers) followed before the
 /// rest is reported as opaque.
@@ -29,10 +33,18 @@ pub const MAX_DEPTH: usize = 8;
 /// Segments analysed in one command string, counted across every level.
 pub const MAX_SEGMENTS: usize = 64;
 
+/// What an `xargs` command has in [`SimpleCommand::unresolved`]: the arguments
+/// it reads from standard input, which no text shows.
+pub const STDIN_ARGUMENTS: &str = "<arguments read from standard input>";
+
 /// Stands in for a `$( )`, backtick or `<( )` body in a segment's text, so the
 /// words around it split as the shell would split them. It is a control
 /// character, which path normalization already discards.
-const SUBSTITUTION: char = '\u{1}';
+pub const SUBSTITUTION: char = '\u{1}';
+
+/// Stands in for a `<( )` or `>( )` body. Unlike [`SUBSTITUTION`] it is not
+/// listed in [`SimpleCommand::unresolved`]: the word is a pipe, not a path.
+pub(super) const PROCESS_SUBSTITUTION: char = '\u{2}';
 
 /// Words that start a compound-command line but are not the command.
 const LEADING_KEYWORDS: &[&str] = &[
@@ -70,11 +82,17 @@ pub struct SimpleCommand {
     pub argv: Vec<String>,
     /// Files this command reads through `<`.
     pub redirects_in: Vec<String>,
-    /// Some word depends on something this module does not expand (a variable,
-    /// a substitution, a glob, `{}` from `find -exec`, or arguments `xargs`
-    /// reads from standard input). The consumer is the dynamic-argument stance
-    /// (bd-2mi); nothing in veil branches on it yet.
-    pub has_dynamic_args: bool,
+    /// Words that depend on something this module could not resolve: a variable
+    /// it was not told the value of, a substitution, a brace list too long to
+    /// expand, or ([`STDIN_ARGUMENTS`]) what `xargs` reads from standard input.
+    /// Each is as it was written. Globs are not listed: a glob can only match
+    /// beneath the directory it starts in, which the path rules already judge.
+    /// The consumer is the dynamic-argument stance (bd-2mi).
+    pub unresolved: Vec<String>,
+    /// Every value the command string assigns to a variable (`d=data/clients`),
+    /// wherever in the string it is assigned. A protected directory named there
+    /// puts the whole string in a protected context.
+    pub assigned: Vec<String>,
     pub origin: Origin,
     /// Standard input comes from an earlier command in a pipeline.
     pub stdin_piped: bool,
@@ -88,7 +106,8 @@ impl SimpleCommand {
         Self {
             argv: Vec::new(),
             redirects_in: Vec::new(),
-            has_dynamic_args: true,
+            unresolved: Vec::new(),
+            assigned: Vec::new(),
             origin: Origin::Top,
             stdin_piped: false,
             heredoc_body: None,
@@ -98,14 +117,24 @@ impl SimpleCommand {
     pub fn is_opaque(&self) -> bool {
         self.argv.is_empty()
     }
+
+    /// Some word depends on something this module could not resolve, or the
+    /// whole command could not be analysed.
+    pub fn has_dynamic_args(&self) -> bool {
+        !self.unresolved.is_empty() || self.is_opaque()
+    }
 }
 
-/// Shared across one `decompose` call: the segment budget and why it stopped.
+/// Shared across one `decompose` call: the segment budget, why it stopped, and
+/// what the command string has assigned so far.
 #[derive(Default)]
 pub(super) struct Run {
     segments: usize,
     pub(super) truncated: bool,
     pub(super) failed: bool,
+    env: ShellEnv,
+    vars: Vars,
+    assigned: Vec<String>,
 }
 
 impl Run {
@@ -121,9 +150,20 @@ impl Run {
 
 /// The simple commands in `command`, in the order they would run: a
 /// substitution before the command that holds it, a wrapper's inner command in
-/// place of the wrapper.
+/// place of the wrapper. Variables are followed from the text alone; see
+/// [`decompose_in`] to resolve `$HOME` and `$PWD` too.
 pub fn decompose(command: &str) -> Vec<SimpleCommand> {
-    let mut run = Run::default();
+    decompose_in(command, &ShellEnv::default())
+}
+
+/// [`decompose`] for a command that runs where `env` says: `$PWD` is its
+/// working directory, `$HOME` and `~` its home.
+pub fn decompose_in(command: &str, env: &ShellEnv) -> Vec<SimpleCommand> {
+    let mut run = Run {
+        env: env.clone(),
+        vars: Vars::for_command(command),
+        ..Run::default()
+    };
     let mut commands = Vec::new();
 
     script(command, Origin::Top, 0, &mut run, &mut commands);
@@ -133,6 +173,9 @@ pub fn decompose(command: &str) -> Vec<SimpleCommand> {
     }
     if run.truncated {
         commands.push(SimpleCommand::opaque());
+    }
+    for simple in &mut commands {
+        simple.assigned = run.assigned.clone();
     }
     commands
 }
@@ -162,32 +205,111 @@ pub(super) fn script(
         for body in &segment.substitutions {
             script(body, Origin::Subshell, depth + 1, run, out);
         }
-        let Some(words) = shlex::split(&segment.text) else {
-            run.failed = true;
-            return;
+        let words = match expand::plain_words(&segment.text) {
+            Some(words) => words,
+            None => {
+                let Some(raw) = expand::raw_words(&segment.text) else {
+                    run.failed = true;
+                    return;
+                };
+
+                // `f=data/x.csv` or `export f=data/x.csv` runs nothing; it tells
+                // the words that follow what `$f` is.
+                if let Some(pairs) = expand::assignment_words(&raw) {
+                    for (name, written) in pairs {
+                        let value = run.vars.value(&written, &run.env);
+                        if let Some(value) = &value {
+                            run.assigned.push(value.clone());
+                        }
+                        run.vars.assign(&name, value);
+                    }
+                    continue;
+                }
+
+                let Some(words) = run.vars.words(&raw, &run.env) else {
+                    run.failed = true;
+                    return;
+                };
+                words
+            }
         };
-        if let Some(command) = simple_command(words, &segment, origin) {
-            wrappers::expand(command, depth, run, out);
+
+        // `for f in a b c; do cat $f; done`: until `done`, `$f` is each of the
+        // words in turn, and every one of them is judged.
+        if let Some((name, values)) = for_header(&words) {
+            run.vars.assign_loop(name, values);
+            continue;
         }
+
+        // `f=data/x.csv sh -c 'cat $f'`: the assignment is the environment of
+        // what runs, so the script it runs sees it; the words of the command
+        // itself were expanded without it.
+        let prefix = prefix_assignments(&words);
+        let Some(command) = simple_command(words, &segment, origin) else {
+            continue;
+        };
+        run.assigned
+            .extend(prefix.iter().map(|(_, value)| value.clone()));
+        let saved = run.vars.scoped(&prefix);
+        wrappers::expand(command, depth, run, out);
+        run.vars.restore(saved);
     }
 }
 
-fn simple_command(
-    mut words: Vec<String>,
-    segment: &Segment,
-    origin: Origin,
-) -> Option<SimpleCommand> {
+/// The loop variable and words of a `for name in words` header, the words as
+/// `None` when any of them could not be resolved. `None` for any other command.
+fn for_header(words: &[Word]) -> Option<(&str, Option<Vec<String>>)> {
     let start = words
         .iter()
-        .position(|word| !(is_env_assignment(word) || LEADING_KEYWORDS.contains(&word.as_str())))?;
-    if HEADER_KEYWORDS.contains(&words[start].as_str()) {
+        .position(|word| !LEADING_KEYWORDS.contains(&word.text.as_str()))?;
+    let header = &words[start..];
+
+    if header.first()?.text != "for" || header.get(2)?.text != "in" {
+        return None;
+    }
+    let name = header[1].text.as_str();
+    if !expand::is_name(name) {
         return None;
     }
 
+    let list = &header[3..];
+    let values = list
+        .iter()
+        .all(|word| word.unresolved.is_none())
+        .then(|| list.iter().map(|word| word.text.clone()).collect());
+    Some((name, values))
+}
+
+fn prefix_assignments(words: &[Word]) -> Vec<(String, String)> {
+    words
+        .iter()
+        .take_while(|word| is_env_assignment(&word.text))
+        .filter_map(|word| word.text.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn simple_command(
+    mut words: Vec<Word>,
+    segment: &Segment,
+    origin: Origin,
+) -> Option<SimpleCommand> {
+    let start = words.iter().position(|word| {
+        !(is_env_assignment(&word.text) || LEADING_KEYWORDS.contains(&word.text.as_str()))
+    })?;
+    if HEADER_KEYWORDS.contains(&words[start].text.as_str()) {
+        return None;
+    }
+
+    let words = words.split_off(start);
     Some(SimpleCommand {
-        argv: words.split_off(start),
+        unresolved: words
+            .iter()
+            .filter_map(|word| word.unresolved.clone())
+            .collect(),
+        argv: words.into_iter().map(|word| word.text).collect(),
         redirects_in: Vec::new(),
-        has_dynamic_args: segment.dynamic,
+        assigned: Vec::new(),
         origin,
         stdin_piped: segment.stdin_piped,
         heredoc_body: segment.heredoc.clone(),
@@ -207,10 +329,9 @@ pub(super) fn emit(mut command: SimpleCommand, out: &mut Vec<SimpleCommand>) {
 /// The text between two separators, with what the scanner learned about it.
 #[derive(Default)]
 struct Segment {
-    /// Shell text for `shlex`: quotes kept, substitutions replaced by
+    /// Shell text for the word splitter: quotes kept, substitutions replaced by
     /// [`SUBSTITUTION`], here-document operators removed.
     text: String,
-    dynamic: bool,
     stdin_piped: bool,
     heredoc: Option<String>,
     /// Bodies of `$( )`, backticks and `<( )` found in `text`, and in an
@@ -275,28 +396,31 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                 i = end + 1;
                 word_start = false;
             }
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                // `$'...'` ends at the first quote a backslash does not escape.
+                let end = expand::ansi_c_end(text, i + 1)?;
+                current.text.push_str(&text[i..=end]);
+                i = end + 1;
+                word_start = false;
+            }
             b'$' => {
-                match bytes.get(i + 1) {
-                    Some(b'(') => {
-                        let end = matching_paren(text, i + 2)?;
-                        substitute(&mut current, text[i + 2..end].to_owned());
-                        i = end + 1;
-                    }
-                    Some(&next) if starts_expansion(next) => {
-                        current.dynamic = true;
-                        current.text.push('$');
-                        i += 1;
-                    }
-                    _ => {
-                        current.text.push('$');
-                        i += 1;
-                    }
+                if bytes.get(i + 1) == Some(&b'(') {
+                    let end = matching_paren(text, i + 2)?;
+                    substitute(&mut current, text[i + 2..end].to_owned());
+                    i = end + 1;
+                } else {
+                    // `$name` is expanded later, with the variables known by then.
+                    current.text.push('$');
+                    i += 1;
                 }
                 word_start = false;
             }
             b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => {
+                // The command is judged like any other; what the word stands
+                // for is a pipe, never a file whose name could be protected.
                 let end = matching_paren(text, i + 2)?;
-                substitute(&mut current, text[i + 2..end].to_owned());
+                current.substitutions.push(text[i + 2..end].to_owned());
+                current.text.push(PROCESS_SUBSTITUTION);
                 i = end + 1;
                 word_start = false;
             }
@@ -372,18 +496,6 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                 i += 1;
                 word_start = true;
             }
-            b'*' | b'?' | b'[' | b'{' => {
-                current.dynamic = true;
-                current.text.push(bytes[i] as char);
-                i += 1;
-                word_start = false;
-            }
-            b'~' if word_start => {
-                current.dynamic = true;
-                current.text.push('~');
-                i += 1;
-                word_start = false;
-            }
             _ => {
                 let ch = text[i..].chars().next()?;
                 current.text.push(ch);
@@ -423,11 +535,6 @@ fn copy_plain_run(text: &str, from: usize, into: &mut String) -> usize {
                     | b'\n'
                     | b' '
                     | b'\t'
-                    | b'*'
-                    | b'?'
-                    | b'['
-                    | b'{'
-                    | b'~'
                     | b'#'
             )
         })
@@ -451,17 +558,6 @@ fn end_segment(
 fn substitute(current: &mut Segment, body: String) {
     current.substitutions.push(body);
     current.text.push(SUBSTITUTION);
-    current.dynamic = true;
-}
-
-/// The byte after `$` that makes it an expansion: `$name`, `${...}`, `$1`,
-/// `$@`, `$?` and the like.
-fn starts_expansion(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'_' | b'{' | b'@' | b'*' | b'#' | b'?' | b'$' | b'!' | b'-'
-        )
 }
 
 /// Scans a double-quoted string starting at the opening quote, copying it to
@@ -495,9 +591,6 @@ fn scan_double_quoted(text: &str, start: usize, current: &mut Segment) -> Option
                 i = end + 1;
             }
             b'$' => {
-                if bytes.get(i + 1).is_some_and(|&next| starts_expansion(next)) {
-                    current.dynamic = true;
-                }
                 current.text.push('$');
                 i += 1;
             }
@@ -843,7 +936,9 @@ mod tests {
         assert_commands("while read l; do cat $l; done", &["read l", "cat $l"]);
         assert_commands("{ cat x; }", &["cat x"]);
         assert_commands("! cat x", &["cat x"]);
-        assert_commands("for f in a b; do cat $f; done", &["cat $f"]);
+        // the keywords are not commands; the loop variable is each word in turn
+        assert_commands("for f in a b; do cat $f; done", &["cat a b"]);
+        assert_commands("for f; do cat $f; done", &["cat $f"]);
         assert_commands("case $x in a) cat y;; esac", &["cat y"]);
         assert_commands("FOO=1", &[]);
     }
@@ -857,8 +952,142 @@ mod tests {
         assert_eq!(commands[0].origin, Origin::Subshell);
         assert_eq!(commands[1].argv[0], "echo");
         assert_eq!(commands[1].origin, Origin::Top);
-        assert!(commands[1].has_dynamic_args);
-        assert!(!commands[0].has_dynamic_args);
+        assert_eq!(commands[1].unresolved, vec![SUBSTITUTION.to_string()]);
+        assert!(commands[1].has_dynamic_args());
+        assert!(!commands[0].has_dynamic_args());
+    }
+
+    fn commands_named(command: &str, program: &str) -> Vec<SimpleCommand> {
+        decompose(command)
+            .into_iter()
+            .filter(|simple| simple.argv.first().is_some_and(|word| word == program))
+            .collect()
+    }
+
+    #[test]
+    fn a_loop_over_known_words_judges_every_word() {
+        // `cat $f` over two words reads both: the command carries both paths.
+        for command in [
+            "for f in a.csv b.csv; do cat $f; done",
+            "for f in a.csv b.csv\ndo\n  cat \"$f\"\ndone",
+            "for f in a.csv b.csv; do cat ${f}; done",
+            "for f in a.csv b.csv; do (cat $f); done",
+            "for f in {a,b}.csv; do cat $f; done",
+        ] {
+            let cats = commands_named(command, "cat");
+            assert_eq!(cats.len(), 1, "{command}");
+            assert_eq!(cats[0].argv, words("cat a.csv b.csv"), "{command}");
+            assert!(cats[0].unresolved.is_empty(), "{command}");
+        }
+
+        let copies = commands_named("for f in a b; do cp $f $f.bak; done", "cp");
+        assert_eq!(copies[0].argv, words("cp a b a.bak b.bak"));
+
+        // two loops multiply: every pair is reached
+        let cats = commands_named(
+            "for a in x y; do for b in 1 2; do cat $a$b; done; done",
+            "cat",
+        );
+        assert_eq!(cats[0].argv, words("cat x1 x2 y1 y2"));
+        assert!(cats[0].unresolved.is_empty());
+
+        // a glob in the list is left for the path rules, as it is everywhere
+        let cats = commands_named("for f in data/*.csv; do cat $f; done", "cat");
+        assert_eq!(cats[0].argv, words("cat data/*.csv"));
+        assert!(cats[0].unresolved.is_empty());
+
+        // an empty list runs nothing: the word is gone
+        let cats = commands_named("for f in; do cat $f; done", "cat");
+        assert_eq!(cats[0].argv, words("cat"));
+    }
+
+    #[test]
+    fn a_loop_variable_veil_cannot_pin_down_stays_unresolved() {
+        for command in [
+            // the list is a command's output, or has an unset variable
+            "for f in $(ls); do cat $f; done",
+            "for f in `ls`; do cat $f; done",
+            "for f in $LIST; do cat $f; done",
+            "for f in a $LIST; do cat $f; done",
+            // no list: the positional parameters
+            "for f; do cat $f; done",
+            // assigned elsewhere too
+            "for f in a b; do f=c; cat $f; done",
+            "f=x; for f in a b; do cat $f; done",
+            "for f in a b; do for f in c d; do cat $f; done; done",
+            // changed by something that reads it
+            "for f in a b; do read f; cat $f; done",
+            // more values than veil follows
+            "for a in {1..10}; do for b in {1..10}; do cat $a$b; done; done",
+            // an unquoted value with a blank is several words
+            "for f in 'a b'; do cat $f; done",
+            // not a plain name
+            "for f.x in a b; do cat $f.x; done",
+        ] {
+            let cats = commands_named(command, "cat");
+            assert!(!cats.is_empty(), "{command}");
+            assert!(
+                cats.iter().all(|cat| !cat.unresolved.is_empty()),
+                "{command}: {cats:?}"
+            );
+        }
+
+        // quoted, the value with a blank is one word and is known
+        let cats = commands_named("for f in 'a b'; do cat \"$f\"; done", "cat");
+        assert_eq!(cats[0].argv, vec!["cat".to_owned(), "a b".to_owned()]);
+        assert!(cats[0].unresolved.is_empty());
+
+        // a name assigned from a loop variable is not guessed at
+        let cats = commands_named("for f in a b; do g=$f; cat $g; done", "cat");
+        assert!(!cats[0].unresolved.is_empty(), "{cats:?}");
+    }
+
+    #[test]
+    fn an_ansi_c_string_ends_at_the_quote_a_backslash_does_not_escape() {
+        // The quote after the backslash is part of the string, so the `;`
+        // after it separates two commands and the second one runs.
+        assert_commands(
+            "echo $'\\''; cat data/clients/x.csv; echo $'x'",
+            &["echo '", "cat data/clients/x.csv", "echo x"],
+        );
+        // and a separator inside the string separates nothing
+        assert_eq!(argvs("echo $'a;b|c' d").len(), 1);
+        assert_eq!(
+            argvs("echo $'a;b|c' d")[0],
+            vec!["echo".to_owned(), "a;b|c".to_owned(), "d".to_owned()]
+        );
+        // unterminated: nothing can be said about the text
+        assert_eq!(decompose("echo $'oops"), vec![SimpleCommand::opaque()]);
+        assert_eq!(decompose("echo $'oops\\'"), vec![SimpleCommand::opaque()]);
+    }
+
+    #[test]
+    fn a_process_substitution_word_is_a_pipe_and_not_an_unresolved_path() {
+        for command in [
+            "diff <(sort data/a.csv) <(sort data/b.csv)",
+            "tee >(cat data/x.csv) > /dev/null",
+        ] {
+            let commands = decompose(command);
+            assert!(
+                commands.iter().any(|simple| simple
+                    .argv
+                    .first()
+                    .is_some_and(|word| word == "sort" || word == "cat")),
+                "the commands inside are still found: {command}"
+            );
+            assert!(
+                commands.iter().all(|simple| simple.unresolved.is_empty()),
+                "{command}: {commands:?}"
+            );
+        }
+
+        // a command substitution beside one is still unresolved
+        let commands = decompose("diff <(sort a) $(ls)");
+        let diff = commands
+            .iter()
+            .find(|simple| simple.argv.first().is_some_and(|word| word == "diff"))
+            .expect("diff is found");
+        assert_eq!(diff.unresolved, vec![SUBSTITUTION.to_string()]);
     }
 
     #[test]
@@ -904,41 +1133,232 @@ mod tests {
         }
     }
 
+    /// The unresolved words of the last command `command` runs.
+    fn unresolved(command: &str) -> Vec<String> {
+        decompose(command)
+            .pop()
+            .map(|c| c.unresolved)
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn dynamic_words_are_flagged() {
+    fn words_veil_cannot_resolve_are_listed_as_written() {
+        let marker = SUBSTITUTION.to_string();
+
+        for (command, expected) in [
+            ("cat $f", vec!["$f"]),
+            ("cat ${f}", vec!["${f}"]),
+            ("cat \"$f\"", vec!["\"$f\""]),
+            ("cat data/$d/x.csv", vec!["data/$d/x.csv"]),
+            ("cat $(echo x)", vec![marker.as_str()]),
+            ("cat `echo x`", vec![marker.as_str()]),
+            ("cat \"$(echo x)/y\"", vec!["\"\u{1}/y\""]),
+            ("cat $1", vec!["$1"]),
+            ("cat $@", vec!["$@"]),
+            ("cat ${f:-x}", vec!["${f:-x}"]),
+            // no home directory is known here
+            ("cat ~/x", vec!["~/x"]),
+            ("cat ~other/x", vec!["~other/x"]),
+            ("cat $a $b ok", vec!["$a", "$b"]),
+            ("$CMD data/x.csv", vec!["$CMD"]),
+            ("cat {1..65}", vec!["{1..65}"]),
+        ] {
+            assert_eq!(unresolved(command), expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn globs_braces_quoted_text_and_known_words_are_not_unresolved() {
         for command in [
-            "cat $f",
-            "cat ${f}",
-            "cat \"$f\"",
+            "cat data/x.csv",
             "cat data/*.csv",
             "cat data/?.csv",
             "cat data/[ab].csv",
-            "cat data/{a,b}.csv",
-            "cat ~/x",
-            "cat $(echo x)",
-            "cat `echo x`",
-            "cat $1",
-            "cat $@",
-        ] {
-            assert!(
-                decompose(command).iter().any(|c| c.has_dynamic_args),
-                "{command} should be dynamic"
-            );
-        }
-        for command in [
-            "cat data/x.csv",
             "cat 'data/*.csv'",
             "cat \"data/*.csv\"",
             "cat '$f'",
+            "cat \"\\$f\"",
             "cat a~b",
             "cat 100$",
             "echo $ x",
+            "cat /tmp/out.$$",
+            "cat data/{a,b}.csv",
+            "cat {data,docs}/x.csv",
+            "cat {}",
         ] {
-            assert!(
-                decompose(command).iter().all(|c| !c.has_dynamic_args),
-                "{command} should not be dynamic"
-            );
+            assert_eq!(unresolved(command), Vec::<String>::new(), "{command}");
         }
+
+        assert_eq!(
+            decompose("cat data/{a,b}.csv")[0].argv,
+            words("cat data/a.csv data/b.csv")
+        );
+        assert_eq!(
+            decompose("cat {data,docs}/x.csv")[0].argv,
+            words("cat data/x.csv docs/x.csv")
+        );
+        // `{}` is not a list, and a glob stays a glob for the directory rules
+        assert_eq!(
+            decompose("cat {} data/*.csv")[0].argv,
+            words("cat {} data/*.csv")
+        );
+    }
+
+    #[test]
+    fn home_and_pwd_come_from_the_environment_the_command_runs_in() {
+        let env = ShellEnv {
+            cwd: Some("/work/repo".into()),
+            home: Some("/home/me".to_owned()),
+        };
+
+        let commands = decompose_in("cat ~/a $HOME/b ${PWD}/c ~", &env);
+        assert_eq!(
+            commands[0].argv,
+            words("cat /home/me/a /home/me/b /work/repo/c /home/me")
+        );
+        assert!(commands[0].unresolved.is_empty());
+
+        // without an environment the same words are unresolved
+        assert_eq!(
+            unresolved("cat ~/a $HOME/b"),
+            vec!["~/a".to_owned(), "$HOME/b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_assigned_variable_is_substituted_in_the_words_that_follow() {
+        for command in [
+            "f=data/x.csv; cat $f",
+            "f=data/x.csv\ncat $f",
+            "f=data/x.csv && cat $f",
+            "export f=data/x.csv; cat \"$f\"",
+            "export f=data/x.csv; cat ${f}",
+            "declare -x f=data/x.csv; cat $f",
+            "local f=data/x.csv; cat $f",
+            "readonly f=data/x.csv; cat $f",
+            "f='data/x.csv'; cat $f",
+            "f=\"data/x.csv\"; cat $f",
+            "(f=data/x.csv; cat $f)",
+            "echo hi; f=data/x.csv; echo hi; cat $f",
+        ] {
+            let commands = decompose(command);
+            let cat = commands
+                .iter()
+                .find(|c| c.argv[0] == "cat")
+                .unwrap_or_else(|| panic!("{command}: no cat in {commands:?}"));
+
+            assert_eq!(cat.argv, words("cat data/x.csv"), "{command}");
+            assert!(cat.unresolved.is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn several_assignments_chain_and_each_value_is_recorded() {
+        let commands = decompose("d=data; c=$d/clients; f=$c/holdings.csv; cat $f $c/x $d");
+
+        assert_eq!(
+            commands[0].argv,
+            words("cat data/clients/holdings.csv data/clients/x data")
+        );
+        assert!(commands[0].unresolved.is_empty());
+        assert_eq!(
+            commands[0].assigned,
+            words("data data/clients data/clients/holdings.csv")
+        );
+
+        // two on one line
+        let commands = decompose("a=data b=x.csv; cat $a/$b");
+        assert_eq!(commands[0].argv, words("cat data/x.csv"));
+    }
+
+    #[test]
+    fn a_prefix_assignment_is_the_environment_of_a_script_it_runs_and_nothing_else() {
+        // the script sees it
+        let commands = decompose("f=data/x.csv sh -c 'cat $f'");
+        let cat = commands
+            .iter()
+            .find(|c| c.argv[0] == "cat")
+            .expect("the script's cat");
+        assert_eq!(cat.argv, words("cat data/x.csv"));
+        assert!(cat.assigned.contains(&"data/x.csv".to_owned()));
+
+        // the command's own words are expanded without it, as a shell does
+        assert_eq!(unresolved("f=data/x.csv cat $f"), vec!["$f".to_owned()]);
+        // and a later command does not see it
+        assert_eq!(
+            unresolved("f=data/x.csv true; cat $f"),
+            vec!["$f".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_assignment_from_the_environment_of_a_nested_script_reaches_it() {
+        let cat = decompose("export f=data/x.csv; bash -c 'cat $f'")
+            .into_iter()
+            .find(|c| c.argv[0] == "cat")
+            .expect("the script's cat");
+        assert_eq!(cat.argv, words("cat data/x.csv"));
+
+        let cat = decompose("f=data/x.csv; echo $(cat $f)")
+            .into_iter()
+            .find(|c| c.argv[0] == "cat")
+            .expect("the substitution's cat");
+        assert_eq!(cat.argv, words("cat data/x.csv"));
+    }
+
+    #[test]
+    fn a_variable_that_could_hold_another_value_is_never_substituted() {
+        for command in [
+            // reassigned: the branch or the loop decides
+            "f=safe.txt; f=data/x.csv; cat $f",
+            "f=safe.txt; if true; then f=data/x.csv; fi; cat $f",
+            "f=safe.txt; while true; do cat $f; f=data/x.csv; done",
+            "f=safe.txt; f+=x; cat $f",
+            // set by a builtin
+            "f=safe.txt; for f in data/x.csv; do cat $f; done",
+            "f=safe.txt; read f < data/x.csv; cat $f",
+            // never set, set later, or set to something unresolved
+            "cat $f",
+            "cat $f; f=safe.txt",
+            "f=$(echo safe.txt); cat $f",
+            "f=$other; cat $f",
+        ] {
+            let commands = decompose(command);
+            let cat = commands
+                .iter()
+                .rev()
+                .find(|c| c.argv[0] == "cat")
+                .unwrap_or_else(|| panic!("{command}: no cat in {commands:?}"));
+
+            assert_eq!(cat.unresolved, vec!["$f".to_owned()], "{command}");
+        }
+    }
+
+    #[test]
+    fn pwd_is_not_trusted_after_a_cd() {
+        let env = ShellEnv {
+            cwd: Some("/work/repo".into()),
+            home: None,
+        };
+
+        assert_eq!(
+            decompose_in("cat $PWD/x", &env)[0].argv,
+            words("cat /work/repo/x")
+        );
+        assert_eq!(
+            decompose_in("cd data; cat $PWD/x", &env)[1].unresolved,
+            vec!["$PWD/x".to_owned()]
+        );
+    }
+
+    #[test]
+    fn find_exec_inherits_what_its_roots_leave_unresolved() {
+        let inner = decompose("find $d -exec cat {} \\;");
+        assert_eq!(inner.last().expect("cat").unresolved, vec!["$d".to_owned()]);
+
+        let known = decompose("d=data; find $d -exec cat {} \\;");
+        assert_eq!(known.last().expect("cat").argv, words("cat data"));
+        assert!(known.last().expect("cat").unresolved.is_empty());
     }
 
     #[test]
@@ -1002,7 +1422,7 @@ mod tests {
         ] {
             let commands = decompose(command);
             assert_eq!(commands, vec![SimpleCommand::opaque()], "{command}");
-            assert!(commands[0].is_opaque() && commands[0].has_dynamic_args);
+            assert!(commands[0].is_opaque() && commands[0].has_dynamic_args());
         }
     }
 

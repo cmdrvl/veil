@@ -2,13 +2,13 @@
 //! the first word of the string. These tests drive the real `veil` binary with
 //! Claude Code `PreToolUse` payloads against real directories on disk.
 //!
-//! What they do not cover, and what is still allowed: variables and other
-//! expansions (`cat $f`), a script fed to a shell on stdin by a pipe
-//! (`echo '...' | sh`), `source`/`.`, `git grep`, `docker exec`, `ssh host cmd`
-//! and the many other programs that run a command and are not in the wrapper
-//! list; command text veil cannot parse; and anything past the 64th segment.
-//! The last test pins the unparseable and over-cap cases so that closing them
-//! (bd-2mi) is a deliberate change.
+//! What they do not cover, and what is still allowed: a script fed to a shell
+//! on stdin by a pipe (`echo '...' | sh`), `source`/`.`, `git grep`,
+//! `docker exec`, `ssh host cmd` and the many other programs that run a
+//! command and are not in the wrapper list. Variables and other expansions,
+//! command text veil cannot parse and anything past the 64th segment are the
+//! dynamic-argument stance's (bd-2mi); the last test here pins that they are
+//! denied, and tests/dynamic_args.rs covers the stance itself.
 
 use std::fs;
 use std::io::Write;
@@ -374,24 +374,20 @@ fn the_first_deny_wins_but_every_command_is_still_evaluated_and_audited() {
 }
 
 #[test]
-fn unparseable_and_over_cap_commands_are_still_allowed_until_the_dynamic_stance_lands() {
+fn unparseable_over_cap_and_variable_hidden_commands_are_denied_by_the_dynamic_stance() {
     let repo = repo("gaps");
     let protected = "data/clients/holdings.csv";
 
-    // Unbalanced quote: veil cannot tell what runs, and today that is allowed.
+    // Unbalanced quote: veil cannot tell what runs (the shell runs the lines
+    // before the quote), so it does not vouch for the command (bd-2mi).
     let unbalanced = bash(&repo, &format!("cat \"{protected}"));
-    assert!(
-        !unbalanced.denied(),
-        "bd-2mi decides the stance for opaque commands; if this now denies, update this test"
-    );
+    assert!(unbalanced.denied(), "an unbalanced quote is not analysed");
 
-    // The first 64 segments are analysed; one past them is not.
+    // The first 64 segments are analysed; one past them is not, and a command
+    // that cannot be seen to the end is not vouched for either.
     let padding = "echo x; ".repeat(64);
     let at_the_cap = bash(&repo, &format!("{padding}cat {protected}"));
-    assert!(
-        !at_the_cap.denied(),
-        "segment 65 is past the cap; if this now denies, update this test"
-    );
+    assert!(at_the_cap.denied(), "segment 65 is past the cap");
     let padding = "echo x; ".repeat(63);
     let within_the_cap = bash(&repo, &format!("{padding}cat {protected}"));
     assert!(
@@ -399,10 +395,7 @@ fn unparseable_and_over_cap_commands_are_still_allowed_until_the_dynamic_stance_
         "segment 64 is within the cap and must be denied"
     );
 
-    // A variable hides the path: the shell expands it, veil does not.
+    // A variable the string assigns is substituted before the path is judged.
     let variable = bash(&repo, &format!("f={protected}; cat $f"));
-    assert!(
-        !variable.denied(),
-        "bd-2mi decides the stance for dynamic arguments; if this now denies, update this test"
-    );
+    assert!(variable.denied(), "the assigned path is judged");
 }

@@ -83,6 +83,10 @@ pub struct PolicyConfig {
     pub audit_path: PathBuf,
     /// Opt-in: operator preflight additionally requires a healthy dcg companion guard.
     pub require_dcg: bool,
+    /// What veil does with a command whose arguments it cannot resolve to
+    /// paths (bd-2mi). Denies by default: dynamic arguments are the canonical
+    /// way around a path rule.
+    pub dynamic_args: DynamicArgsMode,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -91,6 +95,35 @@ pub enum PolicyMode {
     Deny,
     Warn,
     Log,
+}
+
+/// `[policy] dynamic_args`: the stance on a reader, a bulk transfer, or any
+/// command that runs where a protected path is in play, when one of its
+/// arguments is a variable, substitution or placeholder veil cannot resolve.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DynamicArgsMode {
+    /// Block it, as the global `[policy] default` says (`warn` and `log`
+    /// still downgrade a block to a warning).
+    #[default]
+    Deny,
+    /// Allow it and record it in the audit log, with the argument and the
+    /// reason. The agent is not told: use it to measure what `deny` would
+    /// block before turning it on.
+    Warn,
+    /// Do not judge unresolved arguments. Anything the path rules can read
+    /// is still judged.
+    Allow,
+}
+
+impl DynamicArgsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Warn => "warn",
+            Self::Allow => "allow",
+        }
+    }
 }
 
 pub fn load_config(repo_root: &Path) -> io::Result<Config> {
@@ -189,6 +222,7 @@ impl Config {
                 audit_log: true,
                 audit_path: default_audit_path(home, xdg_state_home)?,
                 require_dcg: false,
+                dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
         })
@@ -237,6 +271,10 @@ impl Config {
 
             if let Some(require_dcg) = policy.require_dcg {
                 self.policy.require_dcg = require_dcg;
+            }
+
+            if let Some(dynamic_args) = policy.dynamic_args {
+                self.policy.dynamic_args = dynamic_args;
             }
         }
 
@@ -316,6 +354,7 @@ impl PartialConfig {
         let authorized_tools = split_csv_env("VEIL_SPINE_TOOLS");
         let default_mode = parse_env_var("VEIL_POLICY", parse_policy_mode)?;
         let audit_log = parse_env_var("VEIL_AUDIT_LOG", parse_bool)?;
+        let dynamic_args = parse_env_var("VEIL_DYNAMIC_ARGS", parse_dynamic_args_mode)?;
         let audit_path = parse_env_var("VEIL_AUDIT_PATH", |value| {
             Ok(expand_tilde(Path::new(value), home, xdg_state_home))
         })?;
@@ -331,12 +370,17 @@ impl PartialConfig {
                 authorized_tools: Some(items),
                 denied_flags: None,
             }),
-            policy: if default_mode.is_some() || audit_log.is_some() || audit_path.is_some() {
+            policy: if default_mode.is_some()
+                || audit_log.is_some()
+                || audit_path.is_some()
+                || dynamic_args.is_some()
+            {
                 Some(PartialPolicyConfig {
                     default: default_mode,
                     audit_log,
                     audit_path,
                     require_dcg: None,
+                    dynamic_args,
                 })
             } else {
                 None
@@ -375,6 +419,7 @@ struct PartialPolicyConfig {
     audit_log: Option<bool>,
     audit_path: Option<PathBuf>,
     require_dcg: Option<bool>,
+    dynamic_args: Option<DynamicArgsMode>,
 }
 
 /// `[protected_corpus]`: limits for the one-way filter that `veil sandbox
@@ -673,6 +718,18 @@ fn parse_policy_mode(raw: &str) -> io::Result<PolicyMode> {
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unsupported VEIL_POLICY value `{raw}`"),
+        )),
+    }
+}
+
+fn parse_dynamic_args_mode(raw: &str) -> io::Result<DynamicArgsMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "deny" => Ok(DynamicArgsMode::Deny),
+        "warn" => Ok(DynamicArgsMode::Warn),
+        "allow" => Ok(DynamicArgsMode::Allow),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported VEIL_DYNAMIC_ARGS value `{raw}` (use deny, warn or allow)"),
         )),
     }
 }
@@ -1336,6 +1393,7 @@ mod tests {
                 audit_log: Some(false),
                 audit_path: None,
                 require_dcg: None,
+                dynamic_args: None,
             }),
             protected_corpus: None,
         };
@@ -1386,6 +1444,7 @@ mod tests {
                 audit_log: Some(false),
                 audit_path: Some(home.join("custom/audit.jsonl")),
                 require_dcg: None,
+                dynamic_args: None,
             }),
             protected_corpus: None,
         };
@@ -1569,6 +1628,109 @@ mod tests {
         )
         .unwrap();
         assert!(strict.policy.require_dcg);
+    }
+
+    #[test]
+    fn dynamic_args_denies_by_default_and_layers_system_user_project_env() {
+        // Fresh directories for every load: a load with only a system file
+        // migrates it into the user's config path, which a later load in the
+        // same home would then prefer.
+        let load = |system: Option<&str>,
+                    user: Option<&str>,
+                    project: Option<&str>,
+                    env: PartialConfig| {
+            let repo_root = unique_temp_root("repo");
+            let home = unique_temp_root("home");
+            load_for_test(&repo_root, &home, system, user, project, env).unwrap()
+        };
+        let toml = |mode: &str| format!("[policy]\ndynamic_args = \"{mode}\"\n");
+        let from_env = |mode: DynamicArgsMode| PartialConfig {
+            policy: Some(PartialPolicyConfig {
+                dynamic_args: Some(mode),
+                ..PartialPolicyConfig::default()
+            }),
+            ..PartialConfig::default()
+        };
+
+        let none = PartialConfig::default;
+        assert_eq!(
+            load(None, None, None, none()).policy.dynamic_args,
+            DynamicArgsMode::Deny
+        );
+        assert_eq!(
+            load(Some(&toml("warn")), None, None, none())
+                .policy
+                .dynamic_args,
+            DynamicArgsMode::Warn
+        );
+        assert_eq!(
+            load(Some(&toml("warn")), Some(&toml("allow")), None, none())
+                .policy
+                .dynamic_args,
+            DynamicArgsMode::Allow
+        );
+        assert_eq!(
+            load(
+                Some(&toml("warn")),
+                Some(&toml("allow")),
+                Some(&toml("deny")),
+                none()
+            )
+            .policy
+            .dynamic_args,
+            DynamicArgsMode::Deny
+        );
+        assert_eq!(
+            load(
+                None,
+                None,
+                Some(&toml("deny")),
+                from_env(DynamicArgsMode::Warn)
+            )
+            .policy
+            .dynamic_args,
+            DynamicArgsMode::Warn
+        );
+        // a layer that sets another key leaves the mode alone
+        assert_eq!(
+            load(
+                Some(&toml("allow")),
+                None,
+                Some("[policy]\nrequire_dcg = true\n"),
+                none()
+            )
+            .policy
+            .dynamic_args,
+            DynamicArgsMode::Allow
+        );
+    }
+
+    #[test]
+    fn dynamic_args_rejects_values_it_does_not_know() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let error = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            None,
+            Some("[policy]\ndynamic_args = \"off\"\n"),
+            PartialConfig::default(),
+        )
+        .expect_err("`off` is not a mode");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("dynamic_args"), "{error}");
+
+        for (raw, expected) in [
+            ("deny", DynamicArgsMode::Deny),
+            (" WARN ", DynamicArgsMode::Warn),
+            ("Allow", DynamicArgsMode::Allow),
+        ] {
+            assert_eq!(parse_dynamic_args_mode(raw).unwrap(), expected);
+        }
+        let error = parse_dynamic_args_mode("log").expect_err("`log` is a policy mode only");
+        assert!(error.to_string().contains("VEIL_DYNAMIC_ARGS"), "{error}");
     }
 
     #[test]

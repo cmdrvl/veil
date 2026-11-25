@@ -538,6 +538,7 @@ fn config_json(config: &Config) -> Value {
             "default": policy_mode_name(&config.policy.default),
             "audit_log": config.policy.audit_log,
             "audit_path": config.policy.audit_path.display().to_string(),
+            "dynamic_args": config.policy.dynamic_args.as_str(),
         },
     })
 }
@@ -549,6 +550,11 @@ fn render_config_human(config: &Config) -> String {
         output,
         "  default: {}",
         policy_mode_name(&config.policy.default)
+    );
+    let _ = writeln!(
+        output,
+        "  dynamic_args: {}",
+        config.policy.dynamic_args.as_str()
     );
     let _ = writeln!(output, "  audit_log: {}", config.policy.audit_log);
     let _ = writeln!(
@@ -1818,8 +1824,13 @@ mod tests {
             default = "warn"
             audit_log = false
             audit_path = "/tmp/veil-audit.jsonl"
+            dynamic_args = "warn"
             "#,
         );
+
+        let human = render_config_for_repo(&repo_root, false)
+            .expect("human config rendering should succeed");
+        assert!(human.contains("  dynamic_args: warn\n"), "{human}");
 
         let rendered =
             render_config_for_repo(&repo_root, true).expect("config rendering should succeed");
@@ -1854,6 +1865,7 @@ mod tests {
         assert_eq!(value["policy"]["default"], "warn");
         assert_eq!(value["policy"]["audit_log"], false);
         assert_eq!(value["policy"]["audit_path"], "/tmp/veil-audit.jsonl");
+        assert_eq!(value["policy"]["dynamic_args"], "warn");
         assert_eq!(
             value["spine"]["denied_flags"]["default"],
             serde_json::json!(["--explicit", "--raw", "--dump", "--show-values"])

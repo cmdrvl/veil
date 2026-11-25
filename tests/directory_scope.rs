@@ -394,3 +394,101 @@ fn a_symlink_to_the_repo_is_searched_as_the_repo() {
         "an alias must not hide the protected directory"
     );
 }
+
+/// A repo with a `.env` that only a built-in pack recognises, no `.veil.toml`,
+/// and a scratch home so no user config or audit log is read or written.
+fn pack_only_repo(label: &str) -> (PathBuf, PathBuf) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!(
+        "veil-packonly-{label}-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
+    fs::create_dir_all(base.join("repo/src")).expect("repo dir");
+    fs::create_dir_all(base.join("home")).expect("home dir");
+    fs::write(base.join("repo/.env"), "API_SECRET=hunter2\n").expect("pack-only file");
+    fs::write(base.join("repo/src/main.rs"), "fn main() {}\n").expect("source file");
+
+    let base = fs::canonicalize(&base).expect("base should canonicalize");
+    (base.join("repo"), base)
+}
+
+fn bash_pack_only(command: &str) -> Verdict {
+    let (repo, base) = pack_only_repo("search");
+    let payload = json!({
+        "session_id": "dirscope-pack-only",
+        "cwd": repo,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
+        .env("HOME", base.join("home"))
+        .env("XDG_CONFIG_HOME", base.join("xdg-config"))
+        .env("XDG_STATE_HOME", base.join("xdg-state"))
+        .env("VEIL_AUDIT_PATH", base.join("audit.jsonl"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("veil should spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(payload.to_string().as_bytes())
+        .expect("payload should be written");
+    let output = child.wait_with_output().expect("veil should exit");
+    let decision: Value =
+        serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
+    let specific = &decision["hookSpecificOutput"];
+
+    Verdict {
+        action: specific["permissionDecision"]
+            .as_str()
+            .expect("decision should carry permissionDecision")
+            .to_owned(),
+        reason: specific["permissionDecisionReason"]
+            .as_str()
+            .map(str::to_owned),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// bd-1si reopened: the directory walk only looks for paths covered by
+/// `[sensitivity] protected`, so a file that a built-in pack alone recognises
+/// is not found beneath a searched directory. Each of these commands reads
+/// `.env` and is allowed today. Run with `cargo test --test directory_scope --
+/// --ignored` to see the failure; remove the `ignore` when the walk consults
+/// the packs.
+#[test]
+#[ignore = "bd-1si reopened: directory walk ignores built-in packs (.env found only by name)"]
+fn a_recursive_search_finds_a_file_only_a_builtin_pack_protects() {
+    let mut allowed = Vec::new();
+
+    for command in [
+        "grep -r SECRET .",
+        "rg SECRET .",
+        "rg SECRET",
+        r"find . -exec cat {} \;",
+    ] {
+        let verdict = bash_pack_only(command);
+        if !verdict.denied() {
+            allowed.push(command);
+        }
+    }
+
+    // Naming the file is denied today, which is what makes the gap a gap.
+    assert!(
+        bash_pack_only("cat .env").denied(),
+        "naming `.env` is expected to be denied by the pack"
+    );
+    assert!(
+        allowed.is_empty(),
+        "these commands read `.env` and must be denied: {allowed:?}"
+    );
+}

@@ -14,7 +14,7 @@
 //! their documentation and unchecked.
 
 use super::command_name;
-use super::decompose::{MAX_DEPTH, Origin, Run, SimpleCommand, emit, script};
+use super::decompose::{MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, emit, script};
 
 /// Options a wrapper takes, and which of them carry a value.
 struct Options {
@@ -320,7 +320,9 @@ pub(super) fn expand(
             Step::Skip { count, dynamic } => {
                 start += count;
                 command.origin = Origin::Wrapper;
-                command.has_dynamic_args |= dynamic;
+                if dynamic {
+                    command.unresolved.push(STDIN_ARGUMENTS.to_owned());
+                }
             }
             Step::Words(replacement) => {
                 command.argv = replacement;
@@ -333,10 +335,14 @@ pub(super) fn expand(
             }
             Step::Exec(commands) => {
                 for argv in commands {
+                    // `{}` became a root, which the directory scope judges; what
+                    // the parent could not resolve (`find $d -exec ...`) stays
+                    // unresolved for the command it runs.
                     let inner = SimpleCommand {
                         argv,
                         redirects_in: Vec::new(),
-                        has_dynamic_args: true,
+                        unresolved: command.unresolved.clone(),
+                        assigned: Vec::new(),
                         origin: Origin::Wrapper,
                         stdin_piped: command.stdin_piped,
                         heredoc_body: None,
@@ -715,9 +721,10 @@ mod tests {
         let commands = decompose("ls data | xargs cat");
 
         assert_eq!(commands[1].argv, argv("cat"));
-        assert!(commands[1].has_dynamic_args);
+        assert_eq!(commands[1].unresolved, vec![STDIN_ARGUMENTS.to_owned()]);
+        assert!(commands[1].has_dynamic_args());
         assert_eq!(commands[1].origin, Origin::Wrapper);
-        assert!(!commands[0].has_dynamic_args);
+        assert!(!commands[0].has_dynamic_args());
 
         assert_runs("xargs -n 1 cat", &["cat"]);
         assert_runs("xargs -0 -P 4 -n1 cat x", &["cat x"]);
@@ -764,13 +771,18 @@ mod tests {
     }
 
     #[test]
-    fn find_exec_commands_are_wrapper_origin_with_dynamic_arguments() {
+    fn find_exec_commands_are_wrapper_origin_and_their_braces_are_the_literal_root() {
         let commands = decompose("find data -exec cat {} \\;");
 
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].argv, argv("cat data"));
         assert_eq!(commands[0].origin, Origin::Wrapper);
-        assert!(commands[0].has_dynamic_args);
+        // `{}` became the root, which the directory scope judges
+        assert!(!commands[0].has_dynamic_args());
+
+        // a root that is itself unresolved leaves the command unresolved
+        let commands = decompose("find $d -exec cat {} \\;");
+        assert_eq!(commands[0].unresolved, vec!["$d".to_owned()]);
     }
 
     #[test]
