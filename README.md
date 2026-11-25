@@ -92,17 +92,18 @@ encouraging ad hoc shell commands.
 
 A content search of a directory reads every file beneath it, so veil walks the
 directory before allowing it and denies the search when any path under it is
-covered by `[sensitivity] protected`. Searches that return only file names or
-counts (Grep `output_mode` of `files_with_matches` or `count`; `grep -l`,
-`-L`, `-c`, `rg --files`) stay allowed and are written to the audit log. Two
+protected by `[sensitivity] protected` or a built-in sensitivity pack. Searches
+that return only file names or counts (Grep `output_mode` of
+`files_with_matches` or `count`; `grep -l`, `-L`, `-c`, `rg --files`) stay
+allowed and are written to the audit log. Two
 limits to know about: the Grep tool's `glob` and `type` filters are not
 honored, so a search of a directory that holds protected data is denied even
 if the filter would have skipped it (search a narrower path instead); and a
 directory with more than 200,000 entries is refused rather than assumed clean.
-The walk looks for paths covered by `[sensitivity] protected` only. A file that
-only a built-in sensitivity pack recognises (`.env`, key files) is not found by
-it, so a recursive search of a directory holding nothing else is not denied
-today; naming the file (`cat .env`) still is.
+The walk also checks visited paths against the built-in sensitivity packs,
+including `.env` and key files. The 200,000-entry limit bounds how many entries
+it inspects; it is not a wall-clock latency guarantee, which depends on the
+filesystem and tree shape.
 
 A Bash tool call is judged one command at a time, not by its first word. veil
 splits the line on `;`, `&`, `&&`, `||`, `|` and newlines, looks inside `$( )`,
