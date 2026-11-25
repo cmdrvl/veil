@@ -443,6 +443,42 @@ fn a_shell_script_is_run_as_the_commands_it_holds() {
 }
 
 #[test]
+fn an_unanalysable_shell_script_tail_does_not_hide_a_protected_read() {
+    let malformed = repo("shell-opaque-malformed");
+    malformed.write(
+        "broken.sh",
+        "echo 'unterminated\ncat data/clients/holdings.csv\n",
+    );
+
+    let verdict = assert_denied(&malformed, "bash broken.sh");
+    assert!(
+        verdict.reason().contains("found in script `broken.sh`"),
+        "{}",
+        verdict.reason()
+    );
+    let records = malformed.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["origin"], "script");
+    assert_eq!(records[0]["reason_class"], "dynamic_path_unresolvable");
+
+    let truncated = repo("shell-opaque-limit");
+    let mut text = "echo ok\n".repeat(64);
+    text.push_str("cat data/clients/holdings.csv\n");
+    truncated.write("many.sh", &text);
+
+    let verdict = assert_denied(&truncated, "bash many.sh");
+    assert!(
+        verdict.reason().contains("found in script `many.sh`"),
+        "{}",
+        verdict.reason()
+    );
+    let records = truncated.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["origin"], "script");
+    assert_eq!(records[0]["reason_class"], "dynamic_path_unresolvable");
+}
+
+#[test]
 fn a_script_that_runs_a_script_is_followed_three_levels_deep() {
     let repo = repo("chain");
     repo.write("outer.sh", "#!/bin/sh\nbash middle.sh\n");

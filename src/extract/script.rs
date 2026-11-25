@@ -137,7 +137,7 @@ fn shell_commands(
     };
 
     for inner in decompose_in(text, &inner_env) {
-        if inner.argv.is_empty() {
+        if inner.argv.is_empty() && !inner.is_opaque() {
             continue;
         }
         let inner_cwd = inner.cwd.as_deref().unwrap_or(cwd);
@@ -150,11 +150,15 @@ fn shell_commands(
         });
         found.unresolved.clear();
         found.cwd_unresolved = false;
-        found.opaque = false;
+        // Keep the decomposer's opaque tail. Dropping it would let a protected
+        // read after an unbalanced construct or the segment cap disappear.
+        found.opaque = inner.is_opaque();
         found.dynamic_strict = false;
         out.push(found);
 
-        inspect(&inner, inner_cwd, env, depth + 1, scripts, out);
+        if !inner.is_opaque() {
+            inspect(&inner, inner_cwd, env, depth + 1, scripts, out);
+        }
     }
 }
 
@@ -1796,7 +1800,7 @@ p = os.path.join(BASE, "a.csv")"#
     }
 
     #[test]
-    fn an_unreadable_shell_script_is_skipped_not_judged_opaque() {
+    fn an_unanalysable_shell_script_stays_opaque() {
         let dir = temp_dir("opaque");
         fs::write(
             dir.join("broken.sh"),
@@ -1815,7 +1819,13 @@ p = os.path.join(BASE, "a.csv")"#
             inspect(command, &dir, &env, 0, &mut scripts, &mut out);
         }
 
-        assert!(out.iter().all(|command| !command.opaque));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].opaque, "{out:?}");
+        assert_eq!(out[0].origin, Origin::Script);
+        assert_eq!(
+            out[0].script.as_ref().map(|source| source.name.as_str()),
+            Some("broken.sh")
+        );
     }
 
     #[test]
