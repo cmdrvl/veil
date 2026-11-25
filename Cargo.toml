@@ -46,5 +46,9 @@ opt-level = 3
 [profile.release.package.base64]
 opt-level = 3
 
+[[bench]]
+name = "boundary_detectors_latency"
+harness = false
+
 [dev-dependencies]
 spine-rules = { git = "https://github.com/cmdrvl/spine-rules" }
