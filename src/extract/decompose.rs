@@ -84,6 +84,8 @@ pub enum Origin {
     Subshell,
     /// Run by something else: `sh -c`, `eval`, `env`, `xargs`, `find -exec`, `uv run`...
     Wrapper,
+    /// Found in a script file an interpreter was asked to run (bd-1bk).
+    Script,
 }
 
 impl Origin {
@@ -92,6 +94,7 @@ impl Origin {
             Self::Top => "top",
             Self::Subshell => "subshell",
             Self::Wrapper => "wrapper",
+            Self::Script => "script",
         }
     }
 }

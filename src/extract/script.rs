@@ -1,0 +1,1876 @@
+//! bd-1bk: a script file an interpreter is asked to run, read as the text it is.
+//!
+//! `python3 -c "open('data/x.csv')"` names its file inside the code and veil
+//! reads that code. `python3 read.py` hides the same code in a file, which an
+//! agent can write in three lines and run. When a command runs a script, veil
+//! reads the file (the script is not protected data: the agent wrote it or could
+//! have) and judges what is in it:
+//!
+//! - for Python, Node (also bun and deno), Ruby, Perl and R: the reads veil
+//!   already finds in a `-c` string (`open(...)`, `read_csv(...)`,
+//!   `readFileSync(...)`...) are direct reads, and every string or word in the
+//!   file that is shaped like a path is named like a word of a command, which the
+//!   path rule judges. A path built from literals (`os.path.join("data",
+//!   "clients", "a.csv")`, `Path(BASE) / "a.csv"`, `f"{BASE}/a.csv"`,
+//!   `BASE + "/a.csv"`, where `BASE` is assigned a literal) is worked out and
+//!   named too;
+//! - for `bash`, `sh`, `zsh` and `source`: the file is split into the commands it
+//!   would run, each judged as if it had been typed, and those that run another
+//!   script are followed.
+//!
+//! A file run by name (`./x.py`) is read when its first line names an
+//! interpreter. A Python directory runs its `__main__.py`.
+//!
+//! This is best effort, and the remediation says so. A script that builds a path
+//! at run time, takes it from the environment or a file, or imports a module
+//! that does, is not seen; only an OS sandbox is airtight. A script larger than
+//! [`SCRIPT_LIMIT`], or the 17th script of one command, is not read: it is denied
+//! where a protected path is in reach, and allowed with a record where none is.
+
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use super::{
+    ArgvPath, ArgvResolver, CommandExtraction, InterpreterKind, Origin, PathExposure, SUBSTITUTION,
+    ScriptSource, ShellEnv, SimpleCommand, command_extraction, command_name, decompose_in,
+    extract_interpreter_script_paths, ignorable_system_path, interpreter_kind, is_plain_name,
+    lexical_path, normalize_candidates, path_shaped, strip_redirection_words,
+};
+
+/// The largest script veil reads, in bytes.
+pub(super) const SCRIPT_LIMIT: u64 = 256 * 1024;
+
+/// Scripts read for one Bash call, and the bytes of them. A script that runs a
+/// script that runs a script is followed [`MAX_DEPTH`] deep.
+const MAX_SCRIPTS: usize = 16;
+const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
+const MAX_DEPTH: usize = 3;
+
+/// How many of a script's words are checked against the filesystem. Past it a
+/// word is compared with the protected patterns as text, which costs no stat
+/// and cannot be crowded out by padding.
+const FILESYSTEM_BUDGET: usize = 512;
+
+/// The longest string or word veil treats as a path.
+const MAX_TOKEN: usize = 4096;
+
+/// What veil has read of the scripts one Bash call runs.
+#[derive(Default)]
+pub(super) struct Scripts {
+    read: usize,
+    bytes: u64,
+}
+
+/// The script a simple command runs, when it runs one.
+struct Run {
+    kind: InterpreterKind,
+    /// The program as typed.
+    program: String,
+    /// The script as typed.
+    name: String,
+    path: PathBuf,
+}
+
+/// Adds to `out` what the script `command` runs says it reads: nothing when the
+/// command runs no script.
+pub(super) fn inspect(
+    command: &SimpleCommand,
+    cwd: &Path,
+    env: &ShellEnv,
+    depth: usize,
+    scripts: &mut Scripts,
+    out: &mut Vec<CommandExtraction>,
+) {
+    let Some(run) = find_script(command, cwd) else {
+        return;
+    };
+    let (path, contents) = read_script(&run.path, run.kind, depth, scripts);
+    let source = |unread: Option<String>| ScriptSource {
+        name: run.name.clone(),
+        path: fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
+        run_in: cwd.to_path_buf(),
+        unread,
+    };
+
+    match contents {
+        Contents::Nothing => {}
+        Contents::Unread(why) => out.push(extraction(&run, source(Some(why)))),
+        Contents::Text(text) if run.kind == InterpreterKind::Shell => {
+            shell_commands(&text, &source(None), cwd, env, depth, scripts, out);
+        }
+        Contents::Text(text) => {
+            let source = source(None);
+            let candidates =
+                normalize_candidates(extract_interpreter_script_paths(run.kind, &text), cwd);
+            let argv_paths = path_words(run.kind, &text, &candidates, cwd);
+            let mut found = extraction(&run, source);
+
+            if !candidates.is_empty() {
+                found.exposure = PathExposure::ReadsContents;
+            }
+            found.candidates = candidates;
+            found.argv_paths = argv_paths;
+            found.argv_exposure = PathExposure::ReadsContents;
+            out.push(found);
+        }
+    }
+}
+
+/// The commands a shell script runs, each as `extract_bash_commands` would
+/// extract it, then the scripts those run. A word veil cannot resolve is not an
+/// argument to judge here: scripts are full of `$1` and `"$f"`, and the
+/// dynamic-argument stance is for what the person typed.
+fn shell_commands(
+    text: &str,
+    source: &ScriptSource,
+    cwd: &Path,
+    env: &ShellEnv,
+    depth: usize,
+    scripts: &mut Scripts,
+    out: &mut Vec<CommandExtraction>,
+) {
+    let inner_env = ShellEnv {
+        cwd: Some(cwd.to_path_buf()),
+        home: env.home.clone(),
+    };
+
+    for inner in decompose_in(text, &inner_env) {
+        if inner.argv.is_empty() {
+            continue;
+        }
+        let inner_cwd = inner.cwd.as_deref().unwrap_or(cwd);
+        let mut found = command_extraction(&inner, inner_cwd);
+
+        found.origin = Origin::Script;
+        found.script = Some(ScriptSource {
+            run_in: inner_cwd.to_path_buf(),
+            ..source.clone()
+        });
+        found.unresolved.clear();
+        found.cwd_unresolved = false;
+        found.opaque = false;
+        found.dynamic_strict = false;
+        out.push(found);
+
+        inspect(&inner, inner_cwd, env, depth + 1, scripts, out);
+    }
+}
+
+/// An extraction that names the script and nothing else; the caller fills in
+/// what was found in it.
+fn extraction(run: &Run, source: ScriptSource) -> CommandExtraction {
+    CommandExtraction {
+        origin: Origin::Script,
+        argv: vec![run.program.clone(), run.name.clone()],
+        exposure: PathExposure::None,
+        candidates: Vec::new(),
+        argv_paths: Vec::new(),
+        argv_exposure: PathExposure::None,
+        argv_scans_directories: false,
+        unresolved: Vec::new(),
+        cwd_unresolved: false,
+        opaque: false,
+        dynamic_strict: false,
+        assigned_paths: Vec::new(),
+        egress: false,
+        script: Some(source),
+    }
+}
+
+// ---- which script a command runs --------------------------------------------
+
+fn find_script(command: &SimpleCommand, cwd: &Path) -> Option<Run> {
+    let (program, args) = command.argv.split_first()?;
+    let base = command_name(program);
+
+    if let Some(kind) = interpreter_kind(base) {
+        let name = match script_operand(kind, base, args) {
+            Operand::File(name) => name.to_owned(),
+            // `python3 < read.py`: the file on standard input is the script
+            Operand::Stdin => command
+                .redirects_in
+                .iter()
+                .find(|word| usable(word))?
+                .clone(),
+            Operand::Inline => return None,
+        };
+        return Some(Run {
+            kind,
+            program: program.clone(),
+            path: locate(&name, cwd),
+            name,
+        });
+    }
+
+    if matches!(base, "source" | ".") {
+        let name = strip_redirection_words(args)
+            .into_iter()
+            .find(|word| usable(word))?;
+        return Some(Run {
+            kind: InterpreterKind::Shell,
+            program: program.clone(),
+            path: locate(name, cwd),
+            name: name.to_owned(),
+        });
+    }
+
+    if !usable(program) {
+        return None;
+    }
+    let path = locate(program, cwd);
+
+    // `./x.py`: a file run by name runs under the interpreter on its first line.
+    let by_first_line = if program.contains('/') {
+        shebang_kind(&path)
+    } else {
+        None
+    };
+    // `uv run read.py`, `deno run read.ts`: veil sees through the wrapper to the
+    // file it runs, which the wrapper hands to the interpreter its extension names.
+    let by_extension = if command.origin == Origin::Wrapper {
+        extension_kind(&path)
+    } else {
+        None
+    };
+    let kind = by_first_line.or(by_extension)?;
+
+    Some(Run {
+        kind,
+        program: program.clone(),
+        name: program.clone(),
+        path,
+    })
+}
+
+/// The interpreter that runs a file with this extension.
+fn extension_kind(path: &Path) -> Option<InterpreterKind> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+
+    match extension.as_str() {
+        "py" => Some(InterpreterKind::Python),
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => Some(InterpreterKind::Node),
+        "rb" => Some(InterpreterKind::Ruby),
+        "pl" => Some(InterpreterKind::Perl),
+        "r" => Some(InterpreterKind::R),
+        _ => None,
+    }
+}
+
+fn locate(name: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(name);
+
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// A word that names one file: not a variable, a substitution or a glob.
+fn usable(word: &str) -> bool {
+    !word.is_empty() && !word.contains(['$', SUBSTITUTION, '*', '?', '[', '`'])
+}
+
+/// How an interpreter's command line is read: the options that take the next
+/// word as their value, those after which no script file follows (the code is
+/// in the command, or comes from a module or standard input), and whether the
+/// script comes after a subcommand.
+struct Options {
+    with_value: &'static [&'static str],
+    inline: &'static [&'static str],
+    subcommand: Subcommand,
+}
+
+enum Subcommand {
+    None,
+    /// `bun run x.ts`, or `bun x.ts`.
+    Optional(&'static str),
+    /// `deno run x.ts`; any other subcommand runs no script file.
+    Required(&'static str),
+}
+
+fn options(kind: InterpreterKind, name: &str) -> Options {
+    match (kind, name) {
+        (InterpreterKind::Python, _) => Options {
+            with_value: &["-W", "-X", "-Q", "--check-hash-based-pycs"],
+            inline: &["-c", "-m"],
+            subcommand: Subcommand::None,
+        },
+        (InterpreterKind::Node, "bun") => Options {
+            with_value: &[
+                "--cwd",
+                "--config",
+                "--preload",
+                "-r",
+                "--env-file",
+                "--port",
+            ],
+            inline: &["-e", "--eval", "-p", "--print"],
+            subcommand: Subcommand::Optional("run"),
+        },
+        (InterpreterKind::Node, "deno") => Options {
+            with_value: &[
+                "-c",
+                "--config",
+                "--import-map",
+                "--lock",
+                "--cert",
+                "--location",
+                "--seed",
+                "--v8-flags",
+            ],
+            inline: &[],
+            subcommand: Subcommand::Required("run"),
+        },
+        (InterpreterKind::Node, _) => Options {
+            with_value: &[
+                "-r",
+                "--require",
+                "--import",
+                "--loader",
+                "--experimental-loader",
+                "--conditions",
+                "-C",
+                "--input-type",
+                "--env-file",
+                "--title",
+            ],
+            inline: &["-e", "--eval", "-p", "--print"],
+            subcommand: Subcommand::None,
+        },
+        (InterpreterKind::Ruby, _) => Options {
+            with_value: &["-r", "-I", "-C", "-E"],
+            inline: &["-e"],
+            subcommand: Subcommand::None,
+        },
+        (InterpreterKind::Perl, _) => Options {
+            with_value: &["-I", "-M", "-m"],
+            inline: &["-e", "-E"],
+            subcommand: Subcommand::None,
+        },
+        (InterpreterKind::R, _) => Options {
+            with_value: &[],
+            inline: &["-e"],
+            subcommand: Subcommand::None,
+        },
+        (InterpreterKind::Shell, _) => Options {
+            with_value: &["-o", "+o", "-O", "+O", "--rcfile", "--init-file"],
+            inline: &["-c"],
+            subcommand: Subcommand::None,
+        },
+    }
+}
+
+/// Where an interpreter's code is.
+#[derive(Debug, Eq, PartialEq)]
+enum Operand<'a> {
+    /// In a file the command names.
+    File(&'a str),
+    /// In the command itself (`-c`, `-e`), or in a module or a file veil cannot
+    /// name: there is no script file to read.
+    Inline,
+    /// On standard input, which `python3 < read.py` fills from a file.
+    Stdin,
+}
+
+/// The script file among an interpreter's arguments: the first word that is not
+/// an option or an option's value.
+fn script_operand<'a>(kind: InterpreterKind, name: &str, args: &'a [String]) -> Operand<'a> {
+    let options = options(kind, name);
+    let words = strip_redirection_words(args);
+    let mut index = 0;
+    let mut options_ended = false;
+    let mut subcommand_seen = false;
+
+    while index < words.len() {
+        let word = words[index];
+        index += 1;
+
+        if !options_ended && word == "--" {
+            options_ended = true;
+            continue;
+        }
+
+        if !options_ended && word.starts_with('-') && word.len() > 1 {
+            // `-cCODE`, `-mmodule`: the value attached to a short option.
+            let attached =
+                |flag: &&str| flag.len() == 2 && !flag.starts_with("--") && word.starts_with(*flag);
+            if options.inline.contains(&word) || options.inline.iter().any(attached) {
+                return Operand::Inline;
+            }
+            if options.with_value.contains(&word) {
+                index += 1;
+            }
+            continue;
+        }
+
+        if word == "-" {
+            return Operand::Stdin;
+        }
+
+        match options.subcommand {
+            Subcommand::Required(subcommand) if !subcommand_seen => {
+                if word != subcommand {
+                    return Operand::Inline;
+                }
+                subcommand_seen = true;
+                continue;
+            }
+            Subcommand::Optional(subcommand) if !subcommand_seen => {
+                subcommand_seen = true;
+                if word == subcommand {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+
+        return if usable(word) {
+            Operand::File(word)
+        } else {
+            Operand::Inline
+        };
+    }
+
+    Operand::Stdin
+}
+
+/// The interpreter named on the first line of a file run by name, when it is one
+/// veil reads: `#!/usr/bin/env python3`, `#!/bin/bash`.
+fn shebang_kind(path: &Path) -> Option<InterpreterKind> {
+    if !fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut head = [0u8; 256];
+    let length = File::open(path).ok()?.read(&mut head).ok()?;
+    let first_line = head[..length]
+        .strip_prefix(b"#!")?
+        .split(|byte| *byte == b'\n')
+        .next()?;
+    let line = String::from_utf8_lossy(first_line);
+    let mut words = line.split_whitespace();
+    let mut program = command_name(words.next()?);
+
+    if program == "env" {
+        // `#!/usr/bin/env -S python3 -u`, `#!/usr/bin/env FOO=1 python3`
+        let named = words.find(|word| !word.starts_with('-') && !word.contains('='))?;
+        program = command_name(named);
+    }
+
+    interpreter_kind(program)
+}
+
+// ---- reading it -------------------------------------------------------------
+
+enum Contents {
+    Text(String),
+    /// A script that is there and that veil did not read; why.
+    Unread(String),
+    /// Not a file veil reads: nothing by that name, a pipe, a directory.
+    Nothing,
+}
+
+fn read_script(
+    path: &Path,
+    kind: InterpreterKind,
+    depth: usize,
+    scripts: &mut Scripts,
+) -> (PathBuf, Contents) {
+    let mut path = path.to_path_buf();
+    let Ok(mut metadata) = fs::metadata(&path) else {
+        return (path, Contents::Nothing);
+    };
+
+    if metadata.is_dir() && kind == InterpreterKind::Python {
+        // `python3 pkg/` runs `pkg/__main__.py`
+        path.push("__main__.py");
+        match fs::metadata(&path) {
+            Ok(inner) => metadata = inner,
+            Err(_) => return (path, Contents::Nothing),
+        }
+    }
+    if !metadata.is_file() {
+        return (path, Contents::Nothing);
+    }
+
+    let size = metadata.len();
+    if size > SCRIPT_LIMIT {
+        return (path, Contents::Unread(too_large(size)));
+    }
+    if depth >= MAX_DEPTH || scripts.read >= MAX_SCRIPTS || scripts.bytes + size > MAX_SCRIPT_BYTES
+    {
+        let why = format!(
+            "is more script than veil follows for one command ({MAX_DEPTH} levels, \
+             {MAX_SCRIPTS} scripts, {MAX_SCRIPT_BYTES} bytes)"
+        );
+        return (path, Contents::Unread(why));
+    }
+
+    let Ok(file) = File::open(&path) else {
+        return (path, Contents::Nothing);
+    };
+    let mut buffer = Vec::new();
+    // one byte more than the limit shows a file that grew since it was measured
+    if file
+        .take(SCRIPT_LIMIT + 1)
+        .read_to_end(&mut buffer)
+        .is_err()
+    {
+        return (path, Contents::Nothing);
+    }
+    if buffer.len() as u64 > SCRIPT_LIMIT {
+        return (path, Contents::Unread(too_large(buffer.len() as u64)));
+    }
+
+    scripts.read += 1;
+    scripts.bytes += buffer.len() as u64;
+    let text = String::from_utf8_lossy(&buffer).into_owned();
+    (path, Contents::Text(text))
+}
+
+fn too_large(size: u64) -> String {
+    format!("is {size} bytes, more than the {SCRIPT_LIMIT} bytes veil reads")
+}
+
+// ---- the paths in a script --------------------------------------------------
+
+/// A word of a script that may name a path. `certain` words have a slash: they
+/// name a path whether or not one exists. The rest name one only if it exists.
+struct Word {
+    text: String,
+    certain: bool,
+}
+
+/// The paths a script names, resolved, with the most telling first: what the
+/// script builds from literals, then the strings and words with a slash, then
+/// the bare file names. The first [`FILESYSTEM_BUDGET`] are checked against the
+/// filesystem; the rest are compared with the protected patterns as text.
+fn path_words(kind: InterpreterKind, text: &str, already: &[PathBuf], cwd: &Path) -> Vec<ArgvPath> {
+    let mut found = Vec::new();
+    let mut seen: HashSet<PathBuf> = already.iter().cloned().collect();
+    let mut resolver = ArgvResolver::new(cwd);
+    let mut budget = FILESYSTEM_BUDGET;
+
+    for word in words(kind, text) {
+        let resolved = budget > 0;
+        let path = if resolved {
+            budget -= 1;
+            resolver.resolve(&word.text, !word.certain)
+        } else {
+            lexical_path(&word.text, cwd)
+        };
+        let Some(path) = path else {
+            continue;
+        };
+
+        if ignorable_system_path(&path) || !seen.insert(path.clone()) {
+            continue;
+        }
+        found.push(ArgvPath { path, resolved });
+    }
+
+    found
+}
+
+fn words(kind: InterpreterKind, text: &str) -> Vec<Word> {
+    let tokens = lex(kind, text);
+    let folder = Folder::new(&tokens);
+    let mut words: Vec<Word> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut add = |word: &str, certain: bool| {
+        let word = word.trim_end_matches('.');
+
+        if word.is_empty()
+            || word.len() > MAX_TOKEN
+            || word.contains('$')
+            || !word.bytes().any(|byte| byte.is_ascii_alphanumeric())
+            || !seen.insert(word.to_owned())
+        {
+            return;
+        }
+        words.push(Word {
+            text: word.to_owned(),
+            certain,
+        });
+    };
+
+    // what the script builds out of literals
+    for built in folder.built() {
+        add(&built, built.contains('/'));
+    }
+
+    // a string that is shaped like a path, whole: it may hold spaces
+    for token in &tokens {
+        if let Tok::Str(content) = token
+            && path_shaped(content)
+        {
+            add(content, content.contains('/'));
+        }
+    }
+
+    // any word of the text, comments and all: no reading of the syntax is
+    // needed to see `data/clients/a.csv`, and none can be led astray
+    let mut bare: Vec<&str> = Vec::new();
+    for word in text.split(is_separator) {
+        if word.contains('/') {
+            add(word, true);
+        } else if path_shaped(word) || is_dotfile(word) {
+            bare.push(word);
+        }
+    }
+    for word in bare {
+        add(word, false);
+    }
+
+    // a quoted name with no slash or extension: `"credentials"`, `"id_rsa"`
+    for token in &tokens {
+        if let Tok::Str(content) = token
+            && content.len() <= 255
+            && is_plain_name(content)
+        {
+            add(content, false);
+        }
+    }
+
+    words
+}
+
+fn is_separator(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '\'' | '"'
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+                | '='
+                | '|'
+                | '&'
+                | '!'
+                | '*'
+                | '?'
+                | '#'
+                | ':'
+                | '\\'
+                | '+'
+                | '@'
+                | '^'
+        )
+}
+
+/// `.env`, `.netrc`: a name that starts with a dot and is more than dots.
+fn is_dotfile(word: &str) -> bool {
+    word.len() > 1
+        && word.starts_with('.')
+        && word.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && is_plain_name(word)
+}
+
+// ---- reading the syntax just far enough to build paths ------------------------
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Tok {
+    Str(String),
+    Ident(String),
+    Punct(u8),
+}
+
+/// The strings, names and punctuation of a script, without comments. It knows
+/// enough of each language to find where a string ends (a string stops at the
+/// end of its line, so a stray quote cannot swallow the file) and nothing more.
+fn lex(kind: InterpreterKind, text: &str) -> Vec<Tok> {
+    let bytes = text.as_bytes();
+    let slash_comments = kind == InterpreterKind::Node;
+    let mut tokens = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+
+        if byte.is_ascii_whitespace() {
+            index += 1;
+        } else if (byte == b'#' && !slash_comments)
+            || (slash_comments && byte == b'/' && bytes.get(index + 1) == Some(&b'/'))
+        {
+            index = line_end(bytes, index);
+        } else if slash_comments && byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index = block_comment_end(bytes, index + 2);
+        } else if matches!(byte, b'\'' | b'"' | b'`') {
+            match string_at(bytes, index, kind == InterpreterKind::Python) {
+                Some((content, next)) => {
+                    tokens.push(Tok::Str(content));
+                    index = next;
+                }
+                None => {
+                    tokens.push(Tok::Punct(byte));
+                    index += 1;
+                }
+            }
+        } else if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+            let start = index;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+            {
+                index += 1;
+            }
+            tokens.push(Tok::Ident(
+                String::from_utf8_lossy(&bytes[start..index]).into_owned(),
+            ));
+        } else {
+            tokens.push(Tok::Punct(byte));
+            index += 1;
+        }
+    }
+
+    tokens
+}
+
+fn line_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index] != b'\n' {
+        index += 1;
+    }
+    index
+}
+
+fn block_comment_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+            return index + 2;
+        }
+        index += 1;
+    }
+    bytes.len()
+}
+
+/// The string that starts at `start`, and where it ends. A string with no end
+/// on its line is no string (a backtick string may run on, as may a Python
+/// triple-quoted one).
+fn string_at(bytes: &[u8], start: usize, triple_quotes: bool) -> Option<(String, usize)> {
+    let quote = bytes[start];
+    let triple = triple_quotes
+        && quote != b'`'
+        && bytes.get(start + 1) == Some(&quote)
+        && bytes.get(start + 2) == Some(&quote);
+    let mut index = start + if triple { 3 } else { 1 };
+    let mut content = Vec::new();
+    let mut overflow = false;
+    let mut push = |byte: u8, content: &mut Vec<u8>| {
+        if content.len() < MAX_TOKEN {
+            content.push(byte);
+        } else {
+            overflow = true;
+        }
+    };
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+
+        if triple {
+            if byte == quote
+                && bytes.get(index + 1) == Some(&quote)
+                && bytes.get(index + 2) == Some(&quote)
+            {
+                index += 3;
+                return Some((finish(content, overflow), index));
+            }
+            push(byte, &mut content);
+            index += 1;
+            continue;
+        }
+
+        if byte == b'\\' {
+            match bytes.get(index + 1) {
+                Some(&next) if next == quote || next == b'\\' => push(next, &mut content),
+                Some(&next) => {
+                    push(b'\\', &mut content);
+                    push(next, &mut content);
+                }
+                None => {}
+            }
+            index += 2;
+            continue;
+        }
+        if byte == quote {
+            return Some((finish(content, overflow), index + 1));
+        }
+        if byte == b'\n' && quote != b'`' {
+            return None;
+        }
+        push(byte, &mut content);
+        index += 1;
+    }
+
+    None
+}
+
+fn finish(content: Vec<u8>, overflow: bool) -> String {
+    if overflow {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&content).into_owned()
+    }
+}
+
+/// The deepest call inside a call that is followed, the most arguments of one
+/// call, the most terms of one expression and the most tokens skipped over in
+/// an argument veil cannot work out: bounds on the work done at each token, so
+/// that a file of `join(` repeated cannot make reading it take quadratic time.
+const MAX_NESTING: usize = 8;
+const MAX_ARGUMENTS: usize = 64;
+const MAX_TERMS: usize = 64;
+const MAX_SKIP: usize = 64;
+
+/// What an expression comes to, and where it ends.
+struct Folded {
+    value: String,
+    next: usize,
+    /// Put together from more than one piece: a join, a concatenation.
+    composite: bool,
+    /// Every piece was worked out. A call with a variable among its arguments
+    /// gives the pieces that were (its value is still worth naming) but is not
+    /// what a name assigned from it stands for.
+    complete: bool,
+}
+
+/// Works out the paths a script builds from literals and from names it assigns
+/// a literal (or something built from literals) once.
+struct Folder<'a> {
+    tokens: &'a [Tok],
+    constants: HashMap<String, String>,
+}
+
+impl<'a> Folder<'a> {
+    fn new(tokens: &'a [Tok]) -> Self {
+        let mut folder = Self {
+            tokens,
+            constants: HashMap::new(),
+        };
+
+        // A name can be assigned something built from a name assigned before
+        // it, so look three times.
+        for _ in 0..3 {
+            let mut assigned: Vec<(String, String)> = Vec::new();
+
+            for index in 0..tokens.len() {
+                if let Some((name, value_start)) = folder.assignment(index)
+                    && let Some(folded) = folder.expr(value_start, 0)
+                    && folded.complete
+                    && !folder.constants.contains_key(name)
+                {
+                    assigned.push((name.to_owned(), folded.value));
+                }
+            }
+            if assigned.is_empty() {
+                break;
+            }
+            folder.constants.extend(assigned);
+        }
+
+        folder
+    }
+
+    /// `NAME = value`, `NAME: type = value`, `NAME <- value`: the name and
+    /// where the value starts.
+    fn assignment(&self, index: usize) -> Option<(&str, usize)> {
+        let Tok::Ident(name) = self.tokens.get(index)? else {
+            return None;
+        };
+        if let Some(Tok::Punct(
+            b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^'
+            | b':',
+        )) = index
+            .checked_sub(1)
+            .and_then(|before| self.tokens.get(before))
+        {
+            return None;
+        }
+
+        let punct = |offset: usize| match self.tokens.get(index + offset) {
+            Some(Tok::Punct(byte)) => Some(*byte),
+            _ => None,
+        };
+        let start = match (punct(1), punct(2)) {
+            // `==` compares
+            (Some(b'='), Some(b'=')) => return None,
+            (Some(b'='), _) => index + 2,
+            // `<-`
+            (Some(b'<'), Some(b'-')) => index + 3,
+            // `NAME: type = value`
+            (Some(b':'), _)
+                if matches!(self.tokens.get(index + 2), Some(Tok::Ident(_)))
+                    && punct(3) == Some(b'=')
+                    && punct(4) != Some(b'=') =>
+            {
+                index + 4
+            }
+            _ => return None,
+        };
+
+        Some((key(name), start))
+    }
+
+    /// Every path the script builds out of more than one piece, and every string
+    /// with a name of the script's inside it.
+    fn built(&self) -> Vec<String> {
+        let mut built: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for index in 0..self.tokens.len() {
+            match &self.tokens[index] {
+                Tok::Str(content) => {
+                    if let Some(substituted) = self.substituted(content)
+                        && seen.insert(substituted.clone())
+                    {
+                        built.push(substituted);
+                    }
+                    self.built_at(index, &mut built, &mut seen);
+                }
+                Tok::Ident(_) => self.built_at(index, &mut built, &mut seen),
+                Tok::Punct(_) => {}
+            }
+        }
+
+        built
+    }
+
+    fn built_at(&self, index: usize, built: &mut Vec<String>, seen: &mut HashSet<String>) {
+        if let Some(folded) = self.expr(index, 0)
+            && folded.composite
+            && !folded.value.is_empty()
+            && seen.insert(folded.value.clone())
+        {
+            built.push(folded.value);
+        }
+    }
+
+    /// `a + b`, `a / b`, or a term.
+    fn expr(&self, start: usize, nesting: usize) -> Option<Folded> {
+        let mut folded = self.term(start, nesting)?;
+
+        for _ in 0..MAX_TERMS {
+            let slash = match self.tokens.get(folded.next) {
+                Some(Tok::Punct(b'+')) => false,
+                Some(Tok::Punct(b'/')) => true,
+                _ => break,
+            };
+            let Some(right) = self.term(folded.next + 1, nesting) else {
+                // `base + name`: what comes after the operator is not known
+                folded.complete = false;
+                break;
+            };
+
+            folded.value = if slash {
+                join_two(&folded.value, &right.value)
+            } else {
+                folded.value + &right.value
+            };
+            folded.next = right.next;
+            folded.composite = true;
+            folded.complete &= right.complete;
+        }
+
+        Some(folded)
+    }
+
+    fn term(&self, index: usize, nesting: usize) -> Option<Folded> {
+        match self.tokens.get(index)? {
+            Tok::Str(content) => Some(Folded {
+                value: self.substituted(content).unwrap_or_else(|| content.clone()),
+                next: index + 1,
+                composite: false,
+                complete: true,
+            }),
+            Tok::Ident(name) => {
+                if nesting < MAX_NESTING
+                    && let Some(call) = self.call(index, nesting + 1)
+                {
+                    return Some(call);
+                }
+                self.constants.get(key(name)).map(|value| Folded {
+                    value: value.clone(),
+                    next: index + 1,
+                    composite: false,
+                    complete: true,
+                })
+            }
+            Tok::Punct(_) => None,
+        }
+    }
+
+    /// `os.path.join("a", b)`, `Path("a", "b") / "c"`, `File.join(...)`,
+    /// `file.path(...)`: the pieces of the call that veil can work out, joined.
+    /// A piece it cannot work out (a variable that is not a literal, the
+    /// directory of the script) is left out.
+    fn call(&self, start: usize, nesting: usize) -> Option<Folded> {
+        let mut names: Vec<&str> = Vec::new();
+        let mut last = start;
+
+        loop {
+            let Tok::Ident(name) = self.tokens.get(last)? else {
+                return None;
+            };
+            names.push(name);
+            if self.tokens.get(last + 1) == Some(&Tok::Punct(b'.'))
+                && matches!(self.tokens.get(last + 2), Some(Tok::Ident(_)))
+            {
+                last += 2;
+            } else {
+                break;
+            }
+        }
+        if self.tokens.get(last + 1) != Some(&Tok::Punct(b'(')) || !builds_paths(&names) {
+            return None;
+        }
+
+        let mut pieces: Vec<String> = Vec::new();
+        let mut complete = true;
+        let mut index = last + 2;
+
+        for _ in 0..MAX_ARGUMENTS {
+            match self.expr(index, nesting) {
+                Some(folded) => {
+                    complete &= folded.complete;
+                    pieces.push(folded.value);
+                    index = folded.next;
+                }
+                None => {
+                    complete = false;
+                    index = self.skip_argument(index);
+                }
+            }
+            match self.tokens.get(index) {
+                Some(Tok::Punct(b',')) => index += 1,
+                Some(Tok::Punct(b')')) => {
+                    index += 1;
+                    break;
+                }
+                // not a call veil follows to its end
+                _ => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if pieces.is_empty() {
+            return None;
+        }
+
+        let mut value = pieces
+            .iter()
+            .fold(String::new(), |joined, piece| join_two(&joined, piece));
+
+        // `Path("data") / "clients" / "a.csv"`
+        for _ in 0..MAX_TERMS {
+            if self.tokens.get(index) != Some(&Tok::Punct(b'/')) {
+                break;
+            }
+            let Some(right) = self.term(index + 1, nesting) else {
+                complete = false;
+                break;
+            };
+            value = join_two(&value, &right.value);
+            index = right.next;
+            complete &= right.complete;
+        }
+
+        Some(Folded {
+            value,
+            next: index,
+            composite: true,
+            complete,
+        })
+    }
+
+    /// The end of an argument veil cannot work out: the next `,` or `)` that is
+    /// not inside brackets of its own. An argument longer than [`MAX_SKIP`]
+    /// tokens ends where veil stops looking, which is neither of those: the call
+    /// is then not one veil follows to its end.
+    fn skip_argument(&self, start: usize) -> usize {
+        let mut depth = 0usize;
+        let mut index = start;
+
+        while let Some(token) = self.tokens.get(index) {
+            if index - start >= MAX_SKIP {
+                return index;
+            }
+            match token {
+                Tok::Punct(b'(' | b'[' | b'{') => depth += 1,
+                Tok::Punct(b')' | b']' | b'}') => {
+                    if depth == 0 {
+                        return index;
+                    }
+                    depth -= 1;
+                }
+                Tok::Punct(b',') if depth == 0 => return index,
+                _ => {}
+            }
+            index += 1;
+        }
+
+        index
+    }
+
+    /// A string with a name of the script's inside it (`f"{BASE}/a.csv"`,
+    /// `` `${BASE}/a.csv` ``, `"#{BASE}/a.csv"`), with the value put in.
+    fn substituted(&self, text: &str) -> Option<String> {
+        if !text.contains('{') {
+            return None;
+        }
+
+        let mut result = String::new();
+        let mut rest = text;
+        let mut changed = false;
+
+        while let Some(open) = rest.find('{') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('}') else {
+                break;
+            };
+            let name = &after[..close];
+            let value = if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                None
+            } else {
+                self.constants.get(key(name))
+            };
+
+            match value {
+                Some(value) => {
+                    let head = &rest[..open];
+                    result.push_str(head.strip_suffix(['$', '#']).unwrap_or(head));
+                    result.push_str(value);
+                    changed = true;
+                }
+                None => result.push_str(&rest[..open + close + 2]),
+            }
+            rest = &after[close + 1..];
+        }
+        result.push_str(rest);
+
+        changed.then_some(result)
+    }
+}
+
+/// A name without the sigil a language puts in front of it.
+fn key(name: &str) -> &str {
+    name.trim_start_matches('$')
+}
+
+/// The calls that join path pieces: Python's `os.path.join`, `Path(...)` and
+/// `.joinpath`, Node's `path.join` and `path.resolve`, Ruby's `File.join`, R's
+/// `file.path`, Java's `Paths.get`.
+fn builds_paths(names: &[&str]) -> bool {
+    let Some((last, before)) = names.split_last() else {
+        return false;
+    };
+
+    match *last {
+        "join" | "joinpath" | "Path" | "PurePath" | "PurePosixPath" | "resolve" => true,
+        "get" => before.last() == Some(&"Paths"),
+        "path" => before.last() == Some(&"file"),
+        _ => false,
+    }
+}
+
+/// `join("a/", "b")` and `join("a", "b")` are `a/b`; an absolute piece starts
+/// again, as it does in `os.path.join`.
+fn join_two(left: &str, right: &str) -> String {
+    if left.is_empty() || right.starts_with('/') {
+        right.to_owned()
+    } else if right.is_empty() {
+        left.to_owned()
+    } else if left.ends_with('/') {
+        format!("{left}{right}")
+    } else {
+        format!("{left}/{right}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn argv(command: &str) -> Vec<String> {
+        command.split_whitespace().map(str::to_owned).collect()
+    }
+
+    /// The script file named, or `None` when the code is not in a named file.
+    fn operand(kind: InterpreterKind, name: &str, command: &str) -> Option<String> {
+        match script_operand(kind, name, &argv(command)) {
+            Operand::File(file) => Some(file.to_owned()),
+            Operand::Inline | Operand::Stdin => None,
+        }
+    }
+
+    fn texts(kind: InterpreterKind, script: &str) -> Vec<String> {
+        words(kind, script)
+            .into_iter()
+            .map(|word| word.text)
+            .collect()
+    }
+
+    fn built(script: &str) -> Vec<String> {
+        let tokens = lex(InterpreterKind::Python, script);
+        Folder::new(&tokens).built()
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "veil-script-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        fs::canonicalize(&dir).expect("temp dir should canonicalize")
+    }
+
+    #[test]
+    fn the_script_is_the_first_word_that_is_not_an_option_or_its_value() {
+        use InterpreterKind::*;
+
+        assert_eq!(
+            operand(Python, "python3", "read.py"),
+            Some("read.py".into())
+        );
+        assert_eq!(
+            operand(Python, "python3", "-W ignore -u read.py data.csv"),
+            Some("read.py".into())
+        );
+        assert_eq!(
+            operand(Python, "python3", "-Wignore -B read.py"),
+            Some("read.py".into())
+        );
+        assert_eq!(
+            operand(Python, "python3", "-- read.py"),
+            Some("read.py".into())
+        );
+        assert_eq!(
+            operand(Node, "node", "--require ./hook.js --no-warnings run.js"),
+            Some("run.js".into())
+        );
+        assert_eq!(
+            operand(Ruby, "ruby", "-I lib -w run.rb"),
+            Some("run.rb".into())
+        );
+        assert_eq!(
+            operand(Perl, "perl", "-I lib -w run.pl"),
+            Some("run.pl".into())
+        );
+        assert_eq!(
+            operand(R, "Rscript", "--vanilla run.R"),
+            Some("run.R".into())
+        );
+        assert_eq!(
+            operand(Shell, "bash", "-e -o pipefail run.sh x"),
+            Some("run.sh".into())
+        );
+    }
+
+    #[test]
+    fn code_that_is_not_in_a_file_names_no_script() {
+        use InterpreterKind::*;
+
+        assert_eq!(operand(Python, "python3", "-c print(1) read.py"), None);
+        assert_eq!(operand(Python, "python3", "-cprint(1)"), None);
+        assert_eq!(operand(Python, "python3", "-m http.server"), None);
+        assert_eq!(operand(Python, "python3", "-"), None);
+        assert_eq!(operand(Node, "node", "-e code run.js"), None);
+        assert_eq!(operand(Node, "node", "--eval code"), None);
+        assert_eq!(operand(Ruby, "ruby", "-e code"), None);
+        assert_eq!(operand(Perl, "perl", "-e code"), None);
+        assert_eq!(operand(R, "Rscript", "-e code"), None);
+        assert_eq!(operand(Shell, "bash", "-c code run.sh"), None);
+        assert_eq!(operand(Shell, "bash", "-s"), None);
+    }
+
+    #[test]
+    fn code_on_standard_input_is_told_apart_from_code_in_the_command() {
+        let kind =
+            |kind, name: &str, command: &str| match script_operand(kind, name, &argv(command)) {
+                Operand::File(file) => format!("file {file}"),
+                Operand::Inline => "inline".to_owned(),
+                Operand::Stdin => "stdin".to_owned(),
+            };
+
+        assert_eq!(kind(InterpreterKind::Python, "python3", ""), "stdin");
+        assert_eq!(kind(InterpreterKind::Python, "python3", "-u"), "stdin");
+        assert_eq!(kind(InterpreterKind::Python, "python3", "-"), "stdin");
+        assert_eq!(kind(InterpreterKind::Shell, "bash", "-s"), "stdin");
+        assert_eq!(kind(InterpreterKind::Shell, "bash", "-e"), "stdin");
+        assert_eq!(kind(InterpreterKind::Python, "python3", "-c x"), "inline");
+        assert_eq!(
+            kind(InterpreterKind::Python, "python3", "read.py"),
+            "file read.py"
+        );
+    }
+
+    #[test]
+    fn a_script_that_cannot_be_named_is_not_read() {
+        use InterpreterKind::*;
+
+        assert_eq!(operand(Python, "python3", "$script"), None);
+        assert_eq!(operand(Python, "python3", "scripts/*.py"), None);
+        assert_eq!(operand(Python, "python3", "-W"), None);
+    }
+
+    #[test]
+    fn bun_and_deno_run_their_script_after_a_subcommand() {
+        use InterpreterKind::*;
+
+        assert_eq!(operand(Node, "bun", "run x.ts"), Some("x.ts".into()));
+        assert_eq!(operand(Node, "bun", "x.ts"), Some("x.ts".into()));
+        assert_eq!(operand(Node, "bun", "-e code"), None);
+        assert_eq!(
+            operand(Node, "deno", "run --allow-read --config c.json x.ts"),
+            Some("x.ts".into())
+        );
+        assert_eq!(operand(Node, "deno", "eval code"), None);
+        assert_eq!(operand(Node, "deno", "task start"), None);
+    }
+
+    #[test]
+    fn versioned_interpreters_are_the_interpreter() {
+        assert_eq!(
+            interpreter_kind("python3.12"),
+            Some(InterpreterKind::Python)
+        );
+        assert_eq!(interpreter_kind("python3"), Some(InterpreterKind::Python));
+        assert_eq!(interpreter_kind("ruby3.2"), Some(InterpreterKind::Ruby));
+        assert_eq!(interpreter_kind("perl5.38.0"), Some(InterpreterKind::Perl));
+        assert_eq!(interpreter_kind("Rscript"), Some(InterpreterKind::R));
+        assert_eq!(interpreter_kind("bun"), Some(InterpreterKind::Node));
+        assert_eq!(interpreter_kind("pythonista"), None);
+        assert_eq!(interpreter_kind("perlbrew"), None);
+        assert_eq!(interpreter_kind("python3-config"), None);
+    }
+
+    #[test]
+    fn a_first_line_names_the_interpreter_of_a_file_run_by_name() {
+        let dir = temp_dir("shebang");
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            fs::write(&path, text).expect("script should be written");
+            path
+        };
+
+        assert_eq!(
+            shebang_kind(&write("a", "#!/usr/bin/env python3\nprint(1)\n")),
+            Some(InterpreterKind::Python)
+        );
+        assert_eq!(
+            shebang_kind(&write("b", "#!/usr/bin/env -S node --no-warnings\n")),
+            Some(InterpreterKind::Node)
+        );
+        assert_eq!(
+            shebang_kind(&write("c", "#!/usr/bin/env FOO=1 ruby\n")),
+            Some(InterpreterKind::Ruby)
+        );
+        assert_eq!(
+            shebang_kind(&write("d", "#!/bin/bash -e\necho hi\n")),
+            Some(InterpreterKind::Shell)
+        );
+        assert_eq!(shebang_kind(&write("e", "#!/usr/bin/awk -f\n")), None);
+        assert_eq!(shebang_kind(&write("f", "print(1)\n")), None);
+        assert_eq!(shebang_kind(&dir), None);
+        assert_eq!(shebang_kind(&dir.join("missing")), None);
+    }
+
+    #[test]
+    fn paths_built_from_literals_are_worked_out() {
+        let python = |script: &str| built(script);
+
+        assert!(
+            python(r#"p = os.path.join("data", "clients", "a.csv")"#)
+                .contains(&"data/clients/a.csv".to_owned())
+        );
+        assert!(
+            python(
+                r#"BASE = "data/clients"
+f = os.path.join(BASE, "a.csv")"#
+            )
+            .contains(&"data/clients/a.csv".to_owned())
+        );
+        assert!(
+            python(r#"p = Path("data") / "clients" / "a.csv""#)
+                .contains(&"data/clients/a.csv".to_owned())
+        );
+        assert!(
+            python(r#"p = Path("data", "clients", "a.csv")"#)
+                .contains(&"data/clients/a.csv".to_owned())
+        );
+        assert!(
+            python(
+                r#"BASE = "data/clients/"
+p = BASE + "a.csv""#
+            )
+            .contains(&"data/clients/a.csv".to_owned())
+        );
+        assert!(
+            python(
+                r#"BASE = "data/clients"
+p = f"{BASE}/a.csv""#
+            )
+            .contains(&"data/clients/a.csv".to_owned())
+        );
+        // a name built from a name that was built
+        assert!(
+            python(
+                r#"A = "data"
+B = os.path.join(A, "clients")
+p = os.path.join(B, "a.csv")"#
+            )
+            .contains(&"data/clients/a.csv".to_owned())
+        );
+        // an annotated assignment
+        assert!(
+            python(
+                r#"BASE: str = "data/clients"
+p = os.path.join(BASE, "a.csv")"#
+            )
+            .contains(&"data/clients/a.csv".to_owned())
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_worked_out_is_left_out_not_guessed() {
+        // the script's own directory is unknown: the pieces after it are kept
+        let node = lex(
+            InterpreterKind::Node,
+            r#"path.join(__dirname, "data", "clients", "a.csv")"#,
+        );
+        assert!(
+            Folder::new(&node)
+                .built()
+                .contains(&"data/clients/a.csv".to_owned())
+        );
+
+        let python = |script: &str| built(script);
+        assert!(
+            python(r#"p = os.path.join(base_dir, "data", user_id)"#).contains(&"data".to_owned())
+                || python(r#"p = os.path.join(base_dir, "data", user_id)"#).is_empty()
+        );
+        // `==` compares; it does not assign
+        assert!(
+            !python(
+                r#"if mode == "data/clients":
+    p = os.path.join(mode, "a.csv")"#
+            )
+            .contains(&"data/clients/a.csv".to_owned())
+        );
+        // an absolute piece starts again
+        assert!(
+            python(r#"p = os.path.join("tmp", "/data/clients", "a.csv")"#)
+                .contains(&"/data/clients/a.csv".to_owned())
+        );
+        // a call that is not a path join builds nothing
+        assert!(python(r#"p = str("data", "clients")"#).is_empty());
+    }
+
+    #[test]
+    fn the_other_languages_build_paths_their_own_way() {
+        let node = lex(
+            InterpreterKind::Node,
+            "const b = 'data';\nconst p = path.join(b, 'clients', 'a.csv');\nconst t = `${b}/clients/a.csv`;",
+        );
+        let built = Folder::new(&node).built();
+        assert!(
+            built.contains(&"data/clients/a.csv".to_owned()),
+            "{built:?}"
+        );
+
+        let ruby = lex(
+            InterpreterKind::Ruby,
+            "base = 'data'\np = File.join(base, 'clients', 'a.csv')\nq = \"#{base}/clients/a.csv\"",
+        );
+        let built = Folder::new(&ruby).built();
+        assert!(
+            built.contains(&"data/clients/a.csv".to_owned()),
+            "{built:?}"
+        );
+
+        let r = lex(
+            InterpreterKind::R,
+            "base <- 'data'\np <- file.path(base, 'clients', 'a.csv')",
+        );
+        let built = Folder::new(&r).built();
+        assert!(
+            built.contains(&"data/clients/a.csv".to_owned()),
+            "{built:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_built_to_make_the_builder_slow_is_still_read_in_linear_time() {
+        // Without a bound on the work at each token, `join(` repeated makes
+        // every token scan the rest of the file.
+        let nested = "os.path.join(".repeat(20_000);
+        let unclosed = format!("{nested}\nx = open('data/clients/a.csv')\n");
+        let commas = format!("os.path.join({})\n", "a, ".repeat(40_000));
+        let brackets = format!("p = join({}", "[".repeat(40_000));
+
+        let started = std::time::Instant::now();
+        for script in [&unclosed, &commas, &brackets] {
+            let words = texts(InterpreterKind::Python, script);
+            let tokens = lex(InterpreterKind::Python, script);
+            let built = Folder::new(&tokens).built();
+            assert!(built.len() < 1000, "{}", built.len());
+            // the literal after all that is still a word
+            if script == &unclosed {
+                assert!(words.contains(&"data/clients/a.csv".to_owned()));
+            }
+        }
+        assert!(
+            started.elapsed().as_secs() < 20,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_comment_is_not_code_for_the_builder_but_its_paths_are_still_words() {
+        let tokens = lex(
+            InterpreterKind::Python,
+            "# p = os.path.join('data', 'clients', 'a.csv')\nx = 1\n",
+        );
+        assert!(Folder::new(&tokens).built().is_empty());
+
+        // the plain text of a comment is judged like any other word
+        let words = texts(
+            InterpreterKind::Python,
+            "# reads data/clients/a.csv\nx = 1\n",
+        );
+        assert!(
+            words.contains(&"data/clients/a.csv".to_owned()),
+            "{words:?}"
+        );
+
+        let node = lex(
+            InterpreterKind::Node,
+            "// p = path.join('data', 'clients')\n/* path.join('a', 'b') */\n",
+        );
+        assert!(Folder::new(&node).built().is_empty());
+    }
+
+    #[test]
+    fn words_that_could_name_a_path_are_found_wherever_they_are() {
+        let words = texts(
+            InterpreterKind::Python,
+            "import os\nx = open('data/clients/a.csv')\ny = ['data/b.csv', \"c.json\"]\nprint(f'{x}')\n",
+        );
+
+        assert!(
+            words.contains(&"data/clients/a.csv".to_owned()),
+            "{words:?}"
+        );
+        assert!(words.contains(&"data/b.csv".to_owned()), "{words:?}");
+        assert!(words.contains(&"c.json".to_owned()), "{words:?}");
+        // no slash and no extension: not a path word unless it is a quoted name
+        assert!(!words.contains(&"import".to_owned()), "{words:?}");
+        assert!(!words.contains(&"print".to_owned()), "{words:?}");
+    }
+
+    #[test]
+    fn a_quoted_name_and_a_dotfile_are_path_words_but_a_number_or_a_sentence_is_not() {
+        let words = texts(
+            InterpreterKind::Python,
+            "a = open('credentials')\nb = '.env'\nc = 'hello world'\nd = '42'\ne = 'utf-8'\n",
+        );
+
+        assert!(words.contains(&"credentials".to_owned()), "{words:?}");
+        assert!(words.contains(&".env".to_owned()), "{words:?}");
+        assert!(!words.contains(&"hello world".to_owned()), "{words:?}");
+        assert!(!words.contains(&"42".to_owned()), "{words:?}");
+    }
+
+    #[test]
+    fn a_quoted_path_with_spaces_is_one_word() {
+        let words = texts(InterpreterKind::Python, "x = open('data/q3 clients.csv')\n");
+
+        assert!(
+            words.contains(&"data/q3 clients.csv".to_owned()),
+            "{words:?}"
+        );
+    }
+
+    #[test]
+    fn a_word_with_a_variable_in_it_is_not_a_path() {
+        let words = texts(InterpreterKind::Python, "x = '$HOME/data/a.csv'\n");
+
+        assert!(words.is_empty(), "{words:?}");
+    }
+
+    #[test]
+    fn a_stray_quote_does_not_swallow_the_rest_of_the_file() {
+        // the apostrophe in the comment opens a string that never ends on its line
+        let words = texts(
+            InterpreterKind::Python,
+            "# it's here\nx = open('data/clients/a.csv')\n",
+        );
+
+        assert!(
+            words.contains(&"data/clients/a.csv".to_owned()),
+            "{words:?}"
+        );
+    }
+
+    #[test]
+    fn padding_does_not_push_a_word_past_the_budget() {
+        let dir = temp_dir("padding");
+        let mut script = String::new();
+        for index in 0..2000 {
+            script.push_str(&format!("x{index} = 'decoy/{index}.txt'\n"));
+        }
+        script.push_str("y = open('data/clients/a.csv')\n");
+
+        let paths = path_words(InterpreterKind::Python, &script, &[], &dir);
+        let wanted = dir.join("data/clients/a.csv");
+
+        assert!(
+            paths.iter().any(|found| found.path == wanted),
+            "the last word is still named"
+        );
+        assert!(
+            paths.iter().filter(|found| found.resolved).count() <= FILESYSTEM_BUDGET,
+            "only the budget is checked against the filesystem"
+        );
+    }
+
+    #[test]
+    fn a_script_larger_than_the_limit_is_not_read_and_says_why() {
+        let dir = temp_dir("large");
+        let big = dir.join("big.py");
+        fs::write(&big, "x = 1\n".repeat((SCRIPT_LIMIT as usize / 6) + 10)).expect("big script");
+        let small = dir.join("small.py");
+        fs::write(&small, "x = 1\n").expect("small script");
+
+        let mut scripts = Scripts::default();
+        let unread = match read_script(&big, InterpreterKind::Python, 0, &mut scripts).1 {
+            Contents::Unread(why) => Some(why),
+            Contents::Text(_) | Contents::Nothing => None,
+        };
+        assert!(
+            unread.as_deref().is_some_and(|why| why.contains("bytes")),
+            "a script over the limit is not read, and says why: {unread:?}"
+        );
+        assert!(matches!(
+            read_script(&small, InterpreterKind::Python, 0, &mut scripts).1,
+            Contents::Text(_)
+        ));
+        assert!(matches!(
+            read_script(
+                &dir.join("missing.py"),
+                InterpreterKind::Python,
+                0,
+                &mut scripts
+            )
+            .1,
+            Contents::Nothing
+        ));
+        assert!(matches!(
+            read_script(&dir, InterpreterKind::Ruby, 0, &mut scripts).1,
+            Contents::Nothing
+        ));
+    }
+
+    #[test]
+    fn a_python_directory_runs_its_main_module() {
+        let dir = temp_dir("pkg");
+        fs::create_dir_all(dir.join("pkg")).expect("package dir");
+        fs::write(dir.join("pkg/__main__.py"), "x = open('a.csv')\n").expect("main module");
+
+        let mut scripts = Scripts::default();
+        let (path, contents) =
+            read_script(&dir.join("pkg"), InterpreterKind::Python, 0, &mut scripts);
+
+        assert_eq!(path, dir.join("pkg/__main__.py"));
+        assert!(matches!(contents, Contents::Text(_)));
+    }
+
+    #[test]
+    fn scripts_that_run_scripts_are_followed_only_so_deep_and_so_many() {
+        let dir = temp_dir("budget");
+        let file = dir.join("s.py");
+        fs::write(&file, "x = 1\n").expect("script");
+
+        let mut scripts = Scripts::default();
+        assert!(matches!(
+            read_script(&file, InterpreterKind::Python, MAX_DEPTH, &mut scripts).1,
+            Contents::Unread(_)
+        ));
+
+        let mut scripts = Scripts::default();
+        for _ in 0..MAX_SCRIPTS {
+            assert!(matches!(
+                read_script(&file, InterpreterKind::Python, 0, &mut scripts).1,
+                Contents::Text(_)
+            ));
+        }
+        assert!(matches!(
+            read_script(&file, InterpreterKind::Python, 0, &mut scripts).1,
+            Contents::Unread(_)
+        ));
+    }
+
+    #[test]
+    fn a_shell_script_is_run_as_the_commands_it_holds_and_the_scripts_they_run() {
+        let dir = temp_dir("shell");
+        fs::write(dir.join("inner.py"), "x = open('data/clients/a.csv')\n").expect("inner");
+        fs::write(
+            dir.join("outer.sh"),
+            "#!/bin/sh\nset -e\ncat data/b.csv\npython3 inner.py \"$1\"\n",
+        )
+        .expect("outer");
+
+        let env = ShellEnv {
+            cwd: Some(dir.clone()),
+            home: None,
+        };
+        let simple = decompose_in("bash outer.sh x", &env);
+        let mut out = Vec::new();
+        let mut scripts = Scripts::default();
+        for command in &simple {
+            inspect(command, &dir, &env, 0, &mut scripts, &mut out);
+        }
+
+        let names: Vec<_> = out
+            .iter()
+            .map(|command| {
+                (
+                    command.argv.first().cloned().unwrap_or_default(),
+                    command.script.as_ref().map(|source| source.name.clone()),
+                )
+            })
+            .collect();
+        assert!(out.iter().all(|command| command.origin == Origin::Script));
+        assert!(
+            names.contains(&("cat".to_owned(), Some("outer.sh".to_owned()))),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&("python3".to_owned(), Some("outer.sh".to_owned()))),
+            "{names:?}"
+        );
+        // the script `outer.sh` runs is read too, and named as the script it is
+        assert!(
+            names.contains(&("python3".to_owned(), Some("inner.py".to_owned()))),
+            "{names:?}"
+        );
+        let inner = out
+            .iter()
+            .find(|command| {
+                command
+                    .script
+                    .as_ref()
+                    .is_some_and(|source| source.name == "inner.py")
+            })
+            .expect("inner.py is read");
+        // `open(...)` is a read veil recognises, so the file is a direct read and
+        // not repeated among the words
+        assert!(inner.candidates.contains(&dir.join("data/clients/a.csv")));
+        assert!(
+            !inner
+                .argv_paths
+                .iter()
+                .any(|found| found.path == dir.join("data/clients/a.csv"))
+        );
+        // `$1` is a word veil cannot resolve; it is not an argument to judge
+        assert!(out.iter().all(|command| command.unresolved.is_empty()));
+    }
+
+    #[test]
+    fn an_unreadable_shell_script_is_skipped_not_judged_opaque() {
+        let dir = temp_dir("opaque");
+        fs::write(
+            dir.join("broken.sh"),
+            "echo 'unterminated\ncat data/a.csv\n",
+        )
+        .expect("broken");
+
+        let env = ShellEnv {
+            cwd: Some(dir.clone()),
+            home: None,
+        };
+        let simple = decompose_in("bash broken.sh", &env);
+        let mut out = Vec::new();
+        let mut scripts = Scripts::default();
+        for command in &simple {
+            inspect(command, &dir, &env, 0, &mut scripts, &mut out);
+        }
+
+        assert!(out.iter().all(|command| !command.opaque));
+    }
+
+    #[test]
+    fn a_wrapper_hands_the_file_it_runs_to_the_interpreter_its_extension_names() {
+        let dir = temp_dir("wrapper");
+        fs::write(dir.join("read.py"), "x = open('data/clients/a.csv')\n").expect("script");
+        fs::write(dir.join("read.ts"), "const t = 'data/clients/a.csv';\n").expect("script");
+        fs::write(dir.join("notes.txt"), "data/clients/a.csv\n").expect("text");
+
+        let env = ShellEnv {
+            cwd: Some(dir.clone()),
+            home: None,
+        };
+        let read = |command: &str| {
+            let mut out = Vec::new();
+            let mut scripts = Scripts::default();
+            for found in &decompose_in(command, &env) {
+                inspect(found, &dir, &env, 0, &mut scripts, &mut out);
+            }
+            out.iter()
+                .filter_map(|command| command.script.as_ref().map(|source| source.name.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(read("uv run read.py"), ["read.py"]);
+        assert_eq!(read("deno run --allow-read read.ts"), ["read.ts"]);
+        assert_eq!(read("env FOO=1 read.py"), ["read.py"]);
+        // a file typed as the command, with no wrapper, is not run by an interpreter
+        assert!(read("read.py").is_empty());
+        // an extension that no interpreter claims
+        assert!(read("uv run notes.txt").is_empty());
+    }
+
+    #[test]
+    fn a_command_that_runs_no_script_adds_nothing() {
+        let dir = temp_dir("none");
+        let env = ShellEnv {
+            cwd: Some(dir.clone()),
+            home: None,
+        };
+
+        for command in [
+            "ls -l",
+            "cat x.csv",
+            "python3 -c 'print(1)'",
+            "python3 missing.py",
+            "git status",
+        ] {
+            let simple = decompose_in(command, &env);
+            let mut out = Vec::new();
+            let mut scripts = Scripts::default();
+            for found in &simple {
+                inspect(found, &dir, &env, 0, &mut scripts, &mut out);
+            }
+            assert!(out.is_empty(), "{command}");
+        }
+    }
+}

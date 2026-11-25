@@ -11,6 +11,7 @@ use crate::types::ToolKind;
 mod decompose;
 mod egress;
 mod expand;
+mod script;
 mod wrappers;
 
 pub use decompose::{
@@ -48,6 +49,7 @@ enum InterpreterKind {
     Node,
     Perl,
     Ruby,
+    R,
     Shell,
 }
 
@@ -130,6 +132,24 @@ pub struct CommandExtraction {
     /// `aws`, a mail client...). A protected path it names is an egress
     /// attempt, which the audit log records as such (bd-x8o).
     pub egress: bool,
+    /// The script file this command came from, when it is not one the person
+    /// typed: veil read a script an interpreter was asked to run and these are
+    /// the paths in it (bd-1bk).
+    pub script: Option<ScriptSource>,
+}
+
+/// A script file an interpreter runs, read by veil as the text it is (bd-1bk).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptSource {
+    /// As the command named it: `read.py`, `./tools/run.sh`.
+    pub name: String,
+    /// Where it is.
+    pub path: PathBuf,
+    /// The directory it runs in: where a relative path inside it resolves.
+    pub run_in: PathBuf,
+    /// Why veil did not read all of it, when it did not: it is larger than the
+    /// limit, or the command runs more scripts than veil follows.
+    pub unread: Option<String>,
 }
 
 /// A path a command names in its words. `resolved` says veil followed symlinks
@@ -163,6 +183,7 @@ impl CommandExtraction {
             dynamic_strict: false,
             assigned_paths: Vec::new(),
             egress: false,
+            script: None,
         }
     }
 
@@ -182,10 +203,18 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
         home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
     };
 
-    decompose_in(command, &env)
-        .iter()
-        .map(|simple| command_extraction(simple, simple.cwd.as_deref().unwrap_or(cwd)))
-        .collect()
+    let mut commands = Vec::new();
+    let mut scripts = script::Scripts::default();
+
+    for simple in decompose_in(command, &env) {
+        let cwd = simple.cwd.as_deref().unwrap_or(cwd);
+
+        commands.push(command_extraction(&simple, cwd));
+        // An interpreter run on a script file: what is in the file is read too.
+        script::inspect(&simple, cwd, &env, 0, &mut scripts, &mut commands);
+    }
+
+    commands
 }
 
 fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction {
@@ -208,6 +237,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             dynamic_strict: true,
             assigned_paths,
             egress: false,
+            script: None,
         };
     };
 
@@ -279,6 +309,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         dynamic_strict: is_dynamic_strict(program) || command.cwd_unresolved,
         assigned_paths,
         egress: egress::is_egress(program, args),
+        script: None,
     }
 }
 
@@ -791,6 +822,7 @@ fn heredoc_script_paths(program: &str, body: &str) -> Vec<String> {
         Some(InterpreterKind::Node) => extract_node_script_paths(body),
         Some(InterpreterKind::Perl) => extract_perl_script_paths(body),
         Some(InterpreterKind::Ruby) => extract_ruby_script_paths(body),
+        Some(InterpreterKind::R) => extract_r_script_paths(body),
         Some(InterpreterKind::Shell) | None => Vec::new(),
     }
 }
@@ -1468,7 +1500,10 @@ fn collect_inline_interpreter_paths(program: &str, args: &[String]) -> Vec<Strin
 
     let script_flag = match kind {
         InterpreterKind::Python => "-c",
-        InterpreterKind::Node | InterpreterKind::Perl | InterpreterKind::Ruby => "-e",
+        InterpreterKind::Node
+        | InterpreterKind::Perl
+        | InterpreterKind::Ruby
+        | InterpreterKind::R => "-e",
         InterpreterKind::Shell => return Vec::new(),
     };
 
@@ -1489,14 +1524,30 @@ fn collect_inline_interpreter_paths(program: &str, args: &[String]) -> Vec<Strin
 }
 
 fn interpreter_kind(program: &str) -> Option<InterpreterKind> {
-    match program {
+    match versionless(program) {
         "python" | "python3" => Some(InterpreterKind::Python),
-        "node" | "nodejs" => Some(InterpreterKind::Node),
+        "node" | "nodejs" | "bun" | "deno" => Some(InterpreterKind::Node),
         "perl" => Some(InterpreterKind::Perl),
         "ruby" => Some(InterpreterKind::Ruby),
+        "Rscript" => Some(InterpreterKind::R),
         "bash" | "sh" | "zsh" => Some(InterpreterKind::Shell),
         _ => None,
     }
+}
+
+/// `python3.12` is `python3`, `ruby3.2` is `ruby`: the versioned names an
+/// interpreter is installed under run the same scripts.
+fn versionless(program: &str) -> &str {
+    for family in ["python3", "python", "ruby", "perl"] {
+        if let Some(version) = program.strip_prefix(family)
+            && !version.is_empty()
+            && version.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        {
+            return family;
+        }
+    }
+
+    program
 }
 
 fn extract_interpreter_script_paths(kind: InterpreterKind, script: &str) -> Vec<String> {
@@ -1505,6 +1556,7 @@ fn extract_interpreter_script_paths(kind: InterpreterKind, script: &str) -> Vec<
         InterpreterKind::Node => extract_node_script_paths(script),
         InterpreterKind::Perl => extract_perl_script_paths(script),
         InterpreterKind::Ruby => extract_ruby_script_paths(script),
+        InterpreterKind::R => extract_r_script_paths(script),
         InterpreterKind::Shell => Vec::new(),
     }
 }
@@ -1742,6 +1794,35 @@ fn extract_ruby_script_paths(script: &str) -> Vec<String> {
             .map(|(path, _)| path),
     );
     paths
+}
+
+/// R's readers: base, readr, data.table, readxl and arrow.
+const R_READ_CALLS: &[&str] = &[
+    "read.csv(",
+    "read.csv2(",
+    "read.table(",
+    "read.delim(",
+    "read.delim2(",
+    "readLines(",
+    "readRDS(",
+    "scan(",
+    "fread(",
+    "read_csv(",
+    "read_tsv(",
+    "read_delim(",
+    "read_excel(",
+    "read_parquet(",
+    "read_feather(",
+    "read_fwf(",
+    "load(",
+];
+
+fn extract_r_script_paths(script: &str) -> Vec<String> {
+    R_READ_CALLS
+        .iter()
+        .flat_map(|marker| quoted_literals_after_marker(script, marker))
+        .map(|(path, _)| path)
+        .collect()
 }
 
 fn quoted_literals_after_marker(script: &str, marker: &str) -> Vec<(String, usize)> {

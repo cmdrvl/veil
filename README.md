@@ -121,10 +121,11 @@ cat data/b.csv` still denies the `cat`.
 `find data -exec cat {} \;` is treated as a content read of `data`, because the
 files `{}` stands for are unknown; `-name`, `-type` and `-prune` filters are not
 honored, so it is denied if `data` holds anything protected. What veil does not
-follow: a script piped into a shell (`echo '...' | sh`), `source`, a `cd` earlier
-in the line (paths resolve against the directory the hook started in), and
-programs that run a command but are not in the list above (`docker exec`, `ssh
-host cmd`, `git grep`). Those are allowed today. Variables, `$( )` results, what
+follow: a script piped into a shell (`echo '...' | sh`), a `cd` earlier in the
+line (paths resolve against the directory the hook started in), and programs
+that run a command but are not in the list above (`docker exec`, `ssh host
+cmd`, `git grep`). Those are allowed today. A script file an interpreter is
+asked to run is read; see [Script Files](#script-files). Variables, `$( )` results, what
 `xargs` reads, command text veil cannot parse and anything past the 64th command
 of one line or the 8th level of nesting are the dynamic-argument stance's; see
 [Dynamic Arguments](#dynamic-arguments).
@@ -161,7 +162,9 @@ Denials say which command named the path and carry the label
 Read or Grep call or a command veil recognises as a reader, `argv_path` for a
 path named by any other command, `dynamic_path_unresolvable` for an argument veil
 could not resolve to a path, `mcp_argument` for a path in the arguments of an MCP
-tool call. A word that is not protected writes no record.
+tool call, `script_too_large_to_inspect` for a script file veil was asked to run
+and did not read (see [Script Files](#script-files)). A word that is not
+protected writes no record.
 
 A command that sends what it is given somewhere else is the **egress class**:
 `curl`, `wget`, `scp`, `rsync`, `sftp`, `ftp`, `lftp`, `rclone`, `aws`, `gsutil`,
@@ -172,8 +175,9 @@ the machine and that a copy, archive or encoding of it changes nothing, and the
 audit record carries `class: egress` as well as its `reason_class`.
 `veil audit --class egress` lists those attempts, newest last; it answers "did
 anything try to leave". `--class` also takes a `reason_class` (`direct_read`,
-`argv_path`, `dynamic_path_unresolvable`, `mcp_argument`), and an unknown class
-is an error, not an empty list.
+`argv_path`, `dynamic_path_unresolvable`, `mcp_argument`,
+`script_too_large_to_inspect`), and an unknown class is an error, not an empty
+list.
 
 veil also finds the file when the command hides it inside a longer word: curl's
 `-F name=@file;type=text/csv`, `--data-urlencode name@file`,
@@ -209,12 +213,74 @@ Limits to know about:
   followed, existence checked). A word with a slash or a data-file extension
   past the 64th is still compared with `[sensitivity] protected` as text, but a
   bare name or a symlink past it is not checked.
-- Not a path, so not checked: files a script opens on its own, and a path in a
+- Not a path, so not checked: files a script opens on its own where veil does
+  not read the script (see [Script Files](#script-files)), and a path in a
   quoted literal that holds more than the path (`"cat data/x.csv"`). What a
   shell expands (`cat $f`) and what `xargs` reads are covered by the
   dynamic-argument stance below.
 - A `cd` earlier in the line is not followed; paths resolve against the
   directory the hook started in.
+
+### Script Files
+
+`python3 -c "open('data/x.csv')"` names its path on the command line, so veil
+judges it. `python3 read.py` does not, so veil reads `read.py` and judges what is
+in it. A script operand is found for `python`, `node`, `nodejs`, `bun`, `deno`,
+`ruby`, `perl`, `Rscript`, `bash`, `sh` and `zsh` (also versioned, `python3.12`),
+for `source` and `.`, for a file run by name (`./tools/read.py`, when its first
+line names an interpreter), for a file the wrapper in `uv run read.py`,
+`poetry run`, `pdm run` or `deno run` runs, for a Python directory (its
+`__main__.py`) and for a script on standard input from a file (`python3 <
+read.py`). Options before the script (`python3 -W ignore -u read.py`) are
+skipped. The file is judged under the working directory the command runs in.
+
+What is judged depends on the language:
+
+- Python, JavaScript and TypeScript, Ruby, Perl and R: the file opens and reads
+  veil recognises are judged like the same code given to `-c` or `-e`, and every
+  quoted word that looks like a path is judged like a word on a command line. A
+  path the script builds from literals is worked out: `os.path.join("data",
+  "clients", "x.csv")`, `Path("data") / "clients"`, `BASE + "x.csv"`,
+  `f"{BASE}/x.csv"` and `` `${BASE}/x.csv` `` (with `BASE` assigned a literal
+  once), and the same for the Node `path.join`, Ruby `File.join` and R
+  `file.path` forms.
+- Shell scripts: the text is run back through the same steps as a Bash
+  command, so each command in it is judged, and a script it runs is read in
+  turn. A word a shell script expands (`"$1"`, `"$SRC"`) is not judged; the
+  caller's arguments are not known when the script is read.
+
+A denial names the script the path was found in, and an audit record for it has
+`origin: script`. A script that is itself under a protected path is denied for
+being named and is not read, so its contents do not reach a reason.
+
+veil reads scripts as text. That is best effort, and only an OS sandbox is
+airtight. It does not see:
+
+- a path built at run time: from the environment, a file, user input, a network
+  call or a module the script imports (imports are not followed);
+- a script that arrives through a pipe (`cat read.py | python3`), a module run
+  with `-m`, a zip, a `.pyc` or any binary;
+- a script written by an earlier command of the same line (it does not exist
+  when veil looks), or changed between the hook and the run;
+- a directory entry point other than a Python `__main__.py`.
+
+It also errs the other way. A path named in a comment or a docstring is judged
+like one in code, so `# was data/clients/x.csv` is denied.
+
+A script veil cannot read in full is not guessed at. The limits are 256 KiB for
+one script, 16 scripts, 1 MiB of script text and 3 levels of one script
+running another for one Bash call; the work done reading a script is bounded
+too. A script past a limit is judged like a recursive copy of the directory it
+runs in: if anything protected is within reach, it is denied with
+`reason_class: script_too_large_to_inspect`; if nothing is, it is allowed and
+the audit log records that it was not read. `veil audit --class
+script_too_large_to_inspect` lists them. Under `[policy] default = "warn"` or
+`"log"` a denial is an allow with its reason, as for every other class.
+
+Two costs follow. A bundled script over 256 KiB (a minified Node bundle, for
+instance) that runs from a directory holding a protected path is denied, and
+there is no setting for the limit yet. Split the script, move it out of reach of
+the protected path, or run the work through an authorized spine tool.
 
 ### MCP Tools
 

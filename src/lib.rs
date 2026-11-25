@@ -26,8 +26,8 @@ use evaluator::{
     DynamicReason, EvaluationInput, PolicyMatchers, dynamic_args_decision, evaluate_access_with,
 };
 use extract::{
-    CommandExtraction, Origin, PathExposure, STDIN_ARGUMENTS, SUBSTITUTION, extract_bash_commands,
-    extract_read_or_grep_paths,
+    CommandExtraction, Origin, PathExposure, STDIN_ARGUMENTS, SUBSTITUTION, ScriptSource,
+    extract_bash_commands, extract_read_or_grep_paths,
 };
 use hook::parse_hook_input;
 use packs::PackRegistry;
@@ -64,16 +64,17 @@ fn classify_egress(command: &CommandExtraction, mut decision: Decision) -> (Deci
     (decision, egress)
 }
 
-/// How a path came to be judged (bd-29r, bd-2mi, bd-1wa): read by something
-/// veil recognises as a reader, named in the words of some other command, not
-/// a path veil could work out at all, or handed to an MCP tool in its
-/// arguments.
+/// How a path came to be judged (bd-29r, bd-2mi, bd-1wa, bd-1bk): read by
+/// something veil recognises as a reader, named in the words of some other
+/// command, not a path veil could work out at all, handed to an MCP tool in its
+/// arguments, or a script veil was asked to run and could not read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReasonClass {
     DirectRead,
     ArgvPath,
     DynamicPath,
     McpArgument,
+    ScriptTooLarge,
 }
 
 impl ReasonClass {
@@ -83,9 +84,18 @@ impl ReasonClass {
             Self::ArgvPath => "argv_path",
             Self::DynamicPath => "dynamic_path_unresolvable",
             Self::McpArgument => "mcp_argument",
+            Self::ScriptTooLarge => "script_too_large_to_inspect",
         }
     }
 }
+
+/// What a denial that comes from the inside of a script adds to its remediation:
+/// reading a script is a best effort, and the denial is not the only way a
+/// script could have reached a path.
+const SCRIPT_REMEDIATION: &str = " veil read this script as text and that is best effort: a script can build a path veil cannot see, and only an OS sandbox is airtight.";
+
+/// What the denial of a script veil could not read tells the agent.
+const SCRIPT_UNREAD_REMEDIATION: &str = "Script not inspected: veil reads scripts as text, up to a limit, to show that they name no protected path, and could not read this one. Split it into smaller scripts, or run the work through an authorized spine tool (`veil operator` lists them). veil reading scripts is a best effort; only an OS sandbox is airtight. If the script genuinely must run as it is, stop and ask the operator.";
 
 /// What a denial of an MCP argument tells the agent: the tool may read the
 /// path or send it on, and a copy of it is the same file to the tool.
@@ -286,6 +296,14 @@ fn evaluate_commands(
     let mut outcomes = Vec::new();
 
     for command in commands {
+        // A script that is itself a protected path is denied where it was named
+        // (`python3 data/x.csv`); what is in it is not read into another reason.
+        if let Some(source) = &command.script
+            && script_is_protected(source, registry, &matchers)
+        {
+            continue;
+        }
+
         let first_outcome = outcomes.len();
         let spine_invocation = detect_spine(hook_input, config, command);
         let mut candidates = command.candidates.clone();
@@ -373,9 +391,112 @@ fn evaluate_commands(
         {
             outcomes.push(outcome);
         }
+
+        // What came out of a script says which script it was, and that reading
+        // scripts is best effort.
+        if let Some(source) = &command.script {
+            annotate_script_outcomes(&mut outcomes[first_outcome..], source);
+
+            if let Some(why) = &source.unread {
+                outcomes.push(unread_script_outcome(
+                    hook_input, config, registry, &matchers, command, source, why,
+                ));
+            }
+        }
     }
 
     outcomes
+}
+
+/// The script is a path the policy protects, or sits in a directory it protects.
+fn script_is_protected(
+    source: &ScriptSource,
+    registry: &PackRegistry,
+    matchers: &PolicyMatchers,
+) -> bool {
+    matchers.is_protected(&source.path)
+        || registry.classify(&source.path, false).is_some()
+        || source
+            .path
+            .parent()
+            .is_some_and(|directory| matchers.covers_directory(directory))
+}
+
+fn annotate_script_outcomes(outcomes: &mut [CandidateOutcome], source: &ScriptSource) {
+    for outcome in outcomes {
+        let Some(reason) = outcome.decision.reason.take() else {
+            continue;
+        };
+
+        outcome.decision.reason = Some(format!(
+            "{reason} (found in script `{}`)",
+            readable(&source.name)
+        ));
+        if let Some(remediation) = outcome.decision.remediation.as_mut() {
+            remediation.push_str(SCRIPT_REMEDIATION);
+        }
+    }
+}
+
+/// The outcome for a script veil was asked to run and did not read: it is larger
+/// than the limit, or is one script too many. It is judged by what its directory
+/// holds, the look a recursive copy of that directory would get: a protected
+/// path within reach denies it; with none, it is allowed and recorded.
+fn unread_script_outcome(
+    hook_input: &HookInput,
+    config: &config::Config,
+    registry: &PackRegistry,
+    matchers: &PolicyMatchers,
+    command: &CommandExtraction,
+    source: &ScriptSource,
+    why: &str,
+) -> CandidateOutcome {
+    let program = command
+        .argv
+        .first()
+        .map(|word| readable(command_basename(word)))
+        .unwrap_or_default();
+    let name = readable(&source.name);
+    let reach = evaluate_access_with(
+        &EvaluationInput::new(
+            hook_input.tool,
+            source.run_in.clone(),
+            PathExposure::ReadsContents,
+        )
+        .with_argv_command(&program, true),
+        config,
+        registry,
+        matchers,
+    );
+    let decision = if reach.reason.is_some() {
+        evaluator::resolve_policy(
+            &config.policy.default,
+            None,
+            format!(
+                "`{program}` runs `{name}`, which {why}, so veil cannot read it to show that it reads nothing protected, and the directory it runs in holds a protected path (label: protected); blocked by policy default"
+            ),
+            SCRIPT_UNREAD_REMEDIATION,
+        )
+    } else {
+        Decision {
+            action: DecisionAction::Allow,
+            reason: Some(format!(
+                "`{program}` runs `{name}`, which {why}; nothing protected is within reach of the directory it runs in, so it is allowed"
+            )),
+            severity: None,
+            confidence: None,
+            remediation: None,
+        }
+    };
+
+    CandidateOutcome {
+        path: source.path.clone(),
+        decision,
+        sensitivity: None,
+        origin: Origin::Script,
+        reason_class: ReasonClass::ScriptTooLarge,
+        egress: false,
+    }
 }
 
 /// Whether the commands of one Bash call run where a protected path is in play
