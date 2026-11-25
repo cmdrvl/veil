@@ -38,16 +38,16 @@ pub fn parse_hook_input(input: &str) -> Result<HookInput, HookParseError> {
     let payload: Value = serde_json::from_str(input)
         .map_err(|error| HookParseError::new(format!("invalid hook JSON: {error}")))?;
 
-    if is_claude_payload(&payload) {
-        return parse_snake_case_payload(&payload, HookProtocol::ClaudeCode);
+    if is_grok_payload(&payload) {
+        return parse_grok_payload(&payload);
     }
 
     if is_gemini_payload(&payload) {
         return parse_snake_case_payload(&payload, HookProtocol::GeminiCli);
     }
 
-    if is_grok_payload(&payload) {
-        return parse_grok_payload(&payload);
+    if is_claude_payload(&payload) {
+        return parse_snake_case_payload(&payload, HookProtocol::ClaudeCode);
     }
 
     if is_copilot_payload(&payload) {
@@ -92,12 +92,11 @@ fn is_gemini_payload(payload: &Value) -> bool {
 fn is_grok_payload(payload: &Value) -> bool {
     let event_matches =
         string_field(payload, "hookEventName").is_some_and(|value| value == GROK_PRE_TOOL_EVENT);
-    let bash_tool_matches = string_field(payload, "toolName")
-        .is_some_and(|value| GROK_BASH_TOOL_NAMES.contains(&value));
-    let camel_case_tool_fields =
-        payload.get("toolName").is_some() && payload.get("toolInput").is_some();
+    let grok_bash_tool_matches = ["toolName", "tool_name"].iter().any(|field| {
+        string_field(payload, field).is_some_and(|value| GROK_BASH_TOOL_NAMES.contains(&value))
+    });
 
-    camel_case_tool_fields && (event_matches || bash_tool_matches)
+    event_matches || grok_bash_tool_matches
 }
 
 fn parse_snake_case_payload(
@@ -119,16 +118,31 @@ fn parse_snake_case_payload(
 }
 
 fn parse_grok_payload(payload: &Value) -> Result<HookInput, HookParseError> {
-    let tool_name = required_string(payload, "toolName")?;
+    let tool_name_field = if payload.get("toolName").is_some() {
+        "toolName"
+    } else {
+        "tool_name"
+    };
+    let tool_input_field = if payload.get("toolInput").is_some() {
+        "toolInput"
+    } else {
+        "tool_input"
+    };
+    let session_id_field = if payload.get("sessionId").is_some() {
+        "sessionId"
+    } else {
+        "session_id"
+    };
+    let tool_name = required_string(payload, tool_name_field)?;
     let cwd = required_path(payload, "cwd")?;
-    let raw_args = required_json(payload, "toolInput")?;
+    let raw_args = required_json(payload, tool_input_field)?;
 
     Ok(HookInput {
         protocol: HookProtocol::Grok,
         tool: normalize_tool_kind(HookProtocol::Grok, tool_name)?,
         tool_name: tool_name.to_owned(),
         cwd,
-        session_id: string_field(payload, "sessionId").map(str::to_owned),
+        session_id: string_field(payload, session_id_field).map(str::to_owned),
         raw_args,
     })
 }
@@ -462,6 +476,67 @@ mod tests {
             assert_eq!(parsed.protocol, HookProtocol::Grok);
             assert_eq!(parsed.tool, ToolKind::Bash);
         }
+    }
+
+    #[test]
+    fn parses_grok_dual_event_payload_before_claude_compatibility_fields() {
+        let parsed = parse_hook_input(
+            r#"{
+              "hookEventName": "pre_tool_use",
+              "hook_event_name": "PreToolUse",
+              "sessionId": "camel-session",
+              "session_id": "snake-session",
+              "cwd": "/repo",
+              "toolName": "read_file",
+              "tool_name": "run_terminal_command",
+              "toolInput": { "target_file": "secret.txt" },
+              "tool_input": { "command": "cat secret.txt" }
+            }"#,
+        )
+        .expect("Grok dual-event payload should take precedence over Claude");
+
+        assert_eq!(parsed.protocol, HookProtocol::Grok);
+        assert_eq!(parsed.tool, ToolKind::Read);
+        assert_eq!(parsed.tool_name, "read_file");
+        assert_eq!(parsed.session_id.as_deref(), Some("camel-session"));
+        assert_eq!(parsed.raw_args, r#"{"target_file":"secret.txt"}"#);
+    }
+
+    #[test]
+    fn parses_snake_case_grok_terminal_command_before_claude() {
+        let parsed = parse_hook_input(
+            r#"{
+              "hook_event_name": "PreToolUse",
+              "session_id": "snake-session",
+              "cwd": "/repo",
+              "tool_name": "run_terminal_command",
+              "tool_input": { "command": "npm test" }
+            }"#,
+        )
+        .expect("Grok snake-case terminal command should parse");
+
+        assert_eq!(parsed.protocol, HookProtocol::Grok);
+        assert_eq!(parsed.tool, ToolKind::Bash);
+        assert_eq!(parsed.tool_name, "run_terminal_command");
+        assert_eq!(parsed.session_id.as_deref(), Some("snake-session"));
+        assert_eq!(parsed.raw_args, r#"{"command":"npm test"}"#);
+    }
+
+    #[test]
+    fn claude_compatible_read_without_grok_marker_stays_claude() {
+        let parsed = parse_hook_input(
+            r#"{
+              "hook_event_name": "PreToolUse",
+              "session_id": "claude-session",
+              "cwd": "/repo",
+              "tool_name": "Read",
+              "tool_input": { "file_path": "secret.txt" }
+            }"#,
+        )
+        .expect("Claude Read payload should remain Claude");
+
+        assert_eq!(parsed.protocol, HookProtocol::ClaudeCode);
+        assert_eq!(parsed.tool, ToolKind::Read);
     }
 
     #[test]
