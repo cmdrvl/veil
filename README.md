@@ -83,12 +83,22 @@ veil hooks into Claude Code's `PreToolUse` event for multiple tool types:
 | Hook Matcher | What It Guards |
 |-------------|----------------|
 | `Read` | Direct file reads into context |
-| `Grep` | Content-mode grep exposing file contents |
-| `Bash` | Common shell-reader patterns that would expose file contents directly |
+| `Grep` | Content-mode grep exposing file contents, including a search of a directory that holds protected paths |
+| `Bash` | Common shell-reader patterns that would expose file contents directly, including `grep`, `rg`, `ag`, `ack` and `ugrep` content searches |
 
 Treat `veil` as an operator-first guardrail: it blocks direct reads, then points
 you to the configured authorized path for sensitive-file work instead of
 encouraging ad hoc shell commands.
+
+A content search of a directory reads every file beneath it, so veil walks the
+directory before allowing it and denies the search when any path under it is
+covered by `[sensitivity] protected`. Searches that return only file names or
+counts (Grep `output_mode` of `files_with_matches` or `count`; `grep -l`,
+`-L`, `-c`, `rg --files`) stay allowed and are written to the audit log. Two
+limits to know about: the Grep tool's `glob` and `type` filters are not
+honored, so a search of a directory that holds protected data is denied even
+if the filter would have skipped it (search a narrower path instead); and a
+directory with more than 200,000 entries is refused rather than assumed clean.
 
 ### Configuration
 

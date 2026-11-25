@@ -93,7 +93,13 @@ fn extract_tokenized_bash_paths(command: &str, cwd: &Path) -> PathExtraction {
         return PathExtraction::none();
     };
 
-    let mut paths = command_paths(program, args).unwrap_or_default();
+    let (mut paths, exposure) = match search_command_paths(program, args) {
+        Some(search) => (search.paths, search.exposure),
+        None => (
+            command_paths(program, args).unwrap_or_default(),
+            PathExposure::ReadsContents,
+        ),
+    };
     paths.extend(collect_input_redirect_paths(args));
     paths.extend(collect_inline_interpreter_paths(program, args));
 
@@ -103,7 +109,7 @@ fn extract_tokenized_bash_paths(command: &str, cwd: &Path) -> PathExtraction {
         PathExtraction::none()
     } else {
         PathExtraction {
-            exposure: PathExposure::ReadsContents,
+            exposure,
             candidates,
         }
     }
@@ -124,8 +130,12 @@ fn extract_read_path(raw_value: &Value, cwd: &Path) -> PathExtraction {
 }
 
 fn extract_grep_path(raw_value: &Value, cwd: &Path) -> PathExtraction {
-    let Some(path) = string_field(raw_value, "path").and_then(|path| normalize_path(path, cwd))
-    else {
+    // Grep searches the working directory when `path` is omitted, so an
+    // omitted (or empty) path is a search of `cwd`, not a search of nothing.
+    let raw_path = string_field(raw_value, "path")
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".");
+    let Some(path) = normalize_path(raw_path, cwd) else {
         return PathExtraction::none();
     };
 
@@ -139,9 +149,11 @@ fn string_field<'a>(raw_value: &'a Value, field: &str) -> Option<&'a str> {
     raw_value.get(field)?.as_str()
 }
 
+/// `files_with_matches` and `count` return file names and match counts, not
+/// the matching text. Any other mode, and an omitted one, returns content.
 fn grep_exposure(raw_value: &Value) -> PathExposure {
     match string_field(raw_value, "output_mode") {
-        Some("files_with_matches") => PathExposure::MetadataOnly,
+        Some("files_with_matches" | "count") => PathExposure::MetadataOnly,
         _ => PathExposure::ReadsContents,
     }
 }
@@ -262,6 +274,381 @@ fn command_name(program: &str) -> &str {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(program)
+}
+
+/// How one family of content-search commands spells its options. Each table
+/// lists only options known to take a value: a value taken for an operand adds
+/// a harmless extra path, while an operand taken for a value would hide a real
+/// one, so an option missing here fails toward more paths, never fewer.
+struct SearchSpec {
+    short_with_value: &'static [char],
+    long_with_value: &'static [&'static str],
+    /// Searches directories recursively without being asked (rg, ag, ack).
+    recursive_by_default: bool,
+    recursive_short: &'static [char],
+    recursive_long: &'static [&'static str],
+    /// `-1`..`-9` mean a recursion depth rather than context lines (ugrep).
+    digits_recurse: bool,
+    /// Options that print names or counts instead of matching text.
+    metadata_short: &'static [char],
+    metadata_long: &'static [&'static str],
+    /// Options that carry the pattern or replace it, so no operand is one.
+    pattern_short: &'static [char],
+    pattern_long: &'static [&'static str],
+    /// Options whose value is a file the command reads for its patterns.
+    pattern_file_short: &'static [char],
+    pattern_file_long: &'static [&'static str],
+}
+
+const GREP_SPEC: SearchSpec = SearchSpec {
+    short_with_value: &['e', 'f', 'm', 'A', 'B', 'C', 'd', 'D'],
+    long_with_value: &[
+        "regexp",
+        "file",
+        "max-count",
+        "after-context",
+        "before-context",
+        "context",
+        "directories",
+        "devices",
+        "include",
+        "exclude",
+        "exclude-from",
+        "exclude-dir",
+        "include-dir",
+        "label",
+        "binary-files",
+        "group-separator",
+    ],
+    recursive_by_default: false,
+    recursive_short: &['r', 'R'],
+    recursive_long: &["recursive", "dereference-recursive"],
+    digits_recurse: false,
+    metadata_short: &['l', 'L', 'c', 'q'],
+    metadata_long: &[
+        "files-with-matches",
+        "files-without-match",
+        "count",
+        "quiet",
+        "silent",
+    ],
+    pattern_short: &['e', 'f'],
+    pattern_long: &["regexp", "file"],
+    pattern_file_short: &['f'],
+    pattern_file_long: &["file"],
+};
+
+const UGREP_SPEC: SearchSpec = SearchSpec {
+    short_with_value: &['e', 'f', 'm', 'A', 'B', 'C', 'd', 'D', 'g', 't', 'J'],
+    long_with_value: &[
+        "regexp",
+        "file",
+        "max-count",
+        "after-context",
+        "before-context",
+        "context",
+        "directories",
+        "devices",
+        "include",
+        "exclude",
+        "exclude-from",
+        "exclude-dir",
+        "include-dir",
+        "label",
+        "binary-files",
+        "group-separator",
+        "glob",
+        "iglob",
+        "file-type",
+        "jobs",
+        "max-depth",
+    ],
+    digits_recurse: true,
+    ..GREP_SPEC
+};
+
+const RG_SPEC: SearchSpec = SearchSpec {
+    short_with_value: &[
+        'A', 'B', 'C', 'e', 'f', 'g', 't', 'T', 'm', 'M', 'j', 'd', 'E', 'r',
+    ],
+    long_with_value: &[
+        "after-context",
+        "before-context",
+        "context",
+        "regexp",
+        "file",
+        "glob",
+        "iglob",
+        "type",
+        "type-not",
+        "type-add",
+        "type-clear",
+        "max-count",
+        "max-columns",
+        "threads",
+        "max-depth",
+        "maxdepth",
+        "max-filesize",
+        "encoding",
+        "engine",
+        "replace",
+        "sort",
+        "sortr",
+        "colors",
+        "color",
+        "context-separator",
+        "field-context-separator",
+        "field-match-separator",
+        "path-separator",
+        "pre",
+        "pre-glob",
+        "ignore-file",
+        "hostname-bin",
+        "dfa-size-limit",
+        "regex-size-limit",
+    ],
+    recursive_by_default: true,
+    recursive_short: &[],
+    recursive_long: &[],
+    digits_recurse: false,
+    metadata_short: &['l', 'c', 'q'],
+    metadata_long: &[
+        "files-with-matches",
+        "files-without-match",
+        "count",
+        "count-matches",
+        "quiet",
+        "files",
+        "type-list",
+    ],
+    pattern_short: &['e', 'f'],
+    pattern_long: &["regexp", "file", "files", "type-list"],
+    pattern_file_short: &['f'],
+    pattern_file_long: &["file"],
+};
+
+const AG_SPEC: SearchSpec = SearchSpec {
+    short_with_value: &['G', 'g', 'm', 'p'],
+    long_with_value: &[
+        "file-search-regex",
+        "max-count",
+        "ignore",
+        "ignore-dir",
+        "depth",
+        "workers",
+        "pager",
+        "path-to-ignore",
+        "width",
+    ],
+    recursive_by_default: true,
+    recursive_short: &[],
+    recursive_long: &[],
+    digits_recurse: false,
+    metadata_short: &['l', 'L', 'c', 'g'],
+    metadata_long: &["files-with-matches", "files-without-matches", "count"],
+    pattern_short: &['g'],
+    pattern_long: &[],
+    pattern_file_short: &[],
+    pattern_file_long: &[],
+};
+
+const ACK_SPEC: SearchSpec = SearchSpec {
+    short_with_value: &['A', 'B', 'C', 'm', 'g'],
+    long_with_value: &[
+        "after-context",
+        "before-context",
+        "context",
+        "max-count",
+        "type",
+        "ignore-dir",
+        "noignore-dir",
+        "ignore-file",
+        "pager",
+        "color-filename",
+        "color-match",
+        "color-lineno",
+        "output",
+        "match",
+    ],
+    recursive_by_default: true,
+    recursive_short: &[],
+    recursive_long: &[],
+    digits_recurse: false,
+    metadata_short: &['l', 'L', 'c', 'f', 'g'],
+    metadata_long: &["files-with-matches", "files-without-matches", "count"],
+    pattern_short: &['f', 'g'],
+    pattern_long: &["match"],
+    pattern_file_short: &[],
+    pattern_file_long: &[],
+};
+
+fn search_spec(program: &str) -> Option<&'static SearchSpec> {
+    match program {
+        "grep" | "egrep" | "fgrep" | "zgrep" | "zegrep" | "zfgrep" | "bzgrep" | "xzgrep" => {
+            Some(&GREP_SPEC)
+        }
+        "ugrep" | "ug" => Some(&UGREP_SPEC),
+        "rg" => Some(&RG_SPEC),
+        "ag" => Some(&AG_SPEC),
+        "ack" | "ack-grep" => Some(&ACK_SPEC),
+        _ => None,
+    }
+}
+
+struct SearchPaths {
+    paths: Vec<String>,
+    exposure: PathExposure,
+}
+
+/// The files and directories a grep-family command searches, and whether it
+/// prints their content. Only the first simple command of a pipeline reaches
+/// here, like the other readers.
+///
+/// A recursive search with no operand searches the working directory. An
+/// operand with a shell wildcard is kept literally and, when the search
+/// recurses, also as the directory before its first wildcard, since the shell
+/// will expand it into names this function cannot see.
+fn search_command_paths(program: &str, args: &[String]) -> Option<SearchPaths> {
+    let spec = search_spec(command_name(program))?;
+
+    let mut operands: Vec<&str> = Vec::new();
+    let mut pattern_files: Vec<&str> = Vec::new();
+    let mut recursive = spec.recursive_by_default;
+    let mut metadata_only = false;
+    let mut has_pattern_option = false;
+    let mut options_ended = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = args[index].as_str();
+        index += 1;
+
+        if options_ended || arg == "-" || !arg.starts_with('-') {
+            operands.push(arg);
+            continue;
+        }
+
+        if arg == "--" {
+            options_ended = true;
+            continue;
+        }
+
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline_value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            metadata_only |= spec.metadata_long.contains(&name);
+            recursive |= spec.recursive_long.contains(&name);
+            has_pattern_option |= spec.pattern_long.contains(&name);
+
+            let value = match inline_value {
+                None if spec.long_with_value.contains(&name) => {
+                    index += 1;
+                    args.get(index - 1).map(String::as_str)
+                }
+                other => other,
+            };
+            recursive |= name == "directories" && value == Some("recurse");
+            if spec.pattern_file_long.contains(&name)
+                && let Some(file) = value
+            {
+                pattern_files.push(file);
+            }
+            continue;
+        }
+
+        let cluster = &arg[1..];
+        if spec.digits_recurse && cluster.chars().all(|ch| ch.is_ascii_digit()) {
+            recursive = true;
+            continue;
+        }
+
+        for (offset, flag) in cluster.char_indices() {
+            metadata_only |= spec.metadata_short.contains(&flag);
+            recursive |= spec.recursive_short.contains(&flag);
+            has_pattern_option |= spec.pattern_short.contains(&flag);
+
+            if spec.short_with_value.contains(&flag) {
+                let attached = &cluster[offset + flag.len_utf8()..];
+                let value = if attached.is_empty() {
+                    index += 1;
+                    args.get(index - 1).map(String::as_str)
+                } else {
+                    Some(attached)
+                };
+                recursive |= flag == 'd' && value == Some("recurse");
+                if spec.pattern_file_short.contains(&flag)
+                    && let Some(file) = value
+                {
+                    pattern_files.push(file);
+                }
+                break;
+            }
+        }
+    }
+
+    // The first operand is the pattern unless an option already supplied one.
+    if !has_pattern_option && !operands.is_empty() {
+        operands.remove(0);
+    }
+    operands.retain(|operand| *operand != "-" && !looks_like_redirection(operand));
+
+    if operands.is_empty() && recursive && collect_input_redirect_paths(args).is_empty() {
+        operands.push(".");
+    }
+
+    let mut paths: Vec<String> = pattern_files
+        .iter()
+        .map(|file| (*file).to_owned())
+        .collect();
+    for operand in operands {
+        paths.push(operand.to_owned());
+        if recursive && let Some(directory) = directory_before_wildcard(operand) {
+            paths.push(directory);
+        }
+    }
+
+    // A pattern file is read as input and its content shapes the output, so a
+    // names-and-counts flag does not make reading it metadata-only.
+    let exposure = if metadata_only && pattern_files.is_empty() {
+        PathExposure::MetadataOnly
+    } else {
+        PathExposure::ReadsContents
+    };
+
+    Some(SearchPaths { paths, exposure })
+}
+
+fn looks_like_redirection(operand: &str) -> bool {
+    let rest = operand.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    rest.starts_with(['<', '>']) || rest.starts_with("&>")
+}
+
+fn has_shell_wildcard(operand: &str) -> bool {
+    operand.contains(['*', '?', '[', '{'])
+}
+
+/// The longest leading run of path components with no wildcard (`.` when the
+/// first component already has one), or `None` when there is no wildcard.
+fn directory_before_wildcard(operand: &str) -> Option<String> {
+    if !has_shell_wildcard(operand) {
+        return None;
+    }
+
+    let mut prefix = PathBuf::new();
+    for component in Path::new(operand).components() {
+        if has_shell_wildcard(&component.as_os_str().to_string_lossy()) {
+            break;
+        }
+        prefix.push(component);
+    }
+
+    if prefix.as_os_str().is_empty() {
+        Some(".".to_owned())
+    } else {
+        Some(prefix.to_string_lossy().into_owned())
+    }
 }
 
 fn collect_simple_reader_paths(args: &[String]) -> Vec<String> {
@@ -1394,6 +1781,246 @@ mod tests {
                 workspace(),
             ),
             PathExtraction::none()
+        );
+    }
+
+    // --- bd-1si: directory-scope Grep and content search ---
+
+    /// Exposure and candidates of a Bash command, with candidates shown
+    /// relative to the workspace (`.` is the workspace itself).
+    fn search(command: &str) -> (PathExposure, Vec<String>) {
+        let extraction = extract_bash_read_paths(command, workspace());
+        let candidates = extraction
+            .candidates
+            .iter()
+            .map(|path| match path.strip_prefix(workspace()) {
+                Ok(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
+                Ok(relative) => relative.to_string_lossy().into_owned(),
+                Err(_) => path.to_string_lossy().into_owned(),
+            })
+            .collect();
+
+        (extraction.exposure, candidates)
+    }
+
+    fn assert_search(command: &str, exposure: PathExposure, candidates: &[&str]) {
+        assert_eq!(
+            search(command),
+            (
+                exposure,
+                candidates.iter().map(|path| (*path).to_owned()).collect()
+            ),
+            "command: {command}"
+        );
+    }
+
+    #[test]
+    fn grep_without_a_path_searches_the_working_directory() {
+        for raw in [
+            r#"{"pattern":"ssn","output_mode":"content"}"#,
+            r#"{"pattern":"ssn","output_mode":"content","path":""}"#,
+            r#"{"pattern":"ssn","output_mode":"content","path":null}"#,
+        ] {
+            let extraction = extract_read_or_grep_paths(ToolKind::Grep, raw, workspace());
+
+            assert_eq!(extraction.exposure, PathExposure::ReadsContents, "{raw}");
+            assert_eq!(
+                extraction.candidates,
+                vec![workspace().to_path_buf()],
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn grep_with_an_omitted_output_mode_reads_contents() {
+        let extraction =
+            extract_read_or_grep_paths(ToolKind::Grep, r#"{"path":"data"}"#, workspace());
+
+        assert_eq!(extraction.exposure, PathExposure::ReadsContents);
+        assert_eq!(
+            extraction.candidates,
+            vec![PathBuf::from("/workspace/veil/data")]
+        );
+    }
+
+    #[test]
+    fn grep_count_and_files_with_matches_are_metadata_only() {
+        for mode in ["count", "files_with_matches"] {
+            let extraction = extract_read_or_grep_paths(
+                ToolKind::Grep,
+                &json!({ "path": "data", "output_mode": mode }).to_string(),
+                workspace(),
+            );
+
+            assert_eq!(extraction.exposure, PathExposure::MetadataOnly, "{mode}");
+            assert_eq!(
+                extraction.candidates,
+                vec![PathBuf::from("/workspace/veil/data")],
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_without_a_path_still_has_no_candidates() {
+        let extraction =
+            extract_read_or_grep_paths(ToolKind::Read, r#"{"pattern":"x"}"#, workspace());
+
+        assert_eq!(extraction, PathExtraction::none());
+    }
+
+    #[test]
+    fn grep_family_content_searches_read_contents() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_search("grep ssn data/x.csv", Reads, &["data/x.csv"]);
+        assert_search("grep -r ssn data", Reads, &["data"]);
+        assert_search("grep -rn ssn data/", Reads, &["data"]);
+        assert_search("grep -R -i ssn data other", Reads, &["data", "other"]);
+        assert_search("egrep -r 'ssn|ein' data", Reads, &["data"]);
+        assert_search("/usr/bin/grep -r ssn data", Reads, &["data"]);
+        assert_search("env LC_ALL=C grep -r ssn data", Reads, &["data"]);
+        assert_search("rg ssn data/", Reads, &["data"]);
+        assert_search("rg -n -C 2 ssn data", Reads, &["data"]);
+        assert_search("ag ssn data", Reads, &["data"]);
+        assert_search("ack ssn data", Reads, &["data"]);
+        assert_search("ugrep -r ssn data", Reads, &["data"]);
+        assert_search("ug -rn ssn data", Reads, &["data"]);
+    }
+
+    #[test]
+    fn names_and_counts_only_searches_are_metadata_only() {
+        use PathExposure::MetadataOnly as Meta;
+
+        assert_search("grep -l ssn data/x.csv", Meta, &["data/x.csv"]);
+        assert_search("grep -rl ssn data", Meta, &["data"]);
+        assert_search("grep -r --files-with-matches ssn data", Meta, &["data"]);
+        assert_search("grep -rL ssn data", Meta, &["data"]);
+        assert_search("grep -c ssn data/x.csv", Meta, &["data/x.csv"]);
+        assert_search("grep -rc ssn data", Meta, &["data"]);
+        assert_search("grep -r --count ssn data", Meta, &["data"]);
+        assert_search("grep -rq ssn data", Meta, &["data"]);
+        assert_search("rg -l ssn data", Meta, &["data"]);
+        assert_search("rg -c ssn data", Meta, &["data"]);
+        assert_search("rg --count-matches ssn data", Meta, &["data"]);
+        assert_search("rg --files data", Meta, &["data"]);
+        assert_search("rg --files", Meta, &["."]);
+        assert_search("ag -l ssn data", Meta, &["data"]);
+        assert_search("ag -c ssn data", Meta, &["data"]);
+        assert_search("ag -g csv data", Meta, &["data"]);
+        assert_search("ack -l ssn data", Meta, &["data"]);
+        assert_search("ack -f data", Meta, &["data"]);
+        assert_search("ugrep -rl ssn data", Meta, &["data"]);
+    }
+
+    #[test]
+    fn a_recursive_search_with_no_operand_searches_the_working_directory() {
+        use PathExposure::{MetadataOnly as Meta, ReadsContents as Reads};
+
+        assert_search("grep -r ssn", Reads, &["."]);
+        assert_search("grep -R ssn", Reads, &["."]);
+        assert_search("grep --recursive ssn", Reads, &["."]);
+        assert_search("grep -d recurse ssn", Reads, &["."]);
+        assert_search("grep --directories=recurse ssn", Reads, &["."]);
+        assert_search("grep -rl ssn", Meta, &["."]);
+        assert_search("rg ssn", Reads, &["."]);
+        assert_search("rg -l ssn", Meta, &["."]);
+        assert_search("ag ssn", Reads, &["."]);
+        assert_search("ack ssn", Reads, &["."]);
+        assert_search("ug -2 ssn", Reads, &["."]);
+    }
+
+    #[test]
+    fn a_search_that_reads_standard_input_has_no_path_to_check() {
+        assert_eq!(search("grep ssn"), (PathExposure::None, vec![]));
+        assert_eq!(search("grep -n ssn -"), (PathExposure::None, vec![]));
+        assert_eq!(search("git grep ssn"), (PathExposure::None, vec![]));
+        assert_search(
+            "grep ssn < data/x.csv",
+            PathExposure::ReadsContents,
+            &["data/x.csv"],
+        );
+        assert_search(
+            "rg ssn < data/x.csv",
+            PathExposure::ReadsContents,
+            &["data/x.csv"],
+        );
+    }
+
+    #[test]
+    fn option_values_are_not_mistaken_for_the_pattern_or_the_paths() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_search("grep -e ssn -r data", Reads, &["data"]);
+        assert_search("grep -A 3 -r ssn data", Reads, &["data"]);
+        assert_search("grep -nA3 ssn data/x", Reads, &["data/x"]);
+        assert_search("grep -m 5 -r ssn data", Reads, &["data"]);
+        assert_search("grep --include '*.csv' -r ssn data", Reads, &["data"]);
+        assert_search("grep --include=*.csv -r ssn data", Reads, &["data"]);
+        assert_search(
+            "grep --exclude-dir node_modules -r ssn data",
+            Reads,
+            &["data"],
+        );
+        assert_search("grep -r -- -weird data", Reads, &["data"]);
+        assert_search("grep -r ssn -- data", Reads, &["data"]);
+        assert_search("rg -g '*.csv' ssn data", Reads, &["data"]);
+        assert_search("rg -t csv -e ssn data other", Reads, &["data", "other"]);
+        assert_search("rg --max-depth 2 --color never ssn data", Reads, &["data"]);
+        assert_search("rg -r REDACTED ssn data", Reads, &["data"]);
+        assert_search("ag -G '\\.csv$' ssn data", Reads, &["data"]);
+        assert_search("ack -A 2 ssn data", Reads, &["data"]);
+        assert_search("ug -g '*.csv' -r ssn data", Reads, &["data"]);
+    }
+
+    #[test]
+    fn a_pattern_file_is_a_content_read_even_when_the_output_is_names_only() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_search("grep -f data/p.txt src", Reads, &["data/p.txt", "src"]);
+        assert_search("grep -rl -f data/p.txt src", Reads, &["data/p.txt", "src"]);
+        assert_search(
+            "grep --file=data/p.txt -r src",
+            Reads,
+            &["data/p.txt", "src"],
+        );
+        assert_search("rg -f data/p.txt src", Reads, &["data/p.txt", "src"]);
+    }
+
+    #[test]
+    fn shell_wildcards_also_name_the_directory_before_them_when_the_search_recurses() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_search("grep -r ssn data/*.csv", Reads, &["data/*.csv", "data"]);
+        assert_search("grep -r ssn *", Reads, &["*", "."]);
+        assert_search("grep -r ssn src/*/mod.rs", Reads, &["src/*/mod.rs", "src"]);
+        assert_search("rg ssn src/*.rs", Reads, &["src/*.rs", "src"]);
+        // Without -r grep never descends, so the wildcard is only the literal.
+        assert_search("grep ssn *.csv", Reads, &["*.csv"]);
+    }
+
+    #[test]
+    fn redirections_after_a_search_are_not_paths_and_a_redirect_like_pattern_is_not_one() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_search("grep -r ssn data 2>&1", Reads, &["data"]);
+        assert_search("grep -r ssn data 2>/dev/null", Reads, &["data"]);
+        // The pattern `1>2` is dropped as the pattern, so the path survives.
+        assert_search("grep '1>2' data/x", Reads, &["data/x"]);
+    }
+
+    #[test]
+    fn existing_readers_keep_their_exposure() {
+        assert_search(
+            "cat data/x.csv",
+            PathExposure::ReadsContents,
+            &["data/x.csv"],
+        );
+        assert_search(
+            "head -n 5 data/x.csv",
+            PathExposure::ReadsContents,
+            &["data/x.csv"],
         );
     }
 

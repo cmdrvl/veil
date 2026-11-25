@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::allowlist::SafePathMatcher;
+use crate::allowlist::{DirectoryScan, SafePathMatcher};
 use crate::config::{Config, PolicyMode};
 use crate::extract::PathExposure;
 use crate::packs::PackRegistry;
@@ -13,6 +13,14 @@ use crate::types::{Decision, DecisionAction, SensitivityResult, SensitivitySever
 const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. Run `veil operator` to discover the authorized spine tools available in this repo, then choose the right metadata-safe path for this file. Do not extract the contents any other way; if no listed tool fits, stop and ask the operator.";
 
 const RAW_FLAG_REMEDIATION: &str = "Raw-value flag blocked. Re-run the spine tool without it so its output stays metadata-only, or run `veil operator` to discover the authorized spine tools and the metadata-safe path for this file. Do not look for another way to see the raw values; if no metadata-safe path fits, stop and ask the operator.";
+
+const DIRECTORY_SEARCH_REMEDIATION: &str = "Content search blocked: this directory holds, or may hold, protected data. Search a narrower directory that holds none, or ask for file names or counts only (Grep output_mode files_with_matches or count; `grep -l` or `grep -c`). Run `veil operator` to discover the authorized spine tools for protected data. Do not look for another way to read it; if no listed tool fits, stop and ask the operator.";
+
+/// How many directory entries a content search of one directory makes veil
+/// inspect before it stops vouching for the directory. The hook runs before
+/// every search, so this bounds its latency; past it the search is refused
+/// rather than waved through.
+pub const DIRECTORY_SCOPE_MAX_ENTRIES: usize = 200_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvaluationInput {
@@ -88,6 +96,15 @@ where
     }
 
     let directory_sensitive = is_protected_path(&input.path, &config.sensitivity.protected);
+
+    // A content search of a directory reads every file beneath it, so it is a
+    // read of whatever protected paths sit under it. Like the checks below it
+    // outranks the allowlist.
+    if !directory_sensitive
+        && let Some(decision) = directory_scope_decision(input, config, DIRECTORY_SCOPE_MAX_ENTRIES)
+    {
+        return decision;
+    }
 
     // Sensitivity/protected patterns take precedence over the allowlist for
     // direct reads.  The allowlist should only fast-path files that are NOT
@@ -248,6 +265,43 @@ fn is_protected_path(path: &Path, protected_patterns: &[String]) -> bool {
     }
 
     SafePathMatcher::from_patterns(protected_patterns.iter()).is_safe(path)
+}
+
+/// The decision for a content search of a directory that holds protected
+/// paths, or whose contents veil cannot inspect within `max_entries`. `None`
+/// means this check has nothing to say: the input does not read contents, is
+/// not an existing directory, or the directory holds nothing protected.
+fn directory_scope_decision(
+    input: &EvaluationInput,
+    config: &Config,
+    max_entries: usize,
+) -> Option<Decision> {
+    if input.exposure != PathExposure::ReadsContents
+        || config.sensitivity.protected.is_empty()
+        || !input.path.is_dir()
+    {
+        return None;
+    }
+
+    let matcher = SafePathMatcher::from_patterns(config.sensitivity.protected.iter());
+    let reason = match matcher.scan_directory(&input.path, max_entries) {
+        DirectoryScan::Clear => return None,
+        DirectoryScan::Protected(_) => "a content search of this directory would read paths \
+             covered by [sensitivity] protected, and is blocked by policy default"
+            .to_owned(),
+        DirectoryScan::Unverified { max_entries } => format!(
+            "this directory holds more than {max_entries} entries, so veil cannot show that a \
+             content search of it would not read paths covered by [sensitivity] protected; \
+             blocked by policy default"
+        ),
+    };
+
+    Some(resolve_policy(
+        &config.policy.default,
+        None,
+        reason,
+        DIRECTORY_SEARCH_REMEDIATION,
+    ))
 }
 
 fn is_authorized_spine_invocation(input: &EvaluationInput) -> bool {
@@ -1011,5 +1065,214 @@ mod tests {
                 "non-device path {path} should not be blocked by the device check"
             );
         }
+    }
+
+    // --- bd-1si: a content search of a directory reads what is beneath it ---
+
+    fn tree(label: &str, files: &[&str]) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "veil-scope-{label}-{}-{nanos}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        for file in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().expect("file has a parent"))
+                .expect("parent dir should be creatable");
+            std::fs::write(&path, "ssn,123-45-6789\n").expect("file should be writable");
+        }
+        std::fs::canonicalize(&root).expect("tree root should canonicalize")
+    }
+
+    fn search(path: &Path, exposure: PathExposure) -> EvaluationInput {
+        EvaluationInput::new(ToolKind::Grep, path, exposure)
+    }
+
+    fn decide(input: &EvaluationInput, config: &Config) -> Decision {
+        evaluate_access(input, config, &PackRegistry::with_built_ins())
+    }
+
+    #[test]
+    fn content_search_of_a_directory_holding_protected_paths_is_denied() {
+        let root = tree("deny", &["protected/clients/holdings.csv", "src/main.rs"]);
+
+        let decision = decide(
+            &search(&root, PathExposure::ReadsContents),
+            &fixture_config(),
+        );
+
+        assert_eq!(decision.action, DecisionAction::Deny);
+        assert!(
+            decision
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("[sensitivity] protected")),
+            "reason should name the policy that blocks the search, got {:?}",
+            decision.reason
+        );
+        assert!(
+            decision.remediation.as_deref().is_some_and(
+                |text| text.contains("files_with_matches") && text.contains("veil operator")
+            ),
+            "remediation should point at metadata-only searches and the operator, got {:?}",
+            decision.remediation
+        );
+        assert!(
+            !decision
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("holdings"),
+            "the reason must not hand the agent the name of a protected file"
+        );
+    }
+
+    #[test]
+    fn content_search_of_the_protected_root_itself_is_denied() {
+        let root = tree("root", &["protected/clients/holdings.csv"]);
+
+        let decision = decide(
+            &search(&root.join("protected"), PathExposure::ReadsContents),
+            &fixture_config(),
+        );
+
+        assert_eq!(decision.action, DecisionAction::Deny);
+    }
+
+    #[test]
+    fn names_and_counts_only_search_of_the_same_directory_is_allowed() {
+        let root = tree("meta", &["protected/clients/holdings.csv", "src/main.rs"]);
+
+        for path in [root.clone(), root.join("protected")] {
+            let decision = decide(
+                &search(&path, PathExposure::MetadataOnly),
+                &fixture_config(),
+            );
+
+            assert_eq!(decision.action, DecisionAction::Allow, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn content_search_of_a_directory_with_nothing_protected_is_allowed_silently() {
+        let root = tree("clean", &["src/main.rs", "src/lib.rs", "notes/data.txt"]);
+
+        let decision = decide(
+            &search(&root, PathExposure::ReadsContents),
+            &fixture_config(),
+        );
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, None);
+    }
+
+    #[test]
+    fn a_search_of_one_file_does_not_scan_anything() {
+        let root = tree("file", &["protected/a.csv", "src/main.rs"]);
+
+        let decision = decide(
+            &search(&root.join("src/main.rs"), PathExposure::ReadsContents),
+            &fixture_config(),
+        );
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, None);
+    }
+
+    #[test]
+    fn an_allowlisted_directory_is_still_denied_when_protected_paths_sit_beneath_it() {
+        // tests/** is a default safe pattern, so tests/fixtures is allowlisted
+        // as a path; the protected directory beneath it still decides.
+        let root = tree("allowlisted", &["tests/fixtures/protected/rows.csv"]);
+        let directory = root.join("tests/fixtures");
+        assert!(SafePathMatcher::default().is_safe(&directory));
+
+        let decision = decide(
+            &search(&directory, PathExposure::ReadsContents),
+            &fixture_config(),
+        );
+
+        assert_eq!(decision.action, DecisionAction::Deny);
+    }
+
+    #[test]
+    fn without_protected_patterns_directory_searches_are_untouched() {
+        let root = tree("none", &["protected/a.csv"]);
+        let mut config = fixture_config();
+        config.sensitivity.protected.clear();
+
+        let decision = decide(&search(&root, PathExposure::ReadsContents), &config);
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert_eq!(decision.reason, None);
+    }
+
+    #[test]
+    fn warn_mode_lets_the_search_through_and_says_why() {
+        let root = tree("warn", &["protected/a.csv"]);
+        let mut config = fixture_config();
+        config.policy.default = PolicyMode::Warn;
+
+        let decision = decide(&search(&root, PathExposure::ReadsContents), &config);
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+        assert!(
+            decision
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("policy default warn:")),
+            "got {:?}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn a_directory_too_large_to_inspect_is_refused_not_waved_through() {
+        let root = tree("large", &["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]);
+        let input = search(&root, PathExposure::ReadsContents);
+
+        let decision = directory_scope_decision(&input, &fixture_config(), 3)
+            .expect("a directory over the budget must get a decision");
+
+        assert_eq!(decision.action, DecisionAction::Deny);
+        assert!(
+            decision
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("more than 3 entries")),
+            "got {:?}",
+            decision.reason
+        );
+        assert_eq!(
+            directory_scope_decision(&input, &fixture_config(), 5),
+            None,
+            "the same directory is fine once the budget covers it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_directory_is_searched_as_the_directory_it_points_at() {
+        use std::os::unix::fs::symlink;
+
+        let root = tree("link", &["protected/a.csv", "src/main.rs"]);
+        let alias = tree("alias", &["src/other.rs"]).join("repo");
+        symlink(&root, &alias).expect("symlink should be creatable");
+
+        let decision = decide(
+            &search(&alias, PathExposure::ReadsContents),
+            &fixture_config(),
+        );
+
+        assert_eq!(decision.action, DecisionAction::Deny);
     }
 }
