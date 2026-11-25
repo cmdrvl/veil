@@ -15,6 +15,7 @@ name = "veil"
 path = "src/main.rs"
 
 [dependencies]
+boundary-detectors = { git = "https://github.com/cmdrvl/boundary-detectors", rev = "0d4dd36fc07836dc67becf0647322c5ddd7dc6e8" }
 clap = { version = "4.5.39", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -27,6 +28,23 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Keep the veil binary size-optimized while the scanner and its matchers are
+# built for speed. The root benchmark checks the shared crate's scan budgets.
+[profile.release.package.boundary-detectors]
+opt-level = 3
+
+[profile.release.package.aho-corasick]
+opt-level = 3
+
+[profile.release.package.memchr]
+opt-level = 3
+
+[profile.release.package.regex-automata]
+opt-level = 3
+
+[profile.release.package.base64]
+opt-level = 3
 
 [dev-dependencies]
 spine-rules = { git = "https://github.com/cmdrvl/spine-rules" }
