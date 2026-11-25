@@ -378,9 +378,10 @@ fn node_ruby_perl_and_r_scripts_are_read_too() {
 #[test]
 fn options_and_wrappers_do_not_hide_the_script() {
     let repo = repo("options");
+    let protected_path = repo.root.join(HOLDINGS);
     repo.write(
         "read.py",
-        "print(open('data/clients/holdings.csv').read())\n",
+        &format!("print(open({protected_path:?}).read())\n"),
     );
 
     for command in [
