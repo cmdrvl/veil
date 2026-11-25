@@ -19,6 +19,14 @@ fn main() -> ExitCode {
 fn dispatch() -> Result<u8, Box<dyn std::error::Error>> {
     match cli::parse_env() {
         Ok(cli::Dispatch::HookMode) => veil::run(),
+        Ok(cli::Dispatch::Describe) => {
+            println!("{}", operator::run_describe());
+            Ok(0)
+        }
+        Ok(cli::Dispatch::Schema) => {
+            println!("{}", operator::run_schema());
+            Ok(0)
+        }
         Ok(cli::Dispatch::Operator(command)) => dispatch_operator(command),
         Err(err) => err.exit(),
     }

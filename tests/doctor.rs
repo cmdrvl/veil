@@ -194,15 +194,12 @@ fn top_level_capabilities_json_is_available_without_guard_hooks() {
     assert!(output.status.success());
     let value: Value =
         serde_json::from_slice(&output.stdout).expect("capabilities JSON should parse");
-    assert_eq!(value["schema_version"], "veil.capabilities.v1");
+    assert_eq!(value["schema_version"], "operator.v1");
     assert_eq!(
-        value["standard_agent_surfaces"]["capabilities_json"],
+        value["discovery"]["capabilities"],
         "veil capabilities --json"
     );
-    assert_eq!(
-        value["composition"]["family"]["name"],
-        "cmdrvl-boundary-guard"
-    );
+    assert_eq!(value["composition"]["family"], "cmdrvl-boundary-guard");
     assert_eq!(
         value["composition"]["role"],
         "pre-tool guard that keeps raw sensitive files out of agent context"

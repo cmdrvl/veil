@@ -14,6 +14,16 @@ use clap::{Args, Parser, Subcommand};
 pub struct Cli {
     #[arg(long = "robot-triage", help = "Emit read-only JSON triage for agents")]
     robot_triage: bool,
+    #[arg(
+        long,
+        help = "Print the operator manifest (same document as `capabilities --json`) and exit"
+    )]
+    describe: bool,
+    #[arg(
+        long,
+        help = "Print the JSON Schema for hook-mode stdout (the permission decision) and exit"
+    )]
+    schema: bool,
     #[command(subcommand)]
     command: Option<OperatorCommand>,
 }
@@ -133,11 +143,21 @@ pub enum OperatorCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Dispatch {
     HookMode,
+    Describe,
+    Schema,
     Operator(OperatorCommand),
 }
 
 impl Cli {
     pub fn dispatch(self) -> Dispatch {
+        if self.describe {
+            return Dispatch::Describe;
+        }
+
+        if self.schema {
+            return Dispatch::Schema;
+        }
+
         if self.robot_triage {
             return Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
                 robot_triage: true,
@@ -177,6 +197,12 @@ mod tests {
     #[test]
     fn no_subcommand_selects_hook_mode() {
         assert_eq!(parse(&["veil"]), Dispatch::HookMode);
+    }
+
+    #[test]
+    fn describe_and_schema_flags_select_introspection() {
+        assert_eq!(parse(&["veil", "--describe"]), Dispatch::Describe);
+        assert_eq!(parse(&["veil", "--schema"]), Dispatch::Schema);
     }
 
     #[test]

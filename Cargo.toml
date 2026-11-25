@@ -27,3 +27,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+spine-rules = { git = "https://github.com/cmdrvl/spine-rules" }

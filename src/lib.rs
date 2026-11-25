@@ -12,7 +12,7 @@ pub mod spine;
 pub mod types;
 
 use std::error::Error;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,8 +35,15 @@ struct CandidateOutcome {
     sensitivity: Option<String>,
 }
 
+const BARE_INVOCATION_GUIDANCE: &str = "no hook payload received on stdin; bare `veil` is hook mode. Pipe a Claude/Gemini/Copilot hook payload into stdin, or run `veil --robot-triage`, `veil capabilities --json`, or `veil robot-docs guide` for operator discovery. For help with veil, run `veil --help`.";
+
 pub fn run() -> Result<u8, Box<dyn Error>> {
     let stdin = io::stdin();
+    // Hook mode reads stdin to EOF. A terminal never reaches EOF, so fail fast
+    // with guidance instead of waiting for a human to press Ctrl-D.
+    if stdin.is_terminal() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, BARE_INVOCATION_GUIDANCE).into());
+    }
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     run_with_io(stdin.lock(), &mut stdout, &mut stderr)?;
@@ -54,7 +61,7 @@ fn run_with_io<R: Read, W: Write, E: Write>(
     if input.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "no hook payload received on stdin; bare `veil` is hook mode. Pipe a Claude/Gemini/Copilot hook payload into stdin, or run `veil --robot-triage`, `veil capabilities --json`, or `veil robot-docs guide` for operator discovery. For help with veil, run `veil --help`.",
+            BARE_INVOCATION_GUIDANCE,
         ));
     }
 

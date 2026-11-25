@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cmdrvl/veil/hook-decision.schema.json",
+  "title": "veil hook-mode stdout",
+  "description": "The permission decision veil prints in hook mode (`veil < hook-payload.json`). The shape depends on the hook protocol detected from the payload: Claude Code, GitHub Copilot / unknown, or Gemini CLI / Grok. Exactly one object is printed, followed by a newline. A deny reason is present only on deny.",
+  "oneOf": [
+    { "$ref": "#/definitions/claude_code" },
+    { "$ref": "#/definitions/copilot" },
+    { "$ref": "#/definitions/gemini_grok" }
+  ],
+  "definitions": {
+    "claude_code": {
+      "type": "object",
+      "required": ["hookSpecificOutput"],
+      "additionalProperties": false,
+      "properties": {
+        "hookSpecificOutput": {
+          "type": "object",
+          "required": ["hookEventName", "permissionDecision"],
+          "additionalProperties": false,
+          "properties": {
+            "hookEventName": { "const": "PreToolUse" },
+            "permissionDecision": { "enum": ["allow", "deny"] },
+            "permissionDecisionReason": { "type": "string" }
+          }
+        }
+      }
+    },
+    "copilot": {
+      "type": "object",
+      "required": ["permissionDecision"],
+      "additionalProperties": false,
+      "properties": {
+        "permissionDecision": { "enum": ["allow", "deny"] },
+        "permissionDecisionReason": { "type": "string" }
+      }
+    },
+    "gemini_grok": {
+      "type": "object",
+      "required": ["decision"],
+      "additionalProperties": false,
+      "properties": {
+        "decision": { "enum": ["allow", "deny"] },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

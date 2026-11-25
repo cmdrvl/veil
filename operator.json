@@ -1,0 +1,192 @@
+{
+  "schema_version": "operator.v1",
+  "name": "veil",
+  "tool_version": "0.4.2",
+  "contract_version": "1.0.0",
+  "description": "Data exfiltration guard for AI coding agents. Bare `veil` is hook mode: it reads one Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload on stdin and prints that protocol's allow/deny decision. Subcommands are read-only discovery and diagnostics, plus `install`/`uninstall` for the managed Claude hook entries.",
+  "repository": "https://github.com/cmdrvl/veil",
+  "license": "MIT",
+  "agent_guide": "veil robot-docs guide",
+  "invocation": {
+    "binary": "veil",
+    "usage": [
+      "veil < hook-payload.json",
+      "veil --describe",
+      "veil --schema",
+      "veil --robot-triage",
+      "veil capabilities --json",
+      "veil robot-docs guide",
+      "veil operator --json",
+      "veil test <PATH> [--json]",
+      "veil explain <PATH> [--json]",
+      "veil scan <DIR> [--json]",
+      "veil packs [--json]",
+      "veil config [--json]",
+      "veil audit [--json]",
+      "veil doctor [health|capabilities|robot-docs] [--json]",
+      "veil install",
+      "veil uninstall"
+    ],
+    "output_mode": "hook decision JSON on stdout in hook mode; JSON with --json on subcommands, human text otherwise",
+    "output_schema": "veil --schema",
+    "json_flag": "--json"
+  },
+  "arguments": [],
+  "options": [
+    { "name": "describe", "flag": "--describe", "type": "flag", "description": "Print this operator manifest (identical to `capabilities --json`) and exit 0" },
+    { "name": "schema", "flag": "--schema", "type": "flag", "description": "Print the JSON Schema for hook-mode stdout (the permission decision) and exit 0" },
+    { "name": "robot_triage", "flag": "--robot-triage", "type": "flag", "description": "Emit read-only JSON doctor triage for agents" },
+    { "name": "version", "flag": "--version", "type": "flag", "description": "Print the veil version and exit 0" }
+  ],
+  "commands": [
+    {
+      "name": "capabilities",
+      "description": "Emit this machine-readable contract (same document as --describe).",
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit the contract as JSON" }],
+      "read_only": true,
+      "guard_preflight_required": false
+    },
+    {
+      "name": "robot-docs",
+      "description": "Print the agent quick-start guide (`robot-docs guide`).",
+      "arguments": [{ "name": "topic", "type": "string", "position": 0, "required": false, "description": "Only `guide` is defined" }],
+      "read_only": true,
+      "guard_preflight_required": false
+    },
+    {
+      "name": "operator",
+      "description": "Discover the authorized spine tools configured in [spine] authorized_tools by running each tool's own --describe. Distinct from this manifest.",
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit machine-readable JSON" }],
+      "read_only": true,
+      "guard_preflight_required": true
+    },
+    {
+      "name": "test",
+      "description": "Predict whether one path would be allowed or denied by the read-decision pipeline.",
+      "arguments": [{ "name": "path", "type": "file_path", "position": 0, "required": true, "description": "Path to inspect" }],
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit the path inspection as JSON" }],
+      "read_only": true,
+      "guard_preflight_required": true
+    },
+    {
+      "name": "explain",
+      "description": "Explain allowlist, protected-pattern and pack matches for one path.",
+      "arguments": [{ "name": "path", "type": "file_path", "position": 0, "required": true, "description": "Path to inspect" }],
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit the path inspection as JSON" }],
+      "read_only": true,
+      "guard_preflight_required": true
+    },
+    {
+      "name": "scan",
+      "description": "Scan a directory tree and classify each file path (paths only; file contents are not read into output).",
+      "arguments": [{ "name": "dir", "type": "directory_path", "position": 0, "required": true, "description": "Directory tree to scan" }],
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit scan results as JSON" }],
+      "read_only": true,
+      "guard_preflight_required": true
+    },
+    {
+      "name": "packs",
+      "description": "List the built-in sensitivity packs.",
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit machine-readable JSON" }],
+      "read_only": true,
+      "guard_preflight_required": true
+    },
+    {
+      "name": "config",
+      "description": "Show the merged active configuration (system, user, project, environment layers).",
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit merged config as JSON" }],
+      "read_only": false,
+      "guard_preflight_required": true,
+      "notes": "Loading config may migrate a legacy user config to ~/.cmdrvl/config/veil/config.toml."
+    },
+    {
+      "name": "audit",
+      "description": "Show recent audit log entries.",
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit recent audit entries as JSON" }],
+      "read_only": true,
+      "guard_preflight_required": true
+    },
+    {
+      "name": "doctor",
+      "description": "Inspect config, audit path and guard-hook health without writing. Subcommands: health (default), capabilities, robot-docs. `--robot-triage` emits JSON triage.",
+      "options": [
+        { "name": "json", "flag": "--json", "type": "flag", "description": "Emit doctor health as JSON" },
+        { "name": "robot_triage", "flag": "--robot-triage", "type": "flag", "description": "Emit read-only doctor triage JSON" }
+      ],
+      "read_only": true,
+      "guard_preflight_required": false
+    },
+    {
+      "name": "install",
+      "description": "Install the managed veil Read/Grep/Bash PreToolUse hook entries into Claude settings (~/.claude/settings.json, or VEIL_CLAUDE_SETTINGS_PATH).",
+      "read_only": false,
+      "guard_preflight_required": false
+    },
+    {
+      "name": "uninstall",
+      "description": "Remove only the veil-owned PreToolUse hook entries from Claude settings.",
+      "read_only": false,
+      "guard_preflight_required": false
+    }
+  ],
+  "exit_codes": {
+    "0": { "meaning": "success, or a hook allow/deny decision was rendered", "domain": "positive" },
+    "1": { "meaning": "doctor reported an unhealthy state (an error finding); veil has no other verdict", "domain": "unhealthy" },
+    "2": { "meaning": "usage error, malformed or empty hook payload, configuration error, or guard preflight refusal", "domain": "error" }
+  },
+  "refusals": [],
+  "env_vars": [
+    { "name": "HOME", "description": "Locates ~/.cmdrvl/config/veil/config.toml, the audit log and ~/.claude/settings.json" },
+    { "name": "XDG_CONFIG_HOME", "description": "Locates the legacy user config that is migrated on first use" },
+    { "name": "XDG_STATE_HOME", "description": "Locates the default audit log" },
+    { "name": "VEIL_CLAUDE_SETTINGS_PATH", "description": "Override the Claude settings file inspected and edited by doctor/install/uninstall" },
+    { "name": "VEIL_HARNESS", "description": "Override agent harness detection: claude-code, codex, gemini-cli, cursor or plain" },
+    { "name": "VEIL_PROTECTED", "description": "Comma-separated [sensitivity] protected globs (overrides config files)" },
+    { "name": "VEIL_SAFE_PATTERNS", "description": "Comma-separated [allowlist] safe patterns (overrides config files)" },
+    { "name": "VEIL_SPINE_TOOLS", "description": "Comma-separated [spine] authorized_tools (overrides config files)" },
+    { "name": "VEIL_POLICY", "description": "Default policy mode: deny, warn or log" },
+    { "name": "VEIL_AUDIT_LOG", "description": "Enable or disable audit logging (true/false)" },
+    { "name": "VEIL_AUDIT_PATH", "description": "Audit log file path" }
+  ],
+  "formats": ["json", "text"],
+  "side_effects": {
+    "reads_files": true,
+    "writes_files": true,
+    "network": false,
+    "writes_witness": false,
+    "notes": "Hook mode appends one audit record per evaluated path to the audit log when audit_log is enabled. install/uninstall edit Claude settings. config may migrate a legacy user config. All other commands are read-only. veil never writes to the witness ledger."
+  },
+  "pipeline": {
+    "upstream": ["dcg"],
+    "downstream": ["airlock"]
+  },
+  "hook_mode": {
+    "usage": "veil < hook-payload.json",
+    "stdin": "Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload JSON",
+    "stdout": "protocol-specific permission decision JSON (see `veil --schema`)",
+    "stderr": "diagnostics only",
+    "bare_invocation": "stdin that is a terminal or empty exits 2 immediately with discovery guidance"
+  },
+  "discovery": {
+    "triage": "veil --robot-triage",
+    "capabilities": "veil capabilities --json",
+    "robot_docs": "veil robot-docs guide",
+    "help": "veil --help"
+  },
+  "composition": {
+    "family": "cmdrvl-boundary-guard",
+    "role": "pre-tool guard that keeps raw sensitive files out of agent context",
+    "authorized_processing": "configured spine tools from [spine] authorized_tools",
+    "canonical_chain": [
+      "dcg blocks destructive Bash before commands execute",
+      "veil blocks raw Read/Grep/Bash exfiltration while allowing authorized spine subprocesses",
+      "airlock attests derived artifacts before they cross a model boundary",
+      "pack seals boundary manifests and downstream evidence"
+    ],
+    "agent_rules": [
+      "Do not bypass veil by reading protected files directly; run authorized spine tools instead.",
+      "Use veil operator --json to inspect authorized tool configuration after guard preflight is healthy.",
+      "Use airlock when derived artifacts are ready to cross the model boundary."
+    ]
+  }
+}

@@ -23,7 +23,10 @@ use crate::cli::{
 use crate::hooks;
 
 const RECENT_AUDIT_LIMIT: usize = 20;
-const CAPABILITIES_SCHEMA_VERSION: &str = "veil.capabilities.v1";
+/// veil's own operator.v1 manifest. `--describe` and `capabilities --json`
+/// both print exactly this document.
+const OPERATOR_JSON: &str = include_str!("../operator.json");
+const HOOK_DECISION_SCHEMA: &str = include_str!("../hook-decision.schema.json");
 const DOCTOR_HEALTH_SCHEMA_VERSION: &str = "veil.doctor.health.v1";
 const DOCTOR_CAPABILITIES_SCHEMA_VERSION: &str = "veil.doctor.capabilities.v1";
 const DOCTOR_TRIAGE_SCHEMA_VERSION: &str = "veil.doctor.triage.v1";
@@ -94,12 +97,21 @@ pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>>
     render_audit_for_path(&config.policy.audit_path, args.json, RECENT_AUDIT_LIMIT)
 }
 
-pub fn run_capabilities(args: &CapabilitiesArgs) -> Result<String, Box<dyn std::error::Error>> {
-    let value = capabilities_json_value();
+/// `veil --describe`: the operator manifest, byte-for-byte the repo's `operator.json`.
+pub fn run_describe() -> String {
+    OPERATOR_JSON.trim_end().to_owned()
+}
 
+/// `veil --schema`: JSON Schema for hook-mode stdout.
+pub fn run_schema() -> String {
+    HOOK_DECISION_SCHEMA.trim_end().to_owned()
+}
+
+pub fn run_capabilities(args: &CapabilitiesArgs) -> Result<String, Box<dyn std::error::Error>> {
     if args.json {
-        Ok(serde_json::to_string_pretty(&value)?)
+        Ok(run_describe())
     } else {
+        let value: Value = serde_json::from_str(OPERATOR_JSON)?;
         Ok(render_capabilities_human(&value))
     }
 }
@@ -961,11 +973,17 @@ fn render_capabilities_human(value: &Value) -> String {
     let _ = writeln!(output, "  tool: veil {}", env!("CARGO_PKG_VERSION"));
     let _ = writeln!(output, "  hook_mode: veil < hook-payload.json");
     let _ = writeln!(output, "  discovery:");
+    let _ = writeln!(output, "    - veil --describe");
     let _ = writeln!(output, "    - veil --robot-triage");
     let _ = writeln!(output, "    - veil capabilities --json");
     let _ = writeln!(output, "    - veil robot-docs guide");
     let _ = writeln!(output, "  commands:");
-    for command in capability_command_lines() {
+    for command in value["invocation"]["usage"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
         let _ = writeln!(output, "    - {command}");
     }
 
@@ -1495,118 +1513,6 @@ fn doctor_capabilities_json_value() -> Value {
             "gitignored": true
         }
     })
-}
-
-fn capabilities_json_value() -> Value {
-    json!({
-        "schema_version": CAPABILITIES_SCHEMA_VERSION,
-        "tool": "veil",
-        "version": env!("CARGO_PKG_VERSION"),
-        "purpose": "Data exfiltration guard for AI coding agents.",
-        "hook_mode": {
-            "usage": "veil < hook-payload.json",
-            "stdin": "Claude Code, Gemini CLI, or GitHub Copilot hook payload JSON",
-            "stdout": "protocol-specific permission decision JSON",
-            "stderr": "diagnostics only",
-            "writes_audit_log_when_enabled": true
-        },
-        "discovery": {
-            "triage": "veil --robot-triage",
-            "capabilities": "veil capabilities --json",
-            "robot_docs": "veil robot-docs guide",
-            "help": "veil --help"
-        },
-        "exit_codes": [
-            {
-                "code": 0,
-                "meaning": "success or hook allow/deny decision rendered"
-            },
-            {
-                "code": 2,
-                "meaning": "usage error, hook payload error, configuration error, or guard preflight refusal"
-            }
-        ],
-        "commands": capability_command_lines().iter().map(|command| {
-            json!({
-                "command": command,
-                "guard_preflight_required": command_requires_guard_preflight(command),
-                "read_only": command_is_read_only(command),
-            })
-        }).collect::<Vec<_>>(),
-        "standard_agent_surfaces": {
-            "robot_triage": "veil --robot-triage",
-            "capabilities_json": "veil capabilities --json",
-            "robot_docs": "veil robot-docs guide"
-        },
-        "doctor": doctor_capabilities_json_value(),
-        "composition": {
-            "family": {
-                "name": "cmdrvl-boundary-guard",
-                "siblings": [
-                    {"tool": "dcg", "role": "destructive shell command guard"},
-                    {"tool": "veil", "capabilities": "veil capabilities --json"},
-                    {"tool": "airlock", "capabilities": "airlock capabilities --json"},
-                    {"tool": "pack", "capabilities": "pack capabilities --json"}
-                ]
-            },
-            "role": "pre-tool guard that keeps raw sensitive files out of agent context",
-            "upstream_guards": ["dcg"],
-            "authorized_processing": "configured spine tools from [spine] authorized_tools",
-            "downstream_attestation": ["airlock"],
-            "canonical_chain": [
-                "dcg blocks destructive Bash before commands execute",
-                "veil blocks raw Read/Grep/Bash exfiltration while allowing authorized spine subprocesses",
-                "airlock attests derived artifacts before they cross a model boundary",
-                "pack seals boundary manifests and downstream evidence"
-            ],
-            "agent_rules": [
-                "Do not bypass veil by reading protected files directly; run authorized spine tools instead.",
-                "Use veil operator --json to inspect authorized tool configuration after guard preflight is healthy.",
-                "Use airlock when derived artifacts are ready to cross the model boundary."
-            ]
-        }
-    })
-}
-
-fn capability_command_lines() -> Vec<&'static str> {
-    vec![
-        "veil < hook-payload.json",
-        "veil --robot-triage",
-        "veil capabilities --json",
-        "veil robot-docs guide",
-        "veil operator --json",
-        "veil test <PATH> --json",
-        "veil explain <PATH> --json",
-        "veil scan <DIR> --json",
-        "veil packs --json",
-        "veil config --json",
-        "veil audit --json",
-        "veil doctor health --json",
-        "veil doctor capabilities --json",
-        "veil doctor robot-docs",
-        "veil install",
-        "veil uninstall",
-    ]
-}
-
-fn command_requires_guard_preflight(command: &str) -> bool {
-    matches!(
-        command,
-        "veil operator --json"
-            | "veil test <PATH> --json"
-            | "veil explain <PATH> --json"
-            | "veil scan <DIR> --json"
-            | "veil packs --json"
-            | "veil config --json"
-            | "veil audit --json"
-    )
-}
-
-fn command_is_read_only(command: &str) -> bool {
-    !matches!(
-        command,
-        "veil < hook-payload.json" | "veil install" | "veil uninstall"
-    )
 }
 
 fn doctor_command_lines() -> Vec<&'static str> {
@@ -2162,36 +2068,53 @@ mod tests {
             .expect("top-level capabilities should render");
         let value: Value = serde_json::from_str(&rendered).expect("capabilities JSON should parse");
 
-        assert_eq!(value["schema_version"], CAPABILITIES_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], "operator.v1");
+        assert_eq!(value["discovery"]["triage"], "veil --robot-triage");
         assert_eq!(
-            value["standard_agent_surfaces"]["robot_triage"],
-            "veil --robot-triage"
-        );
-        assert_eq!(
-            value["standard_agent_surfaces"]["capabilities_json"],
+            value["discovery"]["capabilities"],
             "veil capabilities --json"
         );
+        assert_eq!(value["discovery"]["robot_docs"], "veil robot-docs guide");
+        let commands = value["commands"]
+            .as_array()
+            .expect("commands should be an array");
+        assert!(
+            commands.iter().any(|command| command["name"] == "operator"
+                && command["guard_preflight_required"] == true)
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command["name"] == "install" && command["read_only"] == false)
+        );
+    }
+
+    #[test]
+    fn describe_and_capabilities_json_are_the_operator_json_file() {
+        let file = include_str!("../operator.json").trim_end();
+        assert_eq!(run_describe(), file);
         assert_eq!(
-            value["standard_agent_surfaces"]["robot_docs"],
-            "veil robot-docs guide"
+            run_capabilities(&CapabilitiesArgs { json: true }).expect("capabilities renders"),
+            file
         );
-        assert_eq!(value["doctor"]["read_only"], true);
-        assert!(
-            value["commands"]
-                .as_array()
-                .expect("commands should be an array")
-                .iter()
-                .any(|command| command["command"] == "veil operator --json"
-                    && command["guard_preflight_required"] == true)
-        );
-        assert!(
-            value["commands"]
-                .as_array()
-                .expect("commands should be an array")
-                .iter()
-                .any(|command| command["command"] == "veil < hook-payload.json"
-                    && command["read_only"] == false)
-        );
+    }
+
+    #[test]
+    fn manifest_guard_preflight_flags_match_main_preflight_list() {
+        // main.rs decides which commands run the guard preflight; the manifest must agree.
+        let manifest: Value = serde_json::from_str(OPERATOR_JSON).expect("manifest parses");
+        for command in manifest["commands"].as_array().expect("commands array") {
+            let name = command["name"].as_str().expect("command name");
+            let declared = command["guard_preflight_required"] == true;
+            let exempt = matches!(
+                name,
+                "doctor" | "capabilities" | "robot-docs" | "install" | "uninstall"
+            );
+            assert_eq!(
+                declared, !exempt,
+                "manifest guard_preflight_required for `{name}` disagrees with main.rs preflight exemptions"
+            );
+        }
     }
 
     #[test]
