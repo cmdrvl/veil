@@ -211,7 +211,7 @@ fn test_of_a_directory_holding_protected_paths_is_a_denial_with_a_reason() {
     assert!(
         document["decision"]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("[sensitivity] protected")),
+            .is_some_and(|reason| reason.contains("protected paths")),
         "{document}"
     );
 }

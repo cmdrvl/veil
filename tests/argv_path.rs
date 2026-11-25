@@ -430,7 +430,7 @@ fn the_denial_names_the_command_and_the_label_and_is_not_the_direct_read_message
     let tree = bash(&repo, "tar czf /tmp/leak.tgz data");
     let reason = tree.reason.expect("a denial carries a reason");
     assert!(
-        reason.contains("`tar` names a directory that holds paths"),
+        reason.contains("`tar` names a directory that holds protected paths"),
         "{reason}"
     );
     assert!(reason.contains("(label: protected)"), "{reason}");
