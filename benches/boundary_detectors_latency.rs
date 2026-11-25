@@ -31,7 +31,7 @@ fn clean_payload(bytes: usize) -> Vec<u8> {
         state ^= state >> 7;
         state ^= state << 17;
         let word_index = usize::try_from(state % word_count).unwrap_or_default();
-        let word = WORDS.iter().nth(word_index).copied().unwrap_or("steady");
+        let word = WORDS.get(word_index).copied().unwrap_or("steady");
         output.extend_from_slice(word.as_bytes());
         output.push(b' ');
     }
