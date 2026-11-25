@@ -885,8 +885,10 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                 current.text.push(ch);
                 i += ch.len_utf8();
                 i += copy_plain_run(text, i, &mut current.text);
-                // digits alone at the start of a word may be a file descriptor
+                // digits alone at the start of a word may be a file descriptor;
+                // most words start with a letter and cost one comparison
                 fd = word_start
+                    && ch.is_ascii_digit()
                     && current.text.as_bytes()[run_start..]
                         .iter()
                         .all(u8::is_ascii_digit);
