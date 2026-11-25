@@ -99,6 +99,10 @@ limits to know about: the Grep tool's `glob` and `type` filters are not
 honored, so a search of a directory that holds protected data is denied even
 if the filter would have skipped it (search a narrower path instead); and a
 directory with more than 200,000 entries is refused rather than assumed clean.
+The walk looks for paths covered by `[sensitivity] protected` only. A file that
+only a built-in sensitivity pack recognises (`.env`, key files) is not found by
+it, so a recursive search of a directory holding nothing else is not denied
+today; naming the file (`cat .env`) still is.
 
 A Bash tool call is judged one command at a time, not by its first word. veil
 splits the line on `;`, `&`, `&&`, `||`, `|` and newlines, looks inside `$( )`,
@@ -115,12 +119,13 @@ cat data/b.csv` still denies the `cat`.
 `find data -exec cat {} \;` is treated as a content read of `data`, because the
 files `{}` stands for are unknown; `-name`, `-type` and `-prune` filters are not
 honored, so it is denied if `data` holds anything protected. What veil does not
-follow: variables and other expansions (`cat $f`), a script piped into a shell
-(`echo '...' | sh`), `source`, a `cd` earlier in the line (paths resolve against
-the directory the hook started in), programs that run a command but are not in
-the list above (`docker exec`, `ssh host cmd`, `git grep`), command text it
-cannot parse, and anything past the 64th command of one line or the 8th level of
-nesting. Those are allowed today.
+follow: a script piped into a shell (`echo '...' | sh`), `source`, a `cd` earlier
+in the line (paths resolve against the directory the hook started in), and
+programs that run a command but are not in the list above (`docker exec`, `ssh
+host cmd`, `git grep`). Those are allowed today. Variables, `$( )` results, what
+`xargs` reads, command text veil cannot parse and anything past the 64th command
+of one line or the 8th level of nesting are the dynamic-argument stance's; see
+[Dynamic Arguments](#dynamic-arguments).
 
 Each of those commands is then judged by the paths it names, not by whether veil
 knows it as a reader. `awk 1 data/x.csv`, `sed`, `jq`, `base64`, `xxd`, `perl`,
@@ -152,7 +157,8 @@ Denials say which command named the path and carry the label
 (`(label: protected)`, from the `public < derived < protected` model in
 `docs/plan.md`). Each audit record has a `reason_class`: `direct_read` for a
 Read or Grep call or a command veil recognises as a reader, `argv_path` for a
-path named by any other command. A word that is not protected writes no record.
+path named by any other command, `dynamic_path_unresolvable` for an argument veil
+could not resolve to a path. A word that is not protected writes no record.
 
 Limits to know about:
 - Output redirections are not paths when attached (`2>/dev/null`, `>out`). A bare
@@ -165,11 +171,72 @@ Limits to know about:
   followed, existence checked). A word with a slash or a data-file extension
   past the 64th is still compared with `[sensitivity] protected` as text, but a
   bare name or a symlink past it is not checked.
-- Not a path, so not checked: anything a shell expands (`cat $f`), what `xargs`
-  reads from standard input, files a script opens on its own, and a path in a
-  quoted literal that holds more than the path (`"cat data/x.csv"`).
+- Not a path, so not checked: files a script opens on its own, and a path in a
+  quoted literal that holds more than the path (`"cat data/x.csv"`). What a
+  shell expands (`cat $f`) and what `xargs` reads are covered by the
+  dynamic-argument stance below.
 - A `cd` earlier in the line is not followed; paths resolve against the
   directory the hook started in.
+
+### Dynamic Arguments
+
+veil judges the paths a command names, so a command whose arguments a shell
+fills in later (`cat $f`, `cat $(ls)`, `ls | xargs cat`, `cat file{1..100}`) has
+paths veil cannot see. This is the one place veil fails closed by design: an
+argument it cannot resolve to a path is a reason to deny, not to allow.
+
+veil first resolves what it can from the command text: simple assignments
+(`f=.env; cat $f`, `export F=.env`), `$HOME`, `~` and `$PWD`, brace lists, quote
+removal, ANSI-C strings (`$'.e\x6ev'`), and `for f in a b c; do cat $f; done`,
+which judges every word of the list. A name is trusted only when it is assigned
+once in the command string. A name that is assigned twice, appended to (`+=`), or
+set by `read`, `select`, `mapfile`, `getopts`, `printf -v` or a `for` with no list
+is unknown, and `$PWD` is unknown after a `cd`. An unresolved word is then
+judged by what the command is:
+
+- A reader (`cat`, `head`, `tail`, `less`, `bat`, the grep family), a content
+  filter (`awk`, `sed`, `jq`, `cut`, `sort`, `base64`, `xxd`, `diff`,
+  `sqlite3`...), a bulk transfer (`cp`, `mv`, `tar`, `rsync`, `scp`, `curl`,
+  `aws`, `docker`...), a program that is itself a variable or `$( )` result, and
+  text veil cannot parse or that is past the 64th command or 8th level of
+  nesting, is denied for any unresolved word, in any directory. For the readers
+  veil parses, only a word in a place that names a file counts: `grep "$p" file`
+  and `head -n $n file` are allowed, `cat $f` and `grep pat $f` are not.
+- Any other command is denied only in a protected context: when the directory it
+  runs in holds a path covered by `[sensitivity] protected` (the walk a recursive
+  search uses), or when an assignment in the command names a protected path.
+  `echo $x` and `make $target` run freely elsewhere.
+
+A denial says `dynamic_path_unresolvable` in its audit record and asks you to
+rewrite the command with a literal path. Set `[policy] dynamic_args` (or
+`VEIL_DYNAMIC_ARGS`) to change it: `deny` (the default) blocks, `warn` allows
+and writes the finding to the audit log only (the agent is not told), `allow`
+does not judge unresolved arguments at all. A path the command names outright is
+judged as before whichever value is set.
+
+False positives, measured. Replaying the 24,842 distinct (command, directory)
+pairs the agent ran over 30 days, read from session transcripts because the audit
+log does not keep command text, 679 of the 24,681 that the previous release
+allowed (2.75%) are denied now. Of the 681 denials that `dynamic_args = allow`
+would lift, 672 are an unresolved argument to a reader, filter or bulk transfer,
+5 are text veil cannot analyse and 4 are a string that assigns a protected path.
+By the shape of the unresolved word: 533 a variable the command never assigns,
+116 a `$( )` result, 13 names `xargs` reads, 14 other. By program, `aws` (168),
+`sed` (133), `grep` (120), `rg` (36), `cat` (34), `curl` (29), `jq` (15), `cp`
+(13) and `cmp` (12) lead. `aws`, `sed`, `curl`, `jq`, `cp` and `cmp` are 370 of
+them: veil has no parser for which of their words is a file, so any unresolved
+word counts, and teaching it each command's grammar is how that number falls.
+The history is one machine's, replayed against a scratch home with the default
+configuration, so read it as the cost on that history and not a prediction for
+another.
+
+What this does not do: `cd` earlier in the line is not followed, so
+`cd data && cat $f` resolves against the starting directory; a script that
+computes its own paths is not read; `find . -exec cat {} \;` and `grep -r` of a
+directory holding only a pack-recognised file such as `.env` are allowed (see the
+directory-scope note above); and a `$VAR` set in the caller's environment before
+the hook runs is unknown, so `cat $HOME_FILE` is denied even when the variable is
+harmless.
 
 `[sensitivity] protected` patterns are held in an index (names, a trie of path
 components, and globs filed by a literal part they must contain), so a lookup
@@ -237,6 +304,9 @@ safe_patterns = [
 default = "deny"           # deny | warn | log
 audit_log = true           # Log all access attempts
 audit_path = "~/.cmdrvl/logs/veil/audit.jsonl"  # default; outside repo
+# What to do with a command whose arguments veil cannot resolve to a path
+# (see Dynamic Arguments). Also set by VEIL_DYNAMIC_ARGS.
+dynamic_args = "deny"      # deny | warn | allow
 ```
 
 veil also ships a built-in CMD+RVL config-protection profile. Direct content
