@@ -327,17 +327,17 @@ email or chat client.
 
 It does not decide whether an outbound message body is safe, complete,
 appropriate for a counterpart, or compliant with a relationship-specific
-disclosure profile. That belongs in the calling wrapper and, later, the KOVREX
-surface that owns counterpart identity, authorization, approval state, and
-send-path policy.
+disclosure profile. That belongs in the calling wrapper and, later, an external
+send-policy / disclosure service that owns counterpart identity, authorization,
+approval state, and send-path policy.
 
 Use the split this way:
 
 - `veil`: block raw local reads and screen referenced file paths.
 - calling wrapper: classify outbound intent, recipient, approval context, and
   body text.
-- KOVREX integration: enforce account, counterpart, and disclosure policy before
-  a send action is allowed.
+- external send-policy / disclosure service: enforce account, counterpart, and
+  disclosure policy before a send action is allowed.
 
 Do not extend `veil` into a generic outbound content moderator. If the outbound
 body is already in the agent context, `veil` is no longer the right abstraction.
