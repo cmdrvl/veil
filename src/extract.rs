@@ -12,6 +12,7 @@ mod decompose;
 mod egress;
 mod expand;
 mod script;
+mod sed;
 mod wrappers;
 
 pub use decompose::{
@@ -262,14 +263,33 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
     paths.extend(egress::here_string_paths(program, args));
     paths.extend(egress::option_script_paths(program, args));
 
+    // The files a sed script reads (`r`, `R`) are read like a `cat`'s; the ones
+    // it writes (`w`, `W`, the `w` flag of `s`) are named paths, judged with the
+    // other words of the command (bd-pm8).
+    let sed_script = sed::is_sed(command_name(program)).then(|| sed::script_files(args));
+    if let Some(script) = &sed_script {
+        paths.extend(script.reads.iter().cloned());
+    }
+    let script_writes: &[String] = sed_script
+        .as_ref()
+        .map_or(&[][..], |script| script.writes.as_slice());
+
     // A reader veil parses names its files exactly, so an unresolved word that
     // is a pattern or an option's value (`grep "$p" file`, `head -n $n file`)
     // is no file at all.
-    let unresolved = if is_known_reader(program) {
+    let mut unresolved = if is_known_reader(program) {
         unresolved_files(&command.unresolved, &paths)
     } else {
         command.unresolved.clone()
     };
+    // A sed script veil cannot parse, or one that runs a command, is as opaque
+    // as a word it cannot resolve: the dynamic-argument stance decides (bd-pm8).
+    if let Some(script) = sed_script
+        .as_ref()
+        .and_then(|script| script.refused.clone())
+    {
+        unresolved.push(script);
+    }
 
     let candidates = normalize_candidates(paths, cwd);
     let exposure = if candidates.is_empty() {
@@ -288,6 +308,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         let paths = argv_paths(
             program,
             args,
+            script_writes,
             exposure == PathExposure::ReadsContents,
             &candidates,
             cwd,
@@ -343,6 +364,7 @@ const CONTENT_FILTER_COMMANDS: &[&str] = &[
     "gawk",
     "mawk",
     "sed",
+    "gsed",
     "jq",
     "yq",
     "cut",
@@ -516,10 +538,13 @@ fn git_subcommand(args: &[String]) -> Option<&str> {
 /// words: `2>/dev/null` and `> out.txt` are not paths the command reads, and
 /// `< file` is already a read through `redirects_in`. `reads` says whether the
 /// command reads what it names, in which case a glob also names the directory
-/// it starts from.
+/// it starts from. `named` are files the command's own script names outright,
+/// which no word of it spells (a sed script's `w .env`): each is a path whether
+/// or not it exists.
 fn argv_paths(
     program: &str,
     args: &[String],
+    named: &[String],
     reads: bool,
     already: &[PathBuf],
     cwd: &Path,
@@ -529,7 +554,7 @@ fn argv_paths(
     let mut budget = ARGV_FILESYSTEM_BUDGET;
     let mut resolver = ArgvResolver::new(cwd);
 
-    for word in argv_path_words(program, args) {
+    for word in argv_path_words(program, args, named) {
         let mut resolve = |raw: &str, found: &mut Vec<ArgvPath>| {
             let resolved = budget > 0;
             let path = if resolved {
@@ -580,8 +605,8 @@ struct PathWord {
 /// `key=value` (curl's `file=@x.csv`), drops a leading `@` or `<`, and takes
 /// each quoted literal inside a longer word (`select * from 'x.csv'`,
 /// `open('x.csv')`). The script handed to a shell is skipped: the decomposer
-/// runs it as commands of its own.
-fn argv_path_words(program: &str, args: &[String]) -> Vec<PathWord> {
+/// runs it as commands of its own. `named` are added last, as certain paths.
+fn argv_path_words(program: &str, args: &[String], named: &[String]) -> Vec<PathWord> {
     let mut words: Vec<PathWord> = Vec::new();
     let mut add = |text: &str| {
         let text = text.trim_start_matches(['@', '<']);
@@ -645,6 +670,18 @@ fn argv_path_words(program: &str, args: &[String]) -> Vec<PathWord> {
     // `--data-urlencode name@x.csv`, `x.csv#label` (bd-x8o).
     for file in egress::operand_paths(program, args) {
         add(&file);
+    }
+
+    // What the command's script names outright. `add` would drop a bare name
+    // that is not shaped like a path (`.env`) unless it exists, but a script's
+    // `w .env` names the file whether or not it is there yet.
+    for file in named {
+        if !file.is_empty() && !words.iter().any(|word| word.text == *file) {
+            words.push(PathWord {
+                text: file.clone(),
+                certain: true,
+            });
+        }
     }
 
     words

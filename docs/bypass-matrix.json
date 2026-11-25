@@ -19,8 +19,16 @@
         "text": "TOKEN=abc\n"
       },
       {
+        "path": "secret.json",
+        "text": "{\"k\": \"v\"}\n"
+      },
+      {
         "path": "notes.md",
         "text": "notes\n"
+      },
+      {
+        "path": "scripts/read.sed",
+        "text": "r .env\n"
       },
       {
         "path": "copy.csv",
@@ -432,6 +440,231 @@
       "sandbox": "not addressed: a listing reads the directory, not the file; whether the profile also denies file metadata is not decided here",
       "tool_input": {
         "command": "ls -l data/clients"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-script-r",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed 'r .env' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-script-big-r",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed 'R .env' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-script-addressed-r",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -n '1r .env' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-script-r-config-path",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed 'r data/clients/holdings.csv' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "sed-script-expression-w",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -e 'w .env' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "sed-script-s-flag-w",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed 's/a/b/w .env' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "dynamic_path_unresolvable"
+      },
+      "id": "sed-script-e-command",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed 'e cat .env' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "dynamic_path_unresolvable"
+      },
+      "id": "sed-script-unparseable",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed 'k' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "sed-file-option",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -f .env notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "cause": "the script file is not protected and veil does not read sed script files",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "sed-file-script",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -f scripts/read.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "sed-control-print",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "sed -n 5p notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "sed-control-substitute",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "sed 's/a/b/' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "sed-control-text-is-not-a-command",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "sed 's/r .env/x/' notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "awk-getline-file",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "awk 'BEGIN{while((getline l < \".env\")>0) print l}'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "cause": "the file is named by an import in the jq program, which veil does not parse",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "jq-import-data",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -L . -n 'import \"secret\" as $d; $d'"
       },
       "tool_name": "Bash"
     },

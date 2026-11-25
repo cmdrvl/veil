@@ -5,7 +5,7 @@
 
 Enforcement level today: **hook-only** (advisory; parser-based). `veil` reads the text of a tool call before it runs and decides from the paths that text names. It does not sandbox anything, so anything it cannot see in that text it cannot stop.
 
-118 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **86** are blocked, **24** are still ALLOWED and are listed below (14 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 8 are controls that must stay allowed.
+133 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **96** are blocked, **26** are still ALLOWED and are listed below (16 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 11 are controls that must stay allowed.
 
 How to read the columns:
 
@@ -19,13 +19,15 @@ How to read the columns:
 
 These are listed, not hidden. They are grouped by what they let out, because a file listing and a `git push` are not the same thing.
 
-### Contents can get out (14)
+### Contents can get out (16)
 
 The contents of a protected file can get out this way.
 
 | Vector | Why it is allowed | Sandbox |
 |---|---|---|
 | `sqlite3 :memory: ".import data/clients/holdings.csv t" "select * from t"` | the path is inside one quoted `.import` argument, which veil let through | blocked (design, not run) |
+| `sed -f scripts/read.sed notes.md` | the script file is not protected and veil does not read sed script files | blocked (design, not run) |
+| `jq -L . -n 'import "secret" as $d; $d'` | the file is named by an import in the jq program, which veil does not parse | blocked (design, not run) |
 | `cat hard.csv` | a hardlink is the same file under another name, and the name is not protected | **ALLOWED** (measured, ADR B-1): ADR B-1 measured the hardlink read succeeding under a literal-path profile |
 | `cat copy.csv` | a copy made earlier is a different, unprotected path: labels do not follow copies | **ALLOWED** (design, not run): the copy is at an unprotected path |
 | `python3 scripts/build_path.py` | the path is built from pieces that never spell a protected name; veil reads scripts as text | blocked (design, not run) |
@@ -98,6 +100,21 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `tool-sort` | `sort data/clients/holdings.csv` | blocked: argv_path | blocked (design, not run) | found since |  |
 | `tool-wc` | `wc -l data/clients/holdings.csv` | **ALLOWED**: a count, not the contents: wc is metadata-only by design | blocked (design, not run) | found since | reveals the number of rows |
 | `tool-ls` | `ls -l data/clients` | **ALLOWED**: names, sizes and dates, not contents | not addressed: a listing reads the directory, not the file; whether the profile also denies file metadata is not decided here | found since |  |
+| `sed-script-r` | `sed 'r .env' notes.md` | blocked: direct_read | blocked (design, not run) | found since | `r` copies the whole file after each line |
+| `sed-script-big-r` | `sed 'R .env' notes.md` | blocked: direct_read | blocked (design, not run) | found since | `R` copies one line of the file after each line |
+| `sed-script-addressed-r` | `sed -n '1r .env' notes.md` | blocked: direct_read | blocked (design, not run) | found since | an address in front of the command |
+| `sed-script-r-config-path` | `sed 'r data/clients/holdings.csv' notes.md` | blocked: direct_read | blocked (design, not run) | found since | a file the project config protects, not a pack's |
+| `sed-script-expression-w` | `sed -e 'w .env' notes.md` | blocked: argv_path | blocked (design, not run) | found since | `w` writes the input lines to the file; a write is judged as naming the path |
+| `sed-script-s-flag-w` | `sed 's/a/b/w .env' notes.md` | blocked: argv_path | blocked (design, not run) | found since | the `w` flag of `s` |
+| `sed-script-e-command` | `sed 'e cat .env' notes.md` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since | GNU `e` runs a command: veil does not judge it as a nested command, it refuses the script |
+| `sed-script-unparseable` | `sed 'k' notes.md` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since | `k` is no sed command in any dialect; a script veil cannot parse is refused, not skipped |
+| `sed-file-option` | `sed -f .env notes.md` | blocked: argv_path | blocked (design, not run) | baseline | the script file itself is a protected path |
+| `sed-file-script` | `sed -f scripts/read.sed notes.md` | **ALLOWED**: the script file is not protected and veil does not read sed script files | blocked (design, not run) | found since | scripts/read.sed holds `r .env`; unlike scripts an interpreter runs, a sed script file is not opened (bd-1bk covers python, node and shell) |
+| `sed-control-print` | `sed -n 5p notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: no file in the script |
+| `sed-control-substitute` | `sed 's/a/b/' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control |
+| `sed-control-text-is-not-a-command` | `sed 's/r .env/x/' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: `r .env` is the pattern of a substitution, not a command; a parser sees that, a text search would not |
+| `awk-getline-file` | `awk 'BEGIN{while((getline l < ".env")>0) print l}'` | blocked: argv_path | blocked (design, not run) | found since | confirmed denied: the quoted literal is found inside the program text |
+| `jq-import-data` | `jq -L . -n 'import "secret" as $d; $d'` | **ALLOWED**: the file is named by an import in the jq program, which veil does not parse | blocked (design, not run) | found since | reads ./secret.json, a credentials-pack name |
 
 ### Shell indirection
 
