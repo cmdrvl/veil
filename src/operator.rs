@@ -27,9 +27,9 @@ const RECENT_AUDIT_LIMIT: usize = 20;
 /// both print exactly this document.
 const OPERATOR_JSON: &str = include_str!("../operator.json");
 const HOOK_DECISION_SCHEMA: &str = include_str!("../hook-decision.schema.json");
-const DOCTOR_HEALTH_SCHEMA_VERSION: &str = "veil.doctor.health.v1";
+/// Family doctor report schema (`spine-rules` `cmdrvl.doctor.v1`) for every doctor mode.
+const DOCTOR_SCHEMA_VERSION: &str = "cmdrvl.doctor.v1";
 const DOCTOR_CAPABILITIES_SCHEMA_VERSION: &str = "veil.doctor.capabilities.v1";
-const DOCTOR_TRIAGE_SCHEMA_VERSION: &str = "veil.doctor.triage.v1";
 const READ_ONLY_DOCTOR_CONTRACT: &str = "cmdrvl.read_only_doctor.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,21 +120,35 @@ pub fn run_robot_docs(_args: &RobotDocsArgs) -> Result<String, Box<dyn std::erro
     Ok(render_robot_docs_guide())
 }
 
-pub fn run_doctor(args: &DoctorArgs) -> Result<String, Box<dyn std::error::Error>> {
+/// Runs a doctor command and returns its output with the process exit code:
+/// `0` healthy, `1` unhealthy (an `error` finding). Usage errors exit `2` in clap.
+/// `doctor capabilities` and `doctor robot-docs` describe the tool; they do not
+/// inspect health, so they always exit `0`.
+pub fn run_doctor(args: &DoctorArgs) -> Result<(String, u8), Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
-    if args.robot_triage {
-        return render_doctor_robot_triage_for_repo(&repo_root);
+
+    // `--robot-triage` is the deprecated spelling of `doctor triage --json`.
+    if args.robot_triage || matches!(&args.action, Some(DoctorAction::Triage(_))) {
+        let report = current_doctor_report(&repo_root);
+        let exit = report.exit_code();
+        return Ok((
+            serde_json::to_string_pretty(&report.to_triage_json_value())?,
+            exit,
+        ));
     }
 
     match &args.action {
+        Some(DoctorAction::Capabilities(capabilities_args)) => {
+            Ok((render_doctor_capabilities(capabilities_args)?, 0))
+        }
+        Some(DoctorAction::RobotDocs) => Ok((render_doctor_robot_docs(), 0)),
         Some(DoctorAction::Health(health_args)) => {
             render_doctor_health_for_repo(&repo_root, args.json || health_args.json)
         }
-        Some(DoctorAction::Capabilities(capabilities_args)) => {
-            render_doctor_capabilities(capabilities_args)
+        // `Triage` already returned above; it shares the default arm only to keep the match exhaustive.
+        Some(DoctorAction::Triage(_)) | None => {
+            render_doctor_health_for_repo(&repo_root, args.json)
         }
-        Some(DoctorAction::RobotDocs) => Ok(render_doctor_robot_docs()),
-        None => render_doctor_health_for_repo(&repo_root, args.json),
     }
 }
 
@@ -192,11 +206,8 @@ fn render_audit_for_path(
     }
 }
 
-fn render_doctor_health_for_repo(
-    repo_root: &Path,
-    json_output: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let report = build_doctor_report(
+fn current_doctor_report(repo_root: &Path) -> DoctorReport {
+    build_doctor_report(
         repo_root,
         match hooks::default_settings_path() {
             Ok(path) => SettingsPathStatus::Resolved(path),
@@ -204,52 +215,52 @@ fn render_doctor_health_for_repo(
         },
         hooks::detect_harness(|name| env::var(name).ok()),
         env::var_os("PATH").as_deref(),
-    );
+    )
+}
+
+fn render_doctor_health_for_repo(
+    repo_root: &Path,
+    json_output: bool,
+) -> Result<(String, u8), Box<dyn std::error::Error>> {
+    let report = current_doctor_report(repo_root);
+    let exit = report.exit_code();
 
     if json_output {
-        Ok(serde_json::to_string_pretty(&report.to_json_value())?)
+        Ok((serde_json::to_string_pretty(&report.to_json_value())?, exit))
     } else {
-        Ok(render_doctor_human(&report))
+        Ok((render_doctor_human(&report), exit))
     }
+}
+
+/// `doctor capabilities`: a `cmdrvl.doctor.v1` report in `capabilities` mode whose
+/// `contract` is the operator manifest, identical to `capabilities --json`.
+/// It describes the tool and inspects nothing, so it carries no findings.
+fn doctor_capabilities_report_value() -> Result<Value, serde_json::Error> {
+    let mut value = json!({
+        "schema_version": DOCTOR_SCHEMA_VERSION,
+        "mode": "capabilities",
+        "tool": "veil",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "healthy": true,
+        "findings": [],
+        "contract": serde_json::from_str::<Value>(OPERATOR_JSON)?,
+    });
+    value["doctor"] = doctor_capabilities_json_value();
+    Ok(value)
 }
 
 fn render_doctor_capabilities(
     args: &DoctorCapabilitiesArgs,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let value = doctor_capabilities_json_value();
-
     if args.json {
-        Ok(serde_json::to_string_pretty(&value)?)
+        Ok(serde_json::to_string_pretty(
+            &doctor_capabilities_report_value()?,
+        )?)
     } else {
-        Ok(render_doctor_capabilities_human(&value))
+        Ok(render_doctor_capabilities_human(
+            &doctor_capabilities_json_value(),
+        ))
     }
-}
-
-fn render_doctor_robot_triage_for_repo(
-    repo_root: &Path,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let report = build_doctor_report(
-        repo_root,
-        match hooks::default_settings_path() {
-            Ok(path) => SettingsPathStatus::Resolved(path),
-            Err(error) => SettingsPathStatus::Error(error.to_string()),
-        },
-        hooks::detect_harness(|name| env::var(name).ok()),
-        env::var_os("PATH").as_deref(),
-    );
-
-    Ok(serde_json::to_string_pretty(&json!({
-        "guard_posture": report.guard_posture,
-        "schema_version": DOCTOR_TRIAGE_SCHEMA_VERSION,
-        "tool": "veil",
-        "version": env!("CARGO_PKG_VERSION"),
-        "contract": READ_ONLY_DOCTOR_CONTRACT,
-        "ok": report.is_healthy(),
-        "summary": report.summary_json_value(),
-        "checks": report.checks_json_value(),
-        "recommended_actions": report.recommended_actions_json_value(),
-        "capabilities": doctor_capabilities_json_value(),
-    }))?)
 }
 
 fn render_operator_for_repo(
@@ -995,8 +1006,8 @@ fn render_robot_docs_guide() -> String {
         "veil robot-docs guide",
         "",
         "Quick start:",
-        "- `veil --robot-triage` returns one read-only JSON health/capability bundle.",
-        "- `veil capabilities --json` returns the full machine-readable command contract.",
+        "- `veil doctor triage --json` returns one read-only cmdrvl.doctor.v1 report with next actions (exit 0 healthy, 1 unhealthy). `veil --robot-triage` is its deprecated alias.",
+        "- `veil capabilities --json` (same document as `veil --describe`) returns the full machine-readable operator.v1 contract; `veil --schema` prints the JSON Schema for hook-mode stdout.",
         "- `veil operator --json` lists configured spine tools after guard hooks are healthy.",
         "- `veil test PATH --json` predicts the read decision for one path after guard hooks are healthy.",
         "- `veil explain PATH --json` shows allowlist/protected-pack matching after guard hooks are healthy.",
@@ -1008,8 +1019,8 @@ fn render_robot_docs_guide() -> String {
         "Guard preflight:",
         "- Under Claude Code, domain commands fail closed unless healthy veil Read/Grep/Bash hooks are installed. Other harnesses (Codex, Gemini CLI, Cursor, plain shell) do not need Claude hooks; their veil wiring is reported as unverified.",
         "- dcg is optional: set `[policy] require_dcg = true` to make a healthy dcg a hard requirement.",
-        "- `veil doctor health --json` and `veil --robot-triage` report the detected harness and `guard_posture`. Set `VEIL_HARNESS` (claude-code, codex, gemini-cli, cursor, plain) to override detection.",
-        "- `veil doctor`, `veil --robot-triage`, `veil capabilities --json`, `veil robot-docs guide`, `veil install`, and `veil uninstall` remain available for maintenance.",
+        "- `veil doctor --json` and `veil doctor triage --json` report the detected harness and `guard_posture`. Set `VEIL_HARNESS` (claude-code, codex, gemini-cli, cursor, plain) to override detection.",
+        "- `veil doctor`, `veil capabilities --json`, `veil --describe`, `veil robot-docs guide`, `veil install`, and `veil uninstall` remain available for maintenance.",
         "",
         "Composition:",
         "- Use `dcg` to block destructive shell commands.",
@@ -1030,13 +1041,16 @@ fn render_doctor_robot_docs() -> String {
         "- No fix mode is available in this release.",
         "",
         "Commands:",
-        "- veil doctor health",
-        "- veil doctor health --json",
+        "- veil doctor",
+        "- veil doctor --json",
         "- veil doctor capabilities --json",
-        "- veil doctor --robot-triage",
+        "- veil doctor triage --json",
         "- veil doctor robot-docs",
+        "- Deprecated aliases (same documents): veil doctor health [--json], veil doctor --robot-triage, veil --robot-triage",
         "",
-        "When `ok` is false, follow `recommended_actions` manually or run `veil install` only when the operator has chosen to repair hook settings.",
+        "Exit codes: 0 healthy, 1 unhealthy (an error finding), 2 usage error. JSON is cmdrvl.doctor.v1.",
+        "",
+        "When `healthy` is false, follow `next_actions` (or `recommended_actions`) manually or run `veil install` only when the operator has chosen to repair hook settings.",
     ]
     .join("\n")
 }
@@ -1431,12 +1445,47 @@ impl DoctorReport {
             .collect::<Vec<_>>()
     }
 
+    /// Process exit code for this report: `0` healthy, `1` unhealthy.
+    fn exit_code(&self) -> u8 {
+        if self.is_healthy() { 0 } else { 1 }
+    }
+
+    /// `cmdrvl.doctor.v1` findings: one per check; a check needing action is an
+    /// `error` finding, so `healthy` is exactly "no error finding".
+    fn findings_json_value(&self) -> Vec<Value> {
+        self.checks
+            .iter()
+            .map(|check| {
+                let mut finding = json!({
+                    "id": check.name,
+                    "severity": match check.status {
+                        DoctorStatus::Ok => "info",
+                        DoctorStatus::ActionNeeded => "error",
+                    },
+                    "message": check.detail,
+                });
+                if let Some(fix) = &check.remediation {
+                    finding["fix"] = json!(fix);
+                }
+                finding
+            })
+            .collect()
+    }
+
+    /// `cmdrvl.doctor.v1`, mode `health`. The pre-v1 detail fields (`checks`,
+    /// `summary`, `recommended_actions`, `guard_posture`, `fixers`) remain as
+    /// additive extras; `contract` is reserved for capabilities mode, so the old
+    /// string of that name is now `read_only_contract`.
     fn to_json_value(&self) -> Value {
         json!({
-            "schema_version": DOCTOR_HEALTH_SCHEMA_VERSION,
+            "schema_version": DOCTOR_SCHEMA_VERSION,
+            "mode": "health",
             "tool": "veil",
+            "tool_version": env!("CARGO_PKG_VERSION"),
+            "healthy": self.is_healthy(),
+            "findings": self.findings_json_value(),
             "version": env!("CARGO_PKG_VERSION"),
-            "contract": READ_ONLY_DOCTOR_CONTRACT,
+            "read_only_contract": READ_ONLY_DOCTOR_CONTRACT,
             "ok": self.is_healthy(),
             "summary": self.summary_json_value(),
             "checks": self.checks_json_value(),
@@ -1444,6 +1493,27 @@ impl DoctorReport {
             "guard_posture": self.guard_posture,
             "fixers": [],
         })
+    }
+
+    /// `cmdrvl.doctor.v1`, mode `triage`. `next_actions` is never empty when unhealthy.
+    fn to_triage_json_value(&self) -> Value {
+        let mut next_actions: Vec<String> = self
+            .checks
+            .iter()
+            .filter(|check| check.status == DoctorStatus::ActionNeeded)
+            .filter_map(|check| check.remediation.clone())
+            .collect();
+        if !self.is_healthy() && next_actions.is_empty() {
+            next_actions.push(
+                "run `veil doctor` for details, then repair the reported findings".to_owned(),
+            );
+        }
+
+        let mut value = self.to_json_value();
+        value["mode"] = json!("triage");
+        value["next_actions"] = json!(next_actions);
+        value["doctor"] = doctor_capabilities_json_value();
+        value
     }
 }
 
@@ -1959,8 +2029,22 @@ mod tests {
         )
         .to_json_value();
 
-        assert_eq!(value["schema_version"], DOCTOR_HEALTH_SCHEMA_VERSION);
-        assert_eq!(value["contract"], READ_ONLY_DOCTOR_CONTRACT);
+        assert_eq!(value["schema_version"], "cmdrvl.doctor.v1");
+        assert_eq!(value["mode"], "health");
+        assert_eq!(value["healthy"], true);
+        assert!(
+            value["findings"]
+                .as_array()
+                .expect("findings should be an array")
+                .iter()
+                .all(|finding| finding["severity"] == "info"),
+            "a healthy report has no error findings"
+        );
+        assert_eq!(value["read_only_contract"], READ_ONLY_DOCTOR_CONTRACT);
+        assert!(
+            value.get("contract").is_none(),
+            "`contract` is reserved for capabilities mode"
+        );
         assert_eq!(value["ok"], true);
         assert_eq!(
             value["checks"]
@@ -2006,7 +2090,11 @@ mod tests {
     fn doctor_capabilities_json_reports_read_only_no_fix_contract() {
         let rendered = render_doctor_capabilities(&DoctorCapabilitiesArgs { json: true })
             .expect("capabilities should render");
-        let value: Value = serde_json::from_str(&rendered).expect("capabilities JSON should parse");
+        let report: Value =
+            serde_json::from_str(&rendered).expect("capabilities JSON should parse");
+        assert_eq!(report["schema_version"], "cmdrvl.doctor.v1");
+        assert_eq!(report["mode"], "capabilities");
+        let value = &report["doctor"];
 
         assert_eq!(value["schema_version"], DOCTOR_CAPABILITIES_SCHEMA_VERSION);
         assert_eq!(value["contract"], READ_ONLY_DOCTOR_CONTRACT);
@@ -2031,25 +2119,69 @@ mod tests {
             hooks::Harness::ClaudeCode,
             None,
         );
-        let value = json!({
-            "schema_version": DOCTOR_TRIAGE_SCHEMA_VERSION,
-            "tool": "veil",
-            "version": env!("CARGO_PKG_VERSION"),
-            "contract": READ_ONLY_DOCTOR_CONTRACT,
-            "ok": report.is_healthy(),
-            "summary": report.summary_json_value(),
-            "checks": report.checks_json_value(),
-            "recommended_actions": report.recommended_actions_json_value(),
-            "capabilities": doctor_capabilities_json_value(),
-        });
+        let value = report.to_triage_json_value();
 
-        assert_eq!(value["schema_version"], DOCTOR_TRIAGE_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], "cmdrvl.doctor.v1");
+        assert_eq!(value["mode"], "triage");
+        assert_eq!(value["healthy"], false);
         assert_eq!(value["ok"], false);
         assert_eq!(value["summary"]["read_only"], true);
         assert!(
             value["recommended_actions"]
                 .as_array()
                 .is_some_and(|actions| !actions.is_empty())
+        );
+        assert!(
+            value["next_actions"]
+                .as_array()
+                .is_some_and(|actions| !actions.is_empty()),
+            "an unhealthy triage report must say what to do next"
+        );
+    }
+
+    #[test]
+    fn doctor_exit_code_is_one_exactly_when_an_error_finding_exists() {
+        let repo_root = unique_temp_dir("doctor-exit-code");
+
+        // Planted unhealthy: Claude Code with no hooks installed.
+        let unhealthy = build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(repo_root.join("claude/settings.json")),
+            hooks::Harness::ClaudeCode,
+            None,
+        );
+        assert_eq!(unhealthy.exit_code(), 1);
+        assert!(!unhealthy.is_healthy());
+        let findings = unhealthy.to_json_value()["findings"].clone();
+        assert!(
+            findings
+                .as_array()
+                .expect("findings array")
+                .iter()
+                .any(|finding| finding["id"] == "hooks" && finding["severity"] == "error"),
+            "missing hooks must be an error finding"
+        );
+        assert_eq!(unhealthy.to_json_value()["healthy"], false);
+
+        // Healthy: a non-Claude harness needs no Claude hooks.
+        let healthy = build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(repo_root.join("claude/settings.json")),
+            hooks::Harness::Codex,
+            None,
+        );
+        assert_eq!(healthy.exit_code(), 0);
+        assert_eq!(healthy.to_json_value()["healthy"], true);
+    }
+
+    #[test]
+    fn doctor_capabilities_report_embeds_the_capabilities_document() {
+        let value = doctor_capabilities_report_value().expect("report builds");
+        assert_eq!(value["mode"], "capabilities");
+        assert_eq!(value["healthy"], true);
+        assert_eq!(
+            value["contract"],
+            serde_json::from_str::<Value>(OPERATOR_JSON).expect("manifest parses")
         );
     }
 
@@ -2069,7 +2201,7 @@ mod tests {
         let value: Value = serde_json::from_str(&rendered).expect("capabilities JSON should parse");
 
         assert_eq!(value["schema_version"], "operator.v1");
-        assert_eq!(value["discovery"]["triage"], "veil --robot-triage");
+        assert_eq!(value["discovery"]["triage"], "veil doctor triage --json");
         assert_eq!(
             value["discovery"]["capabilities"],
             "veil capabilities --json"

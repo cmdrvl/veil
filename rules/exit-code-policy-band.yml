@@ -1,0 +1,10 @@
+id: exit-code-policy-band
+language: rust
+message: |
+  Exit 3 is reserved for a valid policy verdict (e.g. assess BLOCK) and must
+  be declared in operator.json as {"3": {"domain": "policy"}}. Never use it
+  for refusals or CLI errors (those are 2). See docs/exit-codes.md.
+severity: warning
+note: "Family exit-code dictionary (policy band)"
+rule:
+  pattern: process::exit(3)

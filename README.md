@@ -71,8 +71,8 @@ repository before cutting a release. The tap job validates `Formula/veil.rb`,
 pushes directly to `main` when allowed, and opens a documented tap PR if branch
 protection blocks the direct push.
 
-The remaining signed checksum/provenance/SBOM release artifact expansion is
-tracked separately in bead `bd-37f`.
+Signed checksums, provenance attestations, and SBOMs are not yet published with
+releases; only the SHA-256 checksum asset above is.
 
 ---
 
@@ -156,18 +156,23 @@ or SSM Parameter Store adapter.
 When `veil` blocks a direct read, use the configured authorized path instead of guessing:
 
 ```bash
-veil --robot-triage
+veil doctor triage --json
 veil capabilities --json
+veil --describe
+veil --schema
 veil robot-docs guide
 veil operator
 veil operator --json
 ```
 
-`veil --robot-triage` is the fastest read-only machine entrypoint. It returns
-doctor health, recommendations, and the capabilities contract in one JSON
-document. `veil capabilities --json` exposes the stable command contract, exit
-codes, hook-mode expectations, and composition boundaries. `veil robot-docs
-guide` prints the agent-facing quick guide.
+`veil doctor triage --json` is the fastest read-only machine entrypoint: a
+`cmdrvl.doctor.v1` report with health findings and `next_actions`.
+`veil --robot-triage` is its deprecated alias and prints the same document.
+`veil --describe` and `veil capabilities --json` print the same `operator.v1`
+manifest (the repository's `operator.json`): commands, exit codes, environment
+variables, side effects, hook-mode expectations, and composition boundaries.
+`veil --schema` prints the JSON Schema for hook-mode stdout (the permission
+decision). `veil robot-docs guide` prints the agent-facing quick guide.
 
 `veil operator` reads `[spine] authorized_tools` from the active config, runs
 `--describe` on each installed tool, and prints a combined reference with any
@@ -180,21 +185,28 @@ managed Claude Read/Grep/Bash hook state without installing hooks, rewriting
 settings, appending audit records, or using the network.
 
 ```bash
-veil --robot-triage
-veil capabilities --json
-veil robot-docs guide
-veil doctor health
-veil doctor health --json
-veil doctor capabilities --json
+veil doctor                       # human report
+veil doctor --json                # cmdrvl.doctor.v1, mode "health"
+veil doctor capabilities --json   # mode "capabilities" (embeds the operator.v1 contract)
+veil doctor triage --json         # mode "triage" (adds next_actions)
 veil doctor robot-docs
-veil doctor --robot-triage
 ```
+
+Exit codes: `0` healthy, `1` unhealthy (at least one `error` finding), `2` usage
+errors only. The older spellings `veil doctor health [--json]`,
+`veil doctor --robot-triage` and `veil --robot-triage` still work: they print the
+same documents (`--robot-triage` is `doctor triage --json`) and exit by health.
+Their JSON now uses the `cmdrvl.doctor.v1` schema; consumers should key on
+`schema_version`. The previous `veil.doctor.*.v1` identifiers are gone, and the
+old `contract` string field is now `read_only_contract`.
 
 No `doctor --fix` mode is available yet. Any future repair mode must ship with
 detector, backup, inverse, fixture, and undo coverage before it is exposed.
 
-Bare `veil` remains hook mode for Claude/Gemini/Copilot settings and expects a
-hook payload on stdin. For operator discovery, use `veil --help` or the robot
+Bare `veil` is hook mode for Claude/Gemini/Copilot settings and expects a hook
+payload on stdin. Run with a terminal on stdin, or with empty stdin, it exits
+`2` immediately with pointers to `veil --help` and the discovery commands rather
+than waiting for input. For operator discovery, use `veil --help` or the
 surfaces above instead of running bare `veil`.
 
 ### Operator-First Workflow
@@ -239,7 +251,7 @@ File access attempt (Read/Grep/Bash)
     Bash PreToolUse hook under Claude Code, an executable on `PATH` elsewhere).
   - The harness is detected from its environment markers; set `VEIL_HARNESS`
     (`claude-code`, `codex`, `gemini-cli`, `cursor`, `plain`) to override.
-  - `veil doctor health --json` and `veil --robot-triage` include a
+  - `veil doctor --json` and `veil doctor triage --json` include a
     `guard_posture` object showing the harness, veil-hook and dcg status, and
     any blockers.
   - `veil doctor`, `veil install`, and `veil uninstall` remain available as

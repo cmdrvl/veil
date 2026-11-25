@@ -83,6 +83,35 @@ fn operator_json_is_valid_operator_v1() {
     assert_eq!(contract.name, "veil");
 }
 
+/// Public docs must not leak internal tracker ids such as `bd-37f`.
+fn internal_bead_ids(text: &str) -> Vec<&str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|word| {
+            word.strip_prefix("bd-").is_some_and(|rest| {
+                rest.len() >= 2 && rest.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn readme_has_no_internal_bead_ids() {
+    let leaks = internal_bead_ids(include_str!("../README.md"));
+    assert!(
+        leaks.is_empty(),
+        "README leaks internal bead ids: {leaks:?}"
+    );
+}
+
+#[test]
+fn bead_id_scanner_catches_planted_leaks_and_ignores_prose() {
+    assert_eq!(
+        internal_bead_ids("tracked in bead `bd-37f`, also (bd-2ll)."),
+        vec!["bd-37f", "bd-2ll"]
+    );
+    assert!(internal_bead_ids("a bd- prefix, abd-12 and bd-x? stay clean").is_empty());
+}
+
 #[test]
 fn every_clap_subcommand_is_declared_in_the_manifest() {
     let manifest: Value = serde_json::from_str(OPERATOR_JSON).expect("operator.json is JSON");

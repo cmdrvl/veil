@@ -23,7 +23,10 @@
       "veil packs [--json]",
       "veil config [--json]",
       "veil audit [--json]",
-      "veil doctor [health|capabilities|robot-docs] [--json]",
+      "veil doctor [--json]",
+      "veil doctor capabilities --json",
+      "veil doctor triage --json",
+      "veil doctor robot-docs",
       "veil install",
       "veil uninstall"
     ],
@@ -35,7 +38,7 @@
   "options": [
     { "name": "describe", "flag": "--describe", "type": "flag", "description": "Print this operator manifest (identical to `capabilities --json`) and exit 0" },
     { "name": "schema", "flag": "--schema", "type": "flag", "description": "Print the JSON Schema for hook-mode stdout (the permission decision) and exit 0" },
-    { "name": "robot_triage", "flag": "--robot-triage", "type": "flag", "description": "Emit read-only JSON doctor triage for agents" },
+    { "name": "robot_triage", "flag": "--robot-triage", "type": "flag", "description": "Deprecated alias of `veil doctor triage --json`" },
     { "name": "version", "flag": "--version", "type": "flag", "description": "Print the veil version and exit 0" }
   ],
   "commands": [
@@ -108,10 +111,11 @@
     },
     {
       "name": "doctor",
-      "description": "Inspect config, audit path and guard-hook health without writing. Subcommands: health (default), capabilities, robot-docs. `--robot-triage` emits JSON triage.",
+      "description": "Inspect config, audit path and guard-hook health without writing; every JSON form is a cmdrvl.doctor.v1 report. `doctor --json` is mode health; `doctor capabilities --json` is mode capabilities (its `contract` is this document); `doctor triage --json` is mode triage (with next_actions). Exits 0 healthy, 1 unhealthy. Deprecated aliases kept for compatibility: `doctor health [--json]`, `doctor --robot-triage` and top-level `--robot-triage` (same document as `doctor triage --json`).",
+      "subcommands": ["health", "capabilities", "triage", "robot-docs"],
       "options": [
         { "name": "json", "flag": "--json", "type": "flag", "description": "Emit doctor health as JSON" },
-        { "name": "robot_triage", "flag": "--robot-triage", "type": "flag", "description": "Emit read-only doctor triage JSON" }
+        { "name": "robot_triage", "flag": "--robot-triage", "type": "flag", "description": "Deprecated alias of `doctor triage --json`" }
       ],
       "read_only": true,
       "guard_preflight_required": false
@@ -131,7 +135,7 @@
   ],
   "exit_codes": {
     "0": { "meaning": "success, or a hook allow/deny decision was rendered", "domain": "positive" },
-    "1": { "meaning": "doctor reported an unhealthy state (an error finding); veil has no other verdict", "domain": "unhealthy" },
+    "1": { "meaning": "doctor reported an unhealthy state (an error finding), including `doctor --json`, `doctor triage --json` and the `--robot-triage` alias; veil has no other verdict", "domain": "unhealthy" },
     "2": { "meaning": "usage error, malformed or empty hook payload, configuration error, or guard preflight refusal", "domain": "error" }
   },
   "refusals": [],
@@ -168,7 +172,7 @@
     "bare_invocation": "stdin that is a terminal or empty exits 2 immediately with discovery guidance"
   },
   "discovery": {
-    "triage": "veil --robot-triage",
+    "triage": "veil doctor triage --json",
     "capabilities": "veil capabilities --json",
     "robot_docs": "veil robot-docs guide",
     "help": "veil --help"

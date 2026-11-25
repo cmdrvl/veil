@@ -119,14 +119,15 @@ fn install_healthy_guard_hooks(home: &Path) {
 }
 
 #[test]
-fn doctor_health_exits_zero_without_writing_hook_settings() {
+fn doctor_health_exits_one_when_claude_hooks_are_missing_and_writes_nothing() {
+    // veil_command() pins the harness to claude-code and HOME is empty: unhealthy.
     let home = unique_home("health");
     let output = veil_command(&home)
         .args(["doctor", "health"])
         .output()
         .expect("doctor health should run");
 
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(1), "unhealthy doctor exits 1");
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
     assert!(stdout.contains("veil doctor"));
     assert!(
@@ -136,7 +137,45 @@ fn doctor_health_exits_zero_without_writing_hook_settings() {
 }
 
 #[test]
-fn doctor_capabilities_json_advertises_no_fixers() {
+fn doctor_health_exits_zero_when_healthy() {
+    let home = unique_home("health-ok");
+    let empty_bin = home.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin dir should be creatable");
+
+    let output = veil_command_for(&home, "codex", &[&empty_bin])
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor should run");
+
+    assert_eq!(output.status.code(), Some(0), "healthy doctor exits 0");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("health JSON should parse");
+    assert_eq!(value["schema_version"], "cmdrvl.doctor.v1");
+    assert_eq!(value["mode"], "health");
+    assert_eq!(value["healthy"], true);
+}
+
+#[test]
+fn doctor_json_exit_code_tracks_health_never_two() {
+    let home = unique_home("health-json-unhealthy");
+    let output = veil_command(&home)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor should run");
+
+    // A parsed unhealthy report is exit 1, never the usage-error code 2.
+    assert_eq!(output.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&output.stdout).expect("health JSON should parse");
+    assert_eq!(value["healthy"], false);
+    assert!(
+        value["findings"].as_array().is_some_and(|findings| findings
+            .iter()
+            .any(|finding| finding["id"] == "hooks" && finding["severity"] == "error")),
+        "the unhealthy report must name the failing check: {value}"
+    );
+}
+
+#[test]
+fn doctor_capabilities_json_embeds_the_operator_contract() {
     let home = unique_home("capabilities");
     let output = veil_command(&home)
         .args(["doctor", "capabilities", "--json"])
@@ -146,41 +185,40 @@ fn doctor_capabilities_json_advertises_no_fixers() {
     assert!(output.status.success());
     let value: Value =
         serde_json::from_slice(&output.stdout).expect("capabilities JSON should parse");
-    assert_eq!(value["read_only"], true);
-    assert_eq!(value["fix_mode"], "not_available");
-    assert_eq!(value["fixers"].as_array().map(Vec::len), Some(0));
+    assert_eq!(value["schema_version"], "cmdrvl.doctor.v1");
+    assert_eq!(value["mode"], "capabilities");
+    assert_eq!(value["contract"]["schema_version"], "operator.v1");
+    assert_eq!(value["doctor"]["read_only"], true);
+    assert_eq!(value["doctor"]["fix_mode"], "not_available");
+    assert_eq!(value["doctor"]["fixers"].as_array().map(Vec::len), Some(0));
 }
 
 #[test]
-fn doctor_robot_triage_json_is_machine_readable() {
-    let home = unique_home("triage");
-    let output = veil_command(&home)
-        .args(["doctor", "--robot-triage"])
-        .output()
-        .expect("doctor robot triage should run");
+fn deprecated_robot_triage_spellings_emit_the_same_document_as_doctor_triage() {
+    let home = unique_home("triage-aliases");
+    let triage = |args: &[&str]| {
+        let output = veil_command(&home)
+            .args(args)
+            .output()
+            .expect("triage should run");
+        // Unhealthy under claude-code with no hooks: every spelling exits 1.
+        assert_eq!(output.status.code(), Some(1), "{args:?} exit code");
+        serde_json::from_slice::<Value>(&output.stdout).expect("triage JSON should parse")
+    };
 
-    assert!(output.status.success());
-    let value: Value = serde_json::from_slice(&output.stdout).expect("triage JSON should parse");
-    assert_eq!(value["schema_version"], "veil.doctor.triage.v1");
-    assert_eq!(value["capabilities"]["read_only"], true);
-    assert_eq!(
-        value["capabilities"]["fixers"].as_array().map(Vec::len),
-        Some(0)
+    let canonical = triage(&["doctor", "triage", "--json"]);
+    assert_eq!(canonical["schema_version"], "cmdrvl.doctor.v1");
+    assert_eq!(canonical["mode"], "triage");
+    assert!(
+        canonical["next_actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty()),
+        "unhealthy triage must list next_actions"
     );
-}
+    assert_eq!(canonical["doctor"]["read_only"], true);
 
-#[test]
-fn top_level_robot_triage_json_is_machine_readable() {
-    let home = unique_home("top-level-triage");
-    let output = veil_command(&home)
-        .arg("--robot-triage")
-        .output()
-        .expect("top-level robot triage should run");
-
-    assert!(output.status.success());
-    let value: Value = serde_json::from_slice(&output.stdout).expect("triage JSON should parse");
-    assert_eq!(value["schema_version"], "veil.doctor.triage.v1");
-    assert_eq!(value["capabilities"]["read_only"], true);
+    assert_eq!(triage(&["doctor", "--robot-triage"]), canonical);
+    assert_eq!(triage(&["--robot-triage"]), canonical);
 }
 
 #[test]

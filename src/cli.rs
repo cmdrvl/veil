@@ -74,6 +74,8 @@ pub enum DoctorAction {
     Health(DoctorHealthArgs),
     #[command(about = "Describe read-only doctor commands and contract")]
     Capabilities(DoctorCapabilitiesArgs),
+    #[command(about = "Emit doctor triage JSON with next actions (always JSON)")]
+    Triage(DoctorTriageArgs),
     #[command(about = "Print doctor-specific robot guidance")]
     RobotDocs,
 }
@@ -81,6 +83,12 @@ pub enum DoctorAction {
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct DoctorHealthArgs {
     #[arg(long, help = "Emit doctor health as JSON")]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct DoctorTriageArgs {
+    #[arg(long, help = "Accepted for symmetry; triage is always JSON")]
     pub json: bool,
 }
 
@@ -364,6 +372,18 @@ mod tests {
                 action: Some(DoctorAction::Capabilities(DoctorCapabilitiesArgs {
                     json: true,
                 })),
+            }))
+        );
+    }
+
+    #[test]
+    fn doctor_triage_subcommand_accepts_json_flag() {
+        assert_eq!(
+            parse(&["veil", "doctor", "triage", "--json"]),
+            Dispatch::Operator(OperatorCommand::Doctor(DoctorArgs {
+                robot_triage: false,
+                json: false,
+                action: Some(DoctorAction::Triage(DoctorTriageArgs { json: true })),
             }))
         );
     }

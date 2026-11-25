@@ -37,13 +37,22 @@ struct CandidateOutcome {
 
 const BARE_INVOCATION_GUIDANCE: &str = "no hook payload received on stdin; bare `veil` is hook mode. Pipe a Claude/Gemini/Copilot hook payload into stdin, or run `veil --robot-triage`, `veil capabilities --json`, or `veil robot-docs guide` for operator discovery. For help with veil, run `veil --help`.";
 
+/// Hook mode reads stdin to EOF. A terminal never reaches EOF, so refuse it
+/// with discovery guidance instead of waiting for a human to press Ctrl-D.
+fn reject_terminal_stdin(stdin_is_terminal: bool) -> io::Result<()> {
+    if stdin_is_terminal {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            BARE_INVOCATION_GUIDANCE,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn run() -> Result<u8, Box<dyn Error>> {
     let stdin = io::stdin();
-    // Hook mode reads stdin to EOF. A terminal never reaches EOF, so fail fast
-    // with guidance instead of waiting for a human to press Ctrl-D.
-    if stdin.is_terminal() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, BARE_INVOCATION_GUIDANCE).into());
-    }
+    reject_terminal_stdin(stdin.is_terminal())?;
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
     run_with_io(stdin.lock(), &mut stdout, &mut stderr)?;
@@ -307,6 +316,17 @@ mod tests {
                     .expect("audit line should parse")
             })
             .collect()
+    }
+
+    #[test]
+    fn terminal_stdin_is_rejected_with_discovery_guidance_and_pipes_are_not() {
+        let error = reject_terminal_stdin(true).expect_err("a terminal stdin must be rejected");
+        let message = error.to_string();
+        for hint in ["--robot-triage", "capabilities --json", "veil --help"] {
+            assert!(message.contains(hint), "guidance should mention {hint}");
+        }
+
+        assert!(reject_terminal_stdin(false).is_ok());
     }
 
     #[test]

@@ -34,12 +34,23 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Install ast-grep
+        run: npm install --global @ast-grep/cli
+
+      - name: Spine static rules (ast-grep)
+        run: ast-grep scan
+
       - name: Smoke doctor surface
         run: |
-          cargo run --locked -- --robot-triage
+          cargo run --locked -- --describe
+          cargo run --locked -- --schema
           cargo run --locked -- capabilities --json
           cargo run --locked -- robot-docs guide
-          cargo run --locked -- doctor health
+          cargo run --locked -- doctor
+          cargo run --locked -- doctor --json
           cargo run --locked -- doctor capabilities --json
+          cargo run --locked -- doctor triage --json
           cargo run --locked -- doctor robot-docs
-          cargo run --locked -- doctor --robot-triage
+          # Deprecated aliases stay working for at least one release.
+          cargo run --locked -- --robot-triage
+          cargo run --locked -- doctor health
