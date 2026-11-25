@@ -65,7 +65,7 @@
     },
     {
       "name": "test",
-      "description": "Predict whether one path would be allowed or denied by the read-decision pipeline.",
+      "description": "Predict whether one path would be allowed or denied by the read-decision pipeline. Decides on the path only; file contents and message bodies are not read. With --json the output is a veil.path-decision.v1 document.",
       "arguments": [{ "name": "path", "type": "file_path", "position": 0, "required": true, "description": "Path to inspect" }],
       "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit the path inspection as JSON" }],
       "read_only": true,
@@ -73,7 +73,7 @@
     },
     {
       "name": "explain",
-      "description": "Explain allowlist, protected-pattern and pack matches for one path.",
+      "description": "Explain allowlist, protected-pattern and pack matches for one path. Decides on the path only; file contents and message bodies are not read. With --json the output is a veil.path-decision.v1 document.",
       "arguments": [{ "name": "path", "type": "file_path", "position": 0, "required": true, "description": "Path to inspect" }],
       "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit the path inspection as JSON" }],
       "read_only": true,
@@ -81,7 +81,7 @@
     },
     {
       "name": "scan",
-      "description": "Scan a directory tree and classify each file path (paths only; file contents are not read into output).",
+      "description": "Scan a directory tree and classify each file path. Decides on paths only; file contents and message bodies are not read. With --json the output is a veil.path-decision.v1 document.",
       "arguments": [{ "name": "dir", "type": "directory_path", "position": 0, "required": true, "description": "Directory tree to scan" }],
       "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit scan results as JSON" }],
       "read_only": true,
@@ -136,7 +136,7 @@
   "exit_codes": {
     "0": { "meaning": "success, or a hook allow/deny decision was rendered", "domain": "positive" },
     "1": { "meaning": "doctor reported an unhealthy state (an error finding), including `doctor --json`, `doctor triage --json` and the `--robot-triage` alias; veil has no other verdict", "domain": "unhealthy" },
-    "2": { "meaning": "usage error, malformed or empty hook payload, configuration error, or guard preflight refusal", "domain": "error" }
+    "2": { "meaning": "usage error, malformed or empty hook payload, configuration error, guard preflight refusal, or a path command (test, explain, scan) that could not produce a decision; under --json the path commands print a veil.path-decision.v1 error document on stdout", "domain": "error" }
   },
   "refusals": [],
   "env_vars": [

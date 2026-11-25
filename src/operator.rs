@@ -31,6 +31,54 @@ const HOOK_DECISION_SCHEMA: &str = include_str!("../hook-decision.schema.json");
 const DOCTOR_SCHEMA_VERSION: &str = "cmdrvl.doctor.v1";
 const DOCTOR_CAPABILITIES_SCHEMA_VERSION: &str = "veil.doctor.capabilities.v1";
 const READ_ONLY_DOCTOR_CONTRACT: &str = "cmdrvl.read_only_doctor.v1";
+/// Version tag on every `test`, `explain` and `scan` `--json` document,
+/// including their error documents. These documents are decisions about
+/// paths only: veil does not read file contents or message bodies to produce
+/// them.
+pub const PATH_DECISION_SCHEMA_VERSION: &str = "veil.path-decision.v1";
+
+/// The path could not be normalized with the hook-mode path hardening
+/// pipeline (empty, or holding control characters).
+#[derive(Debug)]
+pub struct PathUnnormalizable {
+    path: String,
+}
+
+impl std::fmt::Display for PathUnnormalizable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not normalize `{}` with the hook-mode path hardening pipeline",
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for PathUnnormalizable {}
+
+/// Why a `--json` path command failed, for the `error.code` field.
+pub const PATH_ERROR_UNNORMALIZABLE: &str = "path_unnormalizable";
+pub const PATH_ERROR_PREFLIGHT_REFUSED: &str = "guard_preflight_refused";
+pub const PATH_ERROR_OTHER: &str = "error";
+
+/// The `error.code` for a failure of `run_test`, `run_explain` or `run_scan`.
+pub fn path_error_code(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if error.downcast_ref::<PathUnnormalizable>().is_some() {
+        PATH_ERROR_UNNORMALIZABLE
+    } else {
+        PATH_ERROR_OTHER
+    }
+}
+
+/// The document a `--json` path command prints on stdout when it fails, so a
+/// wrapper never has to read stderr to learn why there is no decision.
+pub fn path_error_json(code: &str, message: &str) -> String {
+    json!({
+        "schema_version": PATH_DECISION_SCHEMA_VERSION,
+        "error": { "code": code, "message": message },
+    })
+    .to_string()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DoctorStatus {
@@ -286,6 +334,7 @@ fn render_test_for_repo(
 
     if json_output {
         Ok(serde_json::to_string_pretty(&json!({
+            "schema_version": PATH_DECISION_SCHEMA_VERSION,
             "input_path": inspection.input_path,
             "normalized_path": inspection.normalized_path.display().to_string(),
             "decision": decision_json(&inspection.decision),
@@ -303,20 +352,9 @@ fn render_explain_for_repo(
     let inspection = inspect_path(repo_root, path)?;
 
     if json_output {
-        Ok(serde_json::to_string_pretty(&json!({
-            "input_path": inspection.input_path,
-            "normalized_path": inspection.normalized_path.display().to_string(),
-            "match": {
-                "kind": inspection.match_kind(),
-                "allowlist_pattern": inspection.allowlist_pattern,
-                "protected_pattern": inspection.protected_pattern,
-                "pack": inspection.sensitivity.as_ref().map(|value| value.pack.clone()),
-                "severity": inspection.sensitivity.as_ref().map(|value| severity_name(&value.severity)),
-                "confidence": inspection.sensitivity.as_ref().map(|value| value.confidence),
-                "directory_sensitive": inspection.sensitivity.as_ref().map(|value| value.directory_sensitive),
-            },
-            "decision": decision_json(&inspection.decision),
-        }))?)
+        let mut document = inspection_json(&inspection);
+        document["schema_version"] = json!(PATH_DECISION_SCHEMA_VERSION);
+        Ok(serde_json::to_string_pretty(&document)?)
     } else {
         Ok(render_explain_human(&inspection))
     }
@@ -345,8 +383,11 @@ fn render_scan_for_repo(
 
     if json_output {
         Ok(serde_json::to_string_pretty(&json!({
-            "root": scan_root.display().to_string(),
-            "files": inspections.iter().map(scan_entry_json).collect::<Vec<_>>(),
+            "schema_version": PATH_DECISION_SCHEMA_VERSION,
+            // `components` drops a trailing `.`, so `scan .` reports the
+            // directory itself, not `<dir>/.`.
+            "root": scan_root.components().collect::<PathBuf>().display().to_string(),
+            "files": inspections.iter().map(inspection_json).collect::<Vec<_>>(),
         }))?)
     } else {
         Ok(render_scan_human(&scan_root, &inspections))
@@ -1240,12 +1281,10 @@ fn inspect_path(
     raw_path: &Path,
 ) -> Result<PathInspection, Box<dyn std::error::Error>> {
     let config = config::load_config(repo_root)?;
-    let normalized_path = normalize_cli_path(raw_path, repo_root).ok_or_else(|| {
-        format!(
-            "could not normalize `{}` with the hook-mode path hardening pipeline",
-            raw_path.display()
-        )
-    })?;
+    let normalized_path =
+        normalize_cli_path(raw_path, repo_root).ok_or_else(|| PathUnnormalizable {
+            path: raw_path.display().to_string(),
+        })?;
     let allowlist_pattern =
         first_matching_pattern(&config.allowlist.safe_patterns, &normalized_path)
             .map(str::to_owned);
@@ -1329,7 +1368,7 @@ fn decision_json(decision: &Decision) -> Value {
         "action": decision_action_name(&decision.action),
         "reason": decision.reason,
         "severity": decision.severity.as_ref().map(severity_name),
-        "confidence": decision.confidence,
+        "confidence": confidence_json(decision.confidence),
         "remediation": decision.remediation,
     })
 }
@@ -1358,7 +1397,9 @@ fn severity_name(severity: &veil::types::SensitivitySeverity) -> &'static str {
     }
 }
 
-fn scan_entry_json(inspection: &PathInspection) -> Value {
+/// One path's inspection: the `explain` document without its version tag and
+/// each element of the `scan` `files` array.
+fn inspection_json(inspection: &PathInspection) -> Value {
     json!({
         "input_path": inspection.input_path,
         "normalized_path": inspection.normalized_path.display().to_string(),
@@ -1368,11 +1409,20 @@ fn scan_entry_json(inspection: &PathInspection) -> Value {
             "protected_pattern": inspection.protected_pattern,
             "pack": inspection.sensitivity.as_ref().map(|value| value.pack.clone()),
             "severity": inspection.sensitivity.as_ref().map(|value| severity_name(&value.severity)),
-            "confidence": inspection.sensitivity.as_ref().map(|value| value.confidence),
+            "confidence": confidence_json(inspection.sensitivity.as_ref().map(|value| value.confidence)),
             "directory_sensitive": inspection.sensitivity.as_ref().map(|value| value.directory_sensitive),
         },
         "decision": decision_json(&inspection.decision),
     })
+}
+
+/// Confidences are `f32`; widening one to `f64` prints 0.95 as
+/// 0.949999988079071, which no wrapper test can compare against. Going through
+/// the shortest decimal form keeps 0.95 as 0.95.
+fn confidence_json(confidence: Option<f32>) -> Value {
+    confidence
+        .and_then(|value| value.to_string().parse::<f64>().ok())
+        .map_or(Value::Null, Value::from)
 }
 
 fn built_in_pack_inventory() -> Vec<(&'static str, &'static str)> {

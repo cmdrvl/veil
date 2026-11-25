@@ -196,6 +196,43 @@ decision). `veil robot-docs guide` prints the agent-facing quick guide.
 `--describe` on each installed tool, and prints a combined reference with any
 missing or broken tools called out explicitly.
 
+### Path Decisions for Wrappers
+
+A local wrapper that wants veil's decision about a path, such as an attachment
+about to be sent, can run `veil test <path> --json`, `veil explain <path> --json`
+or `veil scan <dir> --json` and parse stdout; it never needs to read stderr.
+Every document carries `"schema_version": "veil.path-decision.v1"`:
+
+```json
+{
+  "schema_version": "veil.path-decision.v1",
+  "input_path": "data/holdings.csv",
+  "normalized_path": "/repo/data/holdings.csv",
+  "decision": {
+    "action": "deny",
+    "reason": "direct read of a path matched by data.tabular is blocked by policy default",
+    "severity": "high",
+    "confidence": 0.95,
+    "remediation": "Direct read blocked. Run `veil operator` ..."
+  }
+}
+```
+
+`explain` adds a `match` object (`kind`, `pack`, `protected_pattern`,
+`allowlist_pattern`, `severity`, `confidence`, `directory_sensitive`), and
+`scan` returns `{ "schema_version", "root", "files": [...] }` with one
+`input_path`/`normalized_path`/`match`/`decision` entry per file. An allow or a
+deny exits 0, so read `decision.action`. When no decision can be made (an
+unusable path, or a guard preflight refusal) the command exits 2 and prints
+`{ "schema_version": "veil.path-decision.v1", "error": { "code", "message" } }`
+on stdout, with `code` one of `path_unnormalizable`, `guard_preflight_refused`
+or `error`.
+
+These are decisions about paths. veil does not read file contents or message
+bodies to make them, so an `allow` says nothing about what a file or a message
+says. Screening the body of an outbound message is a separate surface; see
+"Boundary With Outbound Screening".
+
 ### Doctor Mode
 
 `veil doctor` is read-only. It inspects local configuration, the audit path, and

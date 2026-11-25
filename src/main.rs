@@ -33,7 +33,7 @@ fn dispatch() -> Result<u8, Box<dyn std::error::Error>> {
 }
 
 fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::error::Error>> {
-    if command_requires_guard_preflight(&command) {
+    if command_requires_guard_preflight(&command) && !runs_its_own_guard_preflight(&command) {
         enforce_guard_preflight()?;
     }
 
@@ -51,16 +51,13 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             Ok(0)
         }
         cli::OperatorCommand::Test(args) => {
-            println!("{}", operator::run_test(&args)?);
-            Ok(0)
+            path_decision_command(args.json, || operator::run_test(&args))
         }
         cli::OperatorCommand::Explain(args) => {
-            println!("{}", operator::run_explain(&args)?);
-            Ok(0)
+            path_decision_command(args.json, || operator::run_explain(&args))
         }
         cli::OperatorCommand::Scan(args) => {
-            println!("{}", operator::run_scan(&args)?);
-            Ok(0)
+            path_decision_command(args.json, || operator::run_scan(&args))
         }
         cli::OperatorCommand::Packs(args) => {
             println!("{}", operator::run_packs(&args)?);
@@ -89,6 +86,46 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             println!("Removed veil hooks from {}", path.display());
             Ok(0)
         }
+    }
+}
+
+/// `test`, `explain` and `scan` are what a wrapper calls to get a decision
+/// about a path. They run the guard preflight themselves so that, under
+/// `--json`, a refusal is a JSON document on stdout like every other failure.
+fn runs_its_own_guard_preflight(command: &cli::OperatorCommand) -> bool {
+    matches!(
+        command,
+        cli::OperatorCommand::Test(_)
+            | cli::OperatorCommand::Explain(_)
+            | cli::OperatorCommand::Scan(_)
+    )
+}
+
+/// Runs the guard preflight and then `run`, printing its output. Under
+/// `--json` any failure is printed as a `veil.path-decision.v1` error document
+/// on stdout (the message also goes to stderr, for humans) and exits 2;
+/// without `--json` it is returned and reported on stderr as before.
+fn path_decision_command(
+    json: bool,
+    run: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
+) -> Result<u8, Box<dyn std::error::Error>> {
+    let outcome = match enforce_guard_preflight() {
+        Ok(()) => run().map_err(|error| (operator::path_error_code(error.as_ref()), error)),
+        Err(error) => Err((operator::PATH_ERROR_PREFLIGHT_REFUSED, error)),
+    };
+
+    match outcome {
+        Ok(rendered) => {
+            println!("{rendered}");
+            Ok(0)
+        }
+        Err((code, error)) if json => {
+            let message = error.to_string();
+            println!("{}", operator::path_error_json(code, &message));
+            eprintln!("veil: {message}");
+            Ok(2)
+        }
+        Err((_, error)) => Err(error),
     }
 }
 
