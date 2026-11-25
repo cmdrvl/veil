@@ -1367,6 +1367,12 @@ fn collect_simple_reader_paths(args: &[String]) -> Vec<String> {
             break;
         }
 
+        // `2>/dev/null`, `>out.txt`, `<in.csv`: not a file the command was handed
+        // (what `<` reads is collected with the input redirects)
+        if is_redirection_word(arg) {
+            continue;
+        }
+
         if arg == "--" {
             parsing_options = false;
             continue;
@@ -1392,6 +1398,10 @@ fn collect_delimited_reader_paths(args: &[String]) -> Vec<String> {
     for arg in args {
         if is_redirection(arg) {
             break;
+        }
+
+        if is_redirection_word(arg) {
+            continue;
         }
 
         if arg == "--" {
@@ -1421,6 +1431,11 @@ fn collect_head_tail_paths(args: &[String]) -> Vec<String> {
         let arg = &args[index];
         if is_redirection(arg) {
             break;
+        }
+
+        if is_redirection_word(arg) {
+            index += 1;
+            continue;
         }
 
         if arg == "--" {
@@ -3004,6 +3019,43 @@ mod tests {
         // an input redirect is still a direct read, found once
         assert_reads("awk 1 < data/x.csv", &[("top", Reads, &["data/x.csv"])]);
         assert_eq!(argv_names("awk 1 < data/x.csv"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_reader_is_not_handed_its_redirections_as_files_and_a_glued_one_hides_nothing() {
+        use PathExposure::ReadsContents as Reads;
+
+        // `cat x 2>/dev/null` reads `x`; `2>/dev/null` is where stderr goes. A
+        // redirection once became a path (and an audit record) of its own, and
+        // glued to the file (`x.csv>out`) it made the file's name another one.
+        for command in [
+            "cat data/x.csv 2>/dev/null",
+            "cat data/x.csv 2>&1",
+            "cat data/x.csv >out.txt",
+            "cat data/x.csv >>log 2>&1",
+            "cat data/x.csv>out.txt",
+            "cat data/x.csv>&2",
+            "cat data/x.csv&>/dev/null",
+            "cat 2>/dev/null data/x.csv",
+            "head -2 data/x.csv>out",
+            "head -n 2 data/x.csv 2>/dev/null",
+            "tail data/x.csv >out",
+            "less data/x.csv 2>&1",
+            "bat data/x.csv>out",
+        ] {
+            assert_reads(command, &[("top", Reads, &["data/x.csv"])]);
+        }
+        // an input redirect is a read of its target, once, glued or not
+        assert_reads(
+            "cat <data/x.csv 2>/dev/null",
+            &[("top", Reads, &["data/x.csv"])],
+        );
+        assert_reads("cat<data/x.csv", &[("top", Reads, &["data/x.csv"])]);
+        // and a word that only ends in a digit is not a descriptor
+        assert_reads(
+            "cat data/x.csv2>/dev/null",
+            &[("top", Reads, &["data/x.csv2"])],
+        );
     }
 
     #[test]

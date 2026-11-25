@@ -647,9 +647,17 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
     let mut cwd_scopes = Vec::new();
     let mut next_scope = 0usize;
     let mut word_start = true;
+    // The word being read is only digits so far (the `2` of `2>out`: a file
+    // descriptor, which belongs to the operator), and the last byte was part
+    // of a redirection operator that may go on (`>` of `>>`, `>&`, `>|`).
+    let mut fd = false;
+    let mut in_operator = false;
     let mut i = 0;
 
     while i < bytes.len() {
+        let (was_fd, was_operator) = (fd, in_operator);
+        (fd, in_operator) = (false, false);
+
         match bytes[i] {
             b'\\' => {
                 let next = text[i + 1..].chars().next()?;
@@ -708,6 +716,7 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                 word_start = false;
             }
             b'<' if bytes[i..].starts_with(b"<<<") => {
+                end_word_before_redirection(&mut current.text, word_start, was_fd, was_operator);
                 current.text.push_str("<<<");
                 i += 3;
                 word_start = true;
@@ -722,11 +731,27 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                     word_start = true;
                 }
                 None => {
+                    end_word_before_redirection(
+                        &mut current.text,
+                        word_start,
+                        was_fd,
+                        was_operator,
+                    );
                     current.text.push_str("<<");
                     i += 2;
                     word_start = false;
                 }
             },
+            b'<' | b'>' => {
+                // An unquoted `<` or `>` ends the word before it: `cat x.csv>out`
+                // reads `x.csv` and writes `out`. It is the operator's, and the
+                // word splitter must see it as one.
+                end_word_before_redirection(&mut current.text, word_start, was_fd, was_operator);
+                current.text.push(bytes[i] as char);
+                i += 1;
+                in_operator = true;
+                word_start = false;
+            }
             b'#' if word_start => {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
@@ -787,9 +812,19 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                 let after_redirect = i > 0 && matches!(bytes[i - 1], b'<' | b'>');
                 let next = bytes.get(i + 1).copied();
                 if after_redirect || next == Some(b'>') {
-                    // `2>&1`, `<&3`, `&>file`: part of a redirection.
+                    // `2>&1`, `<&3`, `&>file`: part of a redirection. The `&` of
+                    // `&>` ends the word before it (`cat x.csv&>out`).
+                    if !after_redirect {
+                        end_word_before_redirection(
+                            &mut current.text,
+                            word_start,
+                            false,
+                            was_operator,
+                        );
+                    }
                     current.text.push('&');
                     i += 1;
+                    in_operator = true;
                     word_start = false;
                 } else {
                     end_segment(
@@ -812,6 +847,7 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                     // `>|` forces an overwrite; it is not a pipe.
                     current.text.push('|');
                     i += 1;
+                    in_operator = true;
                     word_start = false;
                 } else if next == Some(b'|') {
                     end_segment(
@@ -845,9 +881,15 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
             }
             _ => {
                 let ch = text[i..].chars().next()?;
+                let run_start = current.text.len();
                 current.text.push(ch);
                 i += ch.len_utf8();
                 i += copy_plain_run(text, i, &mut current.text);
+                // digits alone at the start of a word may be a file descriptor
+                fd = word_start
+                    && current.text.as_bytes()[run_start..]
+                        .iter()
+                        .all(u8::is_ascii_digit);
                 word_start = false;
             }
         }
@@ -863,6 +905,23 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
     );
     segments.retain(|segment| !segment.is_blank());
     Some(segments)
+}
+
+/// Puts a blank between a word and an unquoted redirection operator glued to
+/// it, so that `cat x.csv>out` splits into `cat`, `x.csv` and `>out` as the
+/// shell does. Nothing is added at the start of a word, after a file descriptor
+/// number (`2>out`: `2` is the operator's) or inside an operator (`>>`, `>&`).
+/// Without it the word splitter hands `x.csv>out` on as one word, which names
+/// no protected path.
+fn end_word_before_redirection(
+    text: &mut String,
+    word_start: bool,
+    was_fd: bool,
+    was_operator: bool,
+) {
+    if !word_start && !was_fd && !was_operator {
+        text.push(' ');
+    }
 }
 
 /// Copies the bytes from `from` up to the next byte the scanner treats
@@ -1254,6 +1313,71 @@ mod tests {
         assert_eq!(argvs("cmd &>out.txt").len(), 1);
         assert_eq!(argvs("cmd >| out.txt").len(), 1);
         assert_eq!(argvs("cmd <&3").len(), 1);
+    }
+
+    /// The words of a line that holds exactly one command.
+    fn argv_of(command: &str) -> Vec<String> {
+        let mut commands = argvs(command);
+        assert_eq!(commands.len(), 1, "{command}");
+        commands.remove(0)
+    }
+
+    #[test]
+    fn a_redirection_glued_to_a_word_is_the_next_word_not_part_of_it() {
+        // the shell reads `x.csv` and writes `out`; one word `x.csv>out` names no
+        // protected file
+        for (glued, expected) in [
+            ("cat x.csv>out", vec!["cat", "x.csv", ">out"]),
+            ("cat x.csv>>out", vec!["cat", "x.csv", ">>out"]),
+            ("cat x.csv>&2", vec!["cat", "x.csv", ">&2"]),
+            ("cat x.csv>|out", vec!["cat", "x.csv", ">|out"]),
+            ("cat x.csv&>out", vec!["cat", "x.csv", "&>out"]),
+            ("cat x.csv&>>out", vec!["cat", "x.csv", "&>>out"]),
+            ("cat x.csv<in", vec!["cat", "x.csv", "<in"]),
+            ("cat x.csv<>rw", vec!["cat", "x.csv", "<>rw"]),
+            ("cat x.csv<<<text", vec!["cat", "x.csv", "<<<text"]),
+            ("cat x.csv>out 2>&1", vec!["cat", "x.csv", ">out", "2>&1"]),
+            ("cat x.csv>a>b", vec!["cat", "x.csv", ">a", ">b"]),
+            ("cat<in", vec!["cat", "<in"]),
+        ] {
+            assert_eq!(argv_of(glued), expected, "{glued}");
+        }
+    }
+
+    #[test]
+    fn digits_before_an_operator_are_its_file_descriptor_only_when_they_are_the_whole_word() {
+        // `2>` and `10>` are redirections of a descriptor...
+        assert_eq!(argv_of("cat x 2>out"), ["cat", "x", "2>out"]);
+        assert_eq!(argv_of("cat x 10>out"), ["cat", "x", "10>out"]);
+        assert_eq!(argv_of("cat x 2>&1"), ["cat", "x", "2>&1"]);
+        assert_eq!(argv_of("cat x 0<in"), ["cat", "x", "0<in"]);
+        // ...but the `2` of `x.csv2>out` is part of a file name
+        assert_eq!(argv_of("cat x.csv2>out"), ["cat", "x.csv2", ">out"]);
+        assert_eq!(argv_of("cat x2>out"), ["cat", "x2", ">out"]);
+        // and a quoted word before the operator is not a descriptor either
+        assert_eq!(argv_of("cat 'x.csv'2>out"), ["cat", "x.csv2", ">out"]);
+    }
+
+    #[test]
+    fn a_quoted_or_escaped_operator_is_data_not_a_redirection() {
+        assert_eq!(argv_of("echo 'a>b'"), ["echo", "a>b"]);
+        assert_eq!(argv_of(r#"echo "a>b""#), ["echo", "a>b"]);
+        assert_eq!(argv_of(r"echo a\>b"), ["echo", "a>b"]);
+        assert_eq!(argv_of("cut -d'>' -f1 x"), ["cut", "-d>", "-f1", "x"]);
+        assert_eq!(argv_of("awk '$1>2' x.csv"), ["awk", "$1>2", "x.csv"]);
+    }
+
+    #[test]
+    fn a_redirection_after_a_quote_or_a_substitution_still_ends_the_word() {
+        assert_eq!(argv_of(r#"cat "x.csv">out"#), ["cat", "x.csv", ">out"]);
+        assert_eq!(argv_of("cat 'x.csv'>out"), ["cat", "x.csv", ">out"]);
+        // the substitution is a command of its own; the word after it is `>out`
+        let echo = argvs("echo $(date)>out")
+            .into_iter()
+            .find(|argv| argv[0] == "echo")
+            .expect("echo is a command of the line");
+        assert_eq!(echo.len(), 3, "{echo:?}");
+        assert_eq!(echo[2], ">out");
     }
 
     #[test]
