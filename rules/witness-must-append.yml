@@ -7,8 +7,4 @@ message: |
 severity: error
 note: "Golden Rule R-016 (Witness append-only)"
 rule:
-  all:
-    - pattern: File::create($PATH)
-    - inside:
-        pattern: $$$
-        stopBy: end
+  pattern: File::create($PATH)
