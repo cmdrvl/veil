@@ -1282,7 +1282,10 @@ mod tests {
             let command = format!("{tool} {protected_arg}");
             let detected =
                 detect_spine_invocation(&command, &config.spine.authorized_tools, &repo_root);
-            assert!(detected.is_some(), "default config should authorize `{tool}`");
+            assert!(
+                detected.is_some(),
+                "default config should authorize `{tool}`"
+            );
             let invocation = detected.unwrap();
             let input = EvaluationInput::new(
                 ToolKind::Bash,
