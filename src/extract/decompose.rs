@@ -213,8 +213,10 @@ pub(super) fn script(
                     return;
                 };
 
-                // `f=data/x.csv` or `export f=data/x.csv` runs nothing; it tells
-                // the words that follow what `$f` is.
+                // `f=data/x.csv` runs nothing; it tells the words that follow
+                // what `$f` is. `export f=data/x.csv` also hands it to every
+                // program after it, which veil does not read, so the statement
+                // goes on to be judged as a command naming that path.
                 if let Some(pairs) = expand::assignment_words(&raw) {
                     for (name, written) in pairs {
                         let value = run.vars.value(&written, &run.env);
@@ -223,7 +225,9 @@ pub(super) fn script(
                         }
                         run.vars.assign(&name, value);
                     }
-                    continue;
+                    if !expand::exports_to_environment(&raw) {
+                        continue;
+                    }
                 }
 
                 let Some(words) = run.vars.words(&raw, &run.env) else {

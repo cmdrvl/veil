@@ -786,6 +786,21 @@ pub(super) fn assignment_words(raw: &[&str]) -> Option<Vec<(String, String)>> {
     (!pairs.is_empty()).then_some(pairs)
 }
 
+/// Whether the words put what they set into the environment of every program
+/// that runs after them: `export`, or `declare`/`typeset` with `-x`. veil does
+/// not read what those programs do with it, so a protected path exported this
+/// way is judged as named, which is what it did before assignments were tracked.
+pub(super) fn exports_to_environment(raw: &[&str]) -> bool {
+    match raw.first().copied() {
+        Some("export") => true,
+        Some("declare" | "typeset") => raw[1..]
+            .iter()
+            .take_while(|word| word.starts_with('-'))
+            .any(|option| option.contains('x')),
+        _ => false,
+    }
+}
+
 /// Names whose value veil cannot know from reading the command once: assigned
 /// more than once (a branch or a loop may have run either; a `for name in` is
 /// one assignment), appended to with `+=`, set by `read`, `select`, `mapfile`,
@@ -1539,6 +1554,33 @@ mod tests {
         assert_eq!(pairs(&["export"]), None);
         assert_eq!(pairs(&["export", "f"]), None);
         assert_eq!(pairs(&["f+=x"]), None);
+    }
+
+    #[test]
+    fn only_a_declaration_that_exports_reaches_the_programs_after_it() {
+        for words in [
+            &["export", "f=x"][..],
+            &["export", "-n", "f=x"],
+            &["declare", "-x", "f=x"],
+            &["declare", "-rx", "f=x"],
+            &["typeset", "-x", "f=x"],
+        ] {
+            assert!(exports_to_environment(words), "{words:?}");
+        }
+
+        for words in [
+            &["f=x"][..],
+            &["declare", "f=x"],
+            &["declare", "-r", "f=x"],
+            &["local", "f=x"],
+            &["readonly", "f=x"],
+            // the option after the first word that is not one is the value's
+            &["declare", "f=x", "-x"],
+            &["cat", "export"],
+            &[],
+        ] {
+            assert!(!exports_to_environment(words), "{words:?}");
+        }
     }
 
     fn braces(word: &str) -> Vec<String> {

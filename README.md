@@ -203,9 +203,10 @@ judged by what the command is:
   veil parses, only a word in a place that names a file counts: `grep "$p" file`
   and `head -n $n file` are allowed, `cat $f` and `grep pat $f` are not.
 - Any other command is denied only in a protected context: when the directory it
-  runs in holds a path covered by `[sensitivity] protected` (the walk a recursive
-  search uses), or when an assignment in the command names a protected path.
-  `echo $x` and `make $target` run freely elsewhere.
+  runs in is inside a `[sensitivity] protected` root or one a built-in pack
+  recognises (`~/.ssh`, a credentials directory), or when an assignment in the
+  command names a protected path or a directory inside one. `echo $x` and `make
+  $target` run freely elsewhere.
 
 A denial says `dynamic_path_unresolvable` in its audit record and asks you to
 rewrite the command with a literal path. Set `[policy] dynamic_args` (or
@@ -230,13 +231,17 @@ The history is one machine's, replayed against a scratch home with the default
 configuration, so read it as the cost on that history and not a prediction for
 another.
 
-What this does not do: `cd` earlier in the line is not followed, so
-`cd data && cat $f` resolves against the starting directory; a script that
-computes its own paths is not read; `find . -exec cat {} \;` and `grep -r` of a
-directory holding only a pack-recognised file such as `.env` are allowed (see the
-directory-scope note above); and a `$VAR` set in the caller's environment before
-the hook runs is unknown, so `cat $HOME_FILE` is denied even when the variable is
-harmless.
+An `export` (or `declare -x`) of a protected path is judged as naming it: the
+value reaches every program after it, and veil does not read what they do with it.
+
+What this does not do: a path handed to one program through a prefix assignment
+(`F=data/x.csv ./run.sh`) is not followed into that program; `cd` earlier in the
+line is not followed, so `cd data && cat $f` resolves against the starting
+directory; a script that computes its own paths is not read; `find . -exec cat {}
+\;` and `grep -r` of a directory holding only a pack-recognised file such as
+`.env` are allowed (see the directory-scope note above); and a `$VAR` set in the
+caller's environment before the hook runs is unknown, so `cat $HOME_FILE` is
+denied even when the variable is harmless.
 
 `[sensitivity] protected` patterns are held in an index (names, a trie of path
 components, and globs filed by a literal part they must contain), so a lookup

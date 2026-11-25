@@ -340,6 +340,38 @@ fn a_reader_is_blocked_when_an_argument_cannot_be_resolved() {
 }
 
 #[test]
+fn an_exported_protected_path_is_judged_because_veil_does_not_read_what_runs_after_it() {
+    let repo = repo("exported", "");
+
+    // `export` puts the value in the environment of every program after it, and
+    // veil cannot see what a script does with it, so the export itself is
+    // judged as naming the path (as it was before assignments were tracked).
+    for command in [
+        "export F=data/clients/holdings.csv",
+        "export F=data/clients/holdings.csv; ./run.sh",
+        "export OTHER=1 F=data/clients/holdings.csv; node script.js",
+        "declare -x F=data/clients/holdings.csv; ./run.sh",
+        "typeset -x F=data/clients/holdings.csv; ./run.sh",
+        "d=data/clients; export F=$d/holdings.csv; ./run.sh",
+        "export F=.env; ./run.sh",
+    ] {
+        assert_denied(&repo, command);
+    }
+
+    // A value that is no protected path, and a variable that is only the
+    // shell's own, hand nothing to anything.
+    for command in [
+        "export F=notes.md; ./run.sh",
+        "export MODE=fast OTHER=1; ./run.sh",
+        "F=data/clients/holdings.csv; echo done",
+        "declare F=data/clients/holdings.csv; echo done",
+        "local F=data/clients/holdings.csv; echo done",
+    ] {
+        assert_allowed(&repo, command);
+    }
+}
+
+#[test]
 fn a_loop_over_known_words_is_judged_for_every_word() {
     let repo = repo("loops", "");
 
