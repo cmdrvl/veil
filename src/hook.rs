@@ -111,6 +111,7 @@ fn parse_snake_case_payload(
     Ok(HookInput {
         protocol,
         tool: normalize_tool_kind(protocol, tool_name)?,
+        tool_name: tool_name.to_owned(),
         cwd,
         session_id: string_field(payload, "session_id").map(str::to_owned),
         raw_args,
@@ -125,6 +126,7 @@ fn parse_grok_payload(payload: &Value) -> Result<HookInput, HookParseError> {
     Ok(HookInput {
         protocol: HookProtocol::Grok,
         tool: normalize_tool_kind(HookProtocol::Grok, tool_name)?,
+        tool_name: tool_name.to_owned(),
         cwd,
         session_id: string_field(payload, "sessionId").map(str::to_owned),
         raw_args,
@@ -142,6 +144,7 @@ fn parse_camel_case_payload(
     Ok(HookInput {
         protocol,
         tool: normalize_tool_kind(protocol, tool_name)?,
+        tool_name: tool_name.to_owned(),
         cwd,
         session_id: None,
         raw_args,
@@ -210,6 +213,14 @@ fn string_field<'a>(payload: &'a Value, field: &str) -> Option<&'a str> {
     payload.get(field)?.as_str()
 }
 
+/// Claude Code names a tool an MCP server provides `mcp__<server>__<tool>`.
+/// The prefix is the harness's, so it is matched exactly, not case-folded: a
+/// built-in tool named `MCP__x` would be a different tool.
+fn is_mcp_tool_name(name: &str) -> bool {
+    name.strip_prefix("mcp__")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
 fn normalize_tool_kind(protocol: HookProtocol, name: &str) -> Result<ToolKind, HookParseError> {
     let lower = name.to_ascii_lowercase();
 
@@ -218,6 +229,7 @@ fn normalize_tool_kind(protocol: HookProtocol, name: &str) -> Result<ToolKind, H
             "read" => ToolKind::Read,
             "grep" => ToolKind::Grep,
             "bash" => ToolKind::Bash,
+            _ if is_mcp_tool_name(name) => ToolKind::Mcp,
             _ => {
                 return Err(HookParseError::new(format!(
                     "unsupported Claude Code tool `{name}` in hook payload"
@@ -288,6 +300,59 @@ mod tests {
         assert_eq!(parsed.cwd, Path::new("/repo"));
         assert_eq!(parsed.session_id.as_deref(), Some("abc123"));
         assert_eq!(parsed.raw_args, r#"{"file_path":"secret.txt"}"#);
+    }
+
+    #[test]
+    fn parses_an_mcp_tool_call_with_its_name_and_arguments() {
+        let parsed = parse_hook_input(
+            r#"{
+              "session_id": "abc123",
+              "cwd": "/repo",
+              "hook_event_name": "PreToolUse",
+              "tool_name": "mcp__mail__send_email",
+              "tool_input": { "to": "a@b.c", "attachments": ["/repo/data/x.csv"] }
+            }"#,
+        )
+        .expect("an MCP tool call should parse");
+
+        assert_eq!(parsed.tool, ToolKind::Mcp);
+        assert_eq!(parsed.tool_name, "mcp__mail__send_email");
+        assert_eq!(
+            parsed.raw_args,
+            r#"{"attachments":["/repo/data/x.csv"],"to":"a@b.c"}"#
+        );
+    }
+
+    #[test]
+    fn only_the_exact_mcp_prefix_with_something_after_it_is_an_mcp_tool() {
+        for name in ["mcp__a__b", "mcp__x", "mcp__claude_ai_Gmail__authenticate"] {
+            assert!(is_mcp_tool_name(name), "{name}");
+        }
+        for name in [
+            "mcp__",
+            "mcp_a_b",
+            "MCP__a__b",
+            "xmcp__a__b",
+            "WebFetch",
+            "",
+        ] {
+            assert!(!is_mcp_tool_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_tool_that_is_neither_built_in_nor_mcp_is_still_refused() {
+        let error = parse_hook_input(
+            r#"{
+              "cwd": "/repo",
+              "hook_event_name": "PreToolUse",
+              "tool_name": "WebFetch",
+              "tool_input": { "url": "https://example.com" }
+            }"#,
+        )
+        .expect_err("WebFetch is not a tool veil screens");
+
+        assert!(error.to_string().contains("unsupported Claude Code tool"));
     }
 
     #[test]

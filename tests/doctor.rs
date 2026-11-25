@@ -118,6 +118,116 @@ fn install_healthy_guard_hooks(home: &Path) {
     .expect("settings should be writable");
 }
 
+fn doctor_json(home: &Path) -> (Option<i32>, Value) {
+    let output = veil_command(home)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor should run");
+    let value: Value = serde_json::from_slice(&output.stdout).expect("health JSON should parse");
+    (output.status.code(), value)
+}
+
+fn check<'a>(report: &'a Value, name: &str) -> &'a Value {
+    let found = report["checks"]
+        .as_array()
+        .expect("checks should be an array")
+        .iter()
+        .find(|check| check["name"] == name);
+    assert!(found.is_some(), "no `{name}` check in {report}");
+    found.expect("asserted just above")
+}
+
+#[test]
+fn veil_install_adds_the_mcp_hook_and_doctor_then_passes() {
+    let home = unique_home("install-mcp");
+    let empty_bin = home.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin dir should be creatable");
+
+    let install = veil_command_for(&home, "claude-code", &[&empty_bin])
+        .arg("install")
+        .output()
+        .expect("install should run");
+    assert!(install.status.success(), "{install:?}");
+
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(home.join(".claude/settings.json")).expect("settings should exist"),
+    )
+    .expect("settings should parse");
+    let matchers: Vec<&str> = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("PreToolUse should be an array")
+        .iter()
+        .map(|entry| entry["matcher"].as_str().expect("matcher"))
+        .collect();
+    assert_eq!(matchers, ["Read", "Grep", "Bash", "mcp__.*"]);
+
+    let (code, report) = doctor_json(&home);
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(check(&report, "mcp_hook")["status"], "ok", "{report}");
+
+    // installing again changes nothing
+    let again = veil_command_for(&home, "claude-code", &[&empty_bin])
+        .arg("install")
+        .output()
+        .expect("install should run");
+    assert!(again.status.success(), "{again:?}");
+    let settings_again: Value = serde_json::from_str(
+        &fs::read_to_string(home.join(".claude/settings.json")).expect("settings should exist"),
+    )
+    .expect("settings should parse");
+    assert_eq!(settings_again, settings);
+}
+
+#[test]
+fn an_install_that_predates_mcp_screening_is_reported_but_still_runs_operator_commands() {
+    let home = unique_home("old-install");
+    install_healthy_guard_hooks(&home); // Read, Grep and Bash only
+
+    // operator commands are not refused for the missing MCP hook
+    let packs = veil_command(&home)
+        .args(["packs", "--json"])
+        .output()
+        .expect("domain command should run");
+    assert!(
+        packs.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packs.stderr)
+    );
+
+    // doctor says so, with the way to fix it, and exits 1
+    let (code, report) = doctor_json(&home);
+    assert_eq!(code, Some(1), "{report}");
+    assert_eq!(check(&report, "hooks")["status"], "ok", "{report}");
+    let mcp = check(&report, "mcp_hook");
+    assert_eq!(mcp["status"], "action_needed", "{report}");
+    assert!(
+        mcp["remediation"]
+            .as_str()
+            .is_some_and(|remediation| remediation.contains("veil install")),
+        "{mcp}"
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .is_some_and(|findings| findings
+                .iter()
+                .any(|finding| finding["id"] == "mcp_hook" && finding["severity"] == "error")),
+        "{report}"
+    );
+
+    // the guard posture is still healthy: only doctor reports the gap
+    assert_eq!(report["guard_posture"]["preflight_ok"], true, "{report}");
+
+    // after `veil install` the gap is closed
+    let install = veil_command(&home)
+        .arg("install")
+        .output()
+        .expect("install should run");
+    assert!(install.status.success(), "{install:?}");
+    let (code, report) = doctor_json(&home);
+    assert_eq!(code, Some(0), "{report}");
+}
+
 #[test]
 fn doctor_health_exits_one_when_claude_hooks_are_missing_and_writes_nothing() {
     // veil_command() pins the harness to claude-code and HOME is empty: unhealthy.

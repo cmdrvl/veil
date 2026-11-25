@@ -642,6 +642,7 @@ mod tests {
                 dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
+            mcp: crate::config::McpConfig::default(),
         }
     }
 
@@ -944,6 +945,7 @@ mod tests {
                 dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
+            mcp: crate::config::McpConfig::default(),
         };
 
         let decision = evaluate_access_with_classifier(
@@ -990,6 +992,7 @@ mod tests {
                 dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
+            mcp: crate::config::McpConfig::default(),
         };
 
         let decision = evaluate_access_with_classifier(
@@ -1035,6 +1038,7 @@ mod tests {
                 dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
+            mcp: crate::config::McpConfig::default(),
         };
 
         let decision =
@@ -1067,6 +1071,7 @@ mod tests {
                 dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
+            mcp: crate::config::McpConfig::default(),
         };
 
         let input = EvaluationInput::new(
@@ -1143,6 +1148,7 @@ mod tests {
                 dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
+            mcp: crate::config::McpConfig::default(),
         };
 
         // The alias path is outside the protected directory, but because it is
@@ -1214,6 +1220,7 @@ mod tests {
                 dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
+            mcp: crate::config::McpConfig::default(),
         };
 
         // The symlink is outside the protected dir, but canonicalization should

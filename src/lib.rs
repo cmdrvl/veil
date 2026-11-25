@@ -6,6 +6,7 @@ pub mod config;
 pub mod evaluator;
 pub mod extract;
 pub mod hook;
+mod mcp;
 pub mod packs;
 pub mod protected_corpus;
 pub mod render;
@@ -25,7 +26,7 @@ use evaluator::{
     DynamicReason, EvaluationInput, PolicyMatchers, dynamic_args_decision, evaluate_access_with,
 };
 use extract::{
-    CommandExtraction, Origin, STDIN_ARGUMENTS, SUBSTITUTION, extract_bash_commands,
+    CommandExtraction, Origin, PathExposure, STDIN_ARGUMENTS, SUBSTITUTION, extract_bash_commands,
     extract_read_or_grep_paths,
 };
 use hook::parse_hook_input;
@@ -63,14 +64,16 @@ fn classify_egress(command: &CommandExtraction, mut decision: Decision) -> (Deci
     (decision, egress)
 }
 
-/// How a path came to be judged (bd-29r, bd-2mi): read by something veil
-/// recognises as a reader, named in the words of some other command, or not a
-/// path veil could work out at all.
+/// How a path came to be judged (bd-29r, bd-2mi, bd-1wa): read by something
+/// veil recognises as a reader, named in the words of some other command, not
+/// a path veil could work out at all, or handed to an MCP tool in its
+/// arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReasonClass {
     DirectRead,
     ArgvPath,
     DynamicPath,
+    McpArgument,
 }
 
 impl ReasonClass {
@@ -79,9 +82,17 @@ impl ReasonClass {
             Self::DirectRead => "direct_read",
             Self::ArgvPath => "argv_path",
             Self::DynamicPath => "dynamic_path_unresolvable",
+            Self::McpArgument => "mcp_argument",
         }
     }
 }
+
+/// What a denial of an MCP argument tells the agent: the tool may read the
+/// path or send it on, and a copy of it is the same file to the tool.
+const MCP_REMEDIATION: &str = "MCP argument blocked: this tool call hands a protected path to an MCP tool, which may read it or send it off this machine. Do not pass the protected file, or a copy, archive or encoding of it. Run `veil operator` to discover the authorized spine tools and derive a metadata-safe artifact instead; `airlock` attests which derived artifacts later cross the model boundary. If the data really must go through this tool, stop and ask the operator.";
+
+/// What a denial of arguments veil did not read to the end tells the agent.
+const MCP_OVERSIZE_REMEDIATION: &str = "MCP arguments too large to screen: call the tool with fewer strings and less nesting, so that veil can show that none of them names a protected path. If the tool genuinely needs arguments this large, stop and ask the operator.";
 
 const BARE_INVOCATION_GUIDANCE: &str = "no hook payload received on stdin; bare `veil` is hook mode. Pipe a Claude/Gemini/Copilot hook payload into stdin, or run `veil --robot-triage`, `veil capabilities --json`, or `veil robot-docs guide` for operator discovery. For help with veil, run `veil --help`.";
 
@@ -141,8 +152,16 @@ fn run_with_io<R: Read, W: Write, E: Write>(
 fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
     let config = load_config(&hook_input.cwd)?;
     let registry = PackRegistry::with_built_ins();
-    let commands = extract_commands(hook_input);
-    let outcomes = evaluate_commands(hook_input, &config, &registry, &commands);
+    let outcomes = if hook_input.tool == ToolKind::Mcp {
+        if config.mcp.screens(&hook_input.tool_name) {
+            evaluate_mcp(hook_input, &config, &registry)
+        } else {
+            Vec::new()
+        }
+    } else {
+        let commands = extract_commands(hook_input);
+        evaluate_commands(hook_input, &config, &registry, &commands)
+    };
     let decision = select_decision(&outcomes);
     let mut rendered = render_decision(hook_input.protocol, &decision);
 
@@ -166,9 +185,82 @@ fn extract_commands(hook_input: &HookInput) -> Vec<CommandExtraction> {
         ToolKind::Bash => command_from_raw_args(&hook_input.raw_args)
             .map(|command| extract_bash_commands(&command, &hook_input.cwd))
             .unwrap_or_default(),
-        ToolKind::Unknown => Vec::new(),
+        // an MCP call has no commands: `evaluate_mcp` judges its arguments
+        ToolKind::Mcp | ToolKind::Unknown => Vec::new(),
     }
 }
+
+/// What an MCP tool call hands over: every string in its arguments that names a
+/// path is judged as a word of a command is, for a tool that is not an
+/// authorized spine tool (bd-1wa). The reason names the field, as a JSON
+/// pointer. Arguments veil did not read to the end are denied, as an argument
+/// it cannot resolve is.
+fn evaluate_mcp(
+    hook_input: &HookInput,
+    config: &config::Config,
+    registry: &PackRegistry,
+) -> Vec<CandidateOutcome> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let scan = mcp::scan_arguments(&hook_input.raw_args, &hook_input.cwd, home.as_deref());
+    let matchers = PolicyMatchers::new(config);
+    let mut outcomes = Vec::new();
+
+    for found in &scan.paths {
+        let input = EvaluationInput::new(
+            hook_input.tool,
+            found.path.clone(),
+            PathExposure::ReadsContents,
+        )
+        .with_argv_command(&hook_input.tool_name, false);
+        let mut decision = evaluate_access_with(&input, config, registry, &matchers);
+
+        // A path that is not protected is the common case; it is neither
+        // blocked nor worth a record.
+        if decision.action == DecisionAction::Allow && decision.reason.is_none() {
+            continue;
+        }
+
+        decision.reason = decision
+            .reason
+            .map(|reason| format!("{reason} (argument `{}`)", found.pointer));
+        if decision.remediation.is_some() {
+            decision.remediation = Some(MCP_REMEDIATION.to_owned());
+        }
+        outcomes.push(CandidateOutcome {
+            path: found.path.clone(),
+            decision,
+            sensitivity: sensitivity_pack(registry, &matchers, &found.path),
+            origin: Origin::Top,
+            reason_class: ReasonClass::McpArgument,
+            egress: false,
+        });
+    }
+
+    if scan.exceeded_limits {
+        outcomes.push(CandidateOutcome {
+            path: PathBuf::from(UNSCREENED_LABEL),
+            decision: evaluator::resolve_policy(
+                &config.policy.default,
+                None,
+                format!(
+                    "`{}` was given arguments nested deeper than {} levels or holding more than {} strings, so veil cannot show that none of them names a protected path (label: protected); blocked by policy default",
+                    hook_input.tool_name,
+                    mcp::MAX_DEPTH,
+                    mcp::MAX_STRINGS,
+                ),
+                MCP_OVERSIZE_REMEDIATION,
+            ),
+            sensitivity: None,
+            origin: Origin::Top,
+            reason_class: ReasonClass::McpArgument,
+            egress: false,
+        });
+    }
+
+    outcomes
+}
+
+const UNSCREENED_LABEL: &str = "<arguments veil cannot screen>";
 
 fn command_from_raw_args(raw_args: &str) -> Option<String> {
     serde_json::from_str::<Value>(raw_args)
@@ -479,7 +571,7 @@ fn append_audit_records(
             audit_path,
             &AuditRecord {
                 ts: timestamp.clone(),
-                tool: audit_tool_name(hook_input.tool).to_owned(),
+                tool: audit_tool_name(hook_input),
                 path: outcome.path.to_string_lossy().into_owned(),
                 decision: decision_name(&outcome.decision.action).to_owned(),
                 reason: outcome.decision.reason.clone(),
@@ -503,12 +595,15 @@ fn audit_timestamp() -> String {
     }
 }
 
-fn audit_tool_name(tool: ToolKind) -> &'static str {
-    match tool {
-        ToolKind::Read => "Read",
-        ToolKind::Grep => "Grep",
-        ToolKind::Bash => "Bash",
-        ToolKind::Unknown => "Unknown",
+/// The tool as the audit log names it. An MCP call is recorded under its own
+/// name (`mcp__mail__send_email`): `Mcp` would be every server's every tool.
+fn audit_tool_name(hook_input: &HookInput) -> String {
+    match hook_input.tool {
+        ToolKind::Read => "Read".to_owned(),
+        ToolKind::Grep => "Grep".to_owned(),
+        ToolKind::Bash => "Bash".to_owned(),
+        ToolKind::Mcp => hook_input.tool_name.clone(),
+        ToolKind::Unknown => "Unknown".to_owned(),
     }
 }
 
@@ -812,6 +907,7 @@ mod tests {
         let hook_input = HookInput {
             protocol: types::HookProtocol::ClaudeCode,
             tool: ToolKind::Bash,
+            tool_name: "Bash".to_owned(),
             cwd: repo_root.to_path_buf(),
             session_id: None,
             raw_args: serde_json::json!({ "command": command }).to_string(),
@@ -853,6 +949,7 @@ mod tests {
         let hook_input = HookInput {
             protocol: types::HookProtocol::ClaudeCode,
             tool: ToolKind::Bash,
+            tool_name: "Bash".to_owned(),
             cwd: repo_root.clone(),
             session_id: None,
             raw_args: serde_json::json!({ "command": clean }).to_string(),

@@ -85,6 +85,7 @@ veil hooks into Claude Code's `PreToolUse` event for multiple tool types:
 | `Read` | Direct file reads into context |
 | `Grep` | Content-mode grep exposing file contents, including a search of a directory that holds protected paths |
 | `Bash` | Common shell-reader patterns that would expose file contents directly, including `grep`, `rg`, `ag`, `ack` and `ugrep` content searches, in every command the line would run (see below) |
+| `mcp__.*` | Paths handed to an MCP tool in its arguments, such as a send-mail attachment or an upload path (see MCP Tools below) |
 
 Treat `veil` as an operator-first guardrail: it blocks direct reads, then points
 you to the configured authorized path for sensitive-file work instead of
@@ -159,7 +160,8 @@ Denials say which command named the path and carry the label
 `docs/plan.md`). Each audit record has a `reason_class`: `direct_read` for a
 Read or Grep call or a command veil recognises as a reader, `argv_path` for a
 path named by any other command, `dynamic_path_unresolvable` for an argument veil
-could not resolve to a path. A word that is not protected writes no record.
+could not resolve to a path, `mcp_argument` for a path in the arguments of an MCP
+tool call. A word that is not protected writes no record.
 
 A command that sends what it is given somewhere else is the **egress class**:
 `curl`, `wget`, `scp`, `rsync`, `sftp`, `ftp`, `lftp`, `rclone`, `aws`, `gsutil`,
@@ -170,8 +172,8 @@ the machine and that a copy, archive or encoding of it changes nothing, and the
 audit record carries `class: egress` as well as its `reason_class`.
 `veil audit --class egress` lists those attempts, newest last; it answers "did
 anything try to leave". `--class` also takes a `reason_class` (`direct_read`,
-`argv_path`, `dynamic_path_unresolvable`), and an unknown class is an error, not
-an empty list.
+`argv_path`, `dynamic_path_unresolvable`, `mcp_argument`), and an unknown class
+is an error, not an empty list.
 
 veil also finds the file when the command hides it inside a longer word: curl's
 `-F name=@file;type=text/csv`, `--data-urlencode name@file`,
@@ -213,6 +215,62 @@ Limits to know about:
   dynamic-argument stance below.
 - A `cd` earlier in the line is not followed; paths resolve against the
   directory the hook started in.
+
+### MCP Tools
+
+Claude Code fires `PreToolUse` for the tools an MCP server provides
+(`mcp__<server>__<tool>`) as well, and a send-mail or upload tool takes the path
+of a file as a string argument. `veil install` adds a hook for `mcp__.*`. veil
+then reads every string in the tool's arguments and judges the ones that name a
+path the way it judges a word of a command, for a tool that is not an authorized
+spine tool: a protected path is denied (or warned about, as `[policy] default`
+says). The reason names the tool and the field, as a JSON pointer:
+``(argument `/attachments/1`)``. The audit record carries the tool's own name
+(`mcp__mail__send_email`) and `reason_class: mcp_argument`, and
+`veil audit --class mcp_argument` lists them.
+
+A string names a path when
+
+- it is rooted (`/abs/x`, `~/x`, `file:///x`) and has no whitespace: it is judged
+  whether or not the file exists, as a word of a command is; or
+- it is anything else (a relative name, or text with spaces) and a file of that
+  name exists in the working directory. A symlink counts, and is followed.
+
+So `"path": "data/x.csv"` is judged when that file is there, and
+`"note": "see data/x.csv for the numbers"` never is: veil does not look inside a
+string for content. A URL is not a path (`https://host/x.csv`, `s3://b/k`), and
+numbers, booleans and object keys are not judged. Arguments nested more than 32
+levels deep, or holding more than 10,000 strings, are denied, because veil
+cannot show that nothing in them is protected; the remediation says to send less.
+
+`[mcp] screen = false` turns this off (MCP tool calls are then neither judged nor
+recorded). `[mcp] ignore_tools = ["mcp__crm__*"]` exempts tools whose arguments
+are known not to be paths, by exact name or by a prefix ending in `*`; an entry
+that could never match (one that does not start with `mcp__`) is a config error.
+Like every setting, both can be set in a project `.veil.toml`, which overrides
+the user's.
+
+An install made before MCP screening has no `mcp__.*` hook, so MCP tool calls
+never reach veil. `veil doctor` reports that as the `mcp_hook` check (an `error`,
+exit `1`) until `veil install` is run again. Operator commands are not refused
+for it: their preflight still needs only the Read, Grep and Bash hooks.
+
+Limits to know about:
+- A directory argument is judged as a path, not scanned: an MCP tool handed the
+  project root, which holds a protected file, is allowed. A tool that walks the
+  directory it is given can read that file.
+- A relative name resolves against the agent's working directory. An MCP server
+  running elsewhere may resolve the same string to another file.
+- A path built inside a string is not found: `"--file=x.csv"`, `"a.csv,b.csv"`,
+  `"@x.csv"`, a percent-escaped `file://` URL. A file id that is not a path is
+  not a path.
+- veil judges what the agent hands the tool, not what the tool does: a tool that
+  reads a protected file on its own, without being given its path, is not seen.
+- Only `mcp__*` tools are routed to veil. `WebFetch`, `NotebookRead` and the other
+  built-in tools that are not Read, Grep or Bash are not.
+- Each string that is not rooted costs one `lstat`, so a call with 10,000 such
+  strings takes 50 to 75 ms in a debug build; 10,000 distinct rooted paths take
+  about 450 ms, because each goes through the full path evaluation.
 
 ### Dynamic Arguments
 
@@ -348,6 +406,12 @@ audit_path = "~/.cmdrvl/logs/veil/audit.jsonl"  # default; outside repo
 # What to do with a command whose arguments veil cannot resolve to a path
 # (see Dynamic Arguments). Also set by VEIL_DYNAMIC_ARGS.
 dynamic_args = "deny"      # deny | warn | allow
+
+[mcp]
+# Judge the paths in the arguments of an MCP tool call (see MCP Tools).
+screen = true              # false: MCP tool calls are not judged
+# Tools whose arguments are never judged: an exact name or a prefix ending in *.
+ignore_tools = []          # e.g. ["mcp__crm__*"]
 ```
 
 veil also ships a built-in CMD+RVL config-protection profile. Direct content
@@ -430,7 +494,8 @@ says. Screening the body of an outbound message is a separate surface; see
 ### Doctor Mode
 
 `veil doctor` is read-only. It inspects local configuration, the audit path, and
-managed Claude Read/Grep/Bash hook state without installing hooks, rewriting
+managed Claude Read/Grep/Bash hook state, and the `mcp__.*` hook that screens MCP
+tool calls, without installing hooks, rewriting
 settings, appending audit records, or using the network.
 
 ```bash
@@ -492,7 +557,9 @@ File access attempt (Read/Grep/Bash)
 - Classified-sensitive file anywhere is resolved through pack-specific rules or `[policy] default`, with direct reads denied by default.
 - Operator/domain commands run a harness-aware guard preflight:
   - Under **Claude Code**, they fail closed unless the active Claude `PreToolUse`
-    settings contain healthy `veil` Read/Grep/Bash hooks.
+    settings contain healthy `veil` Read/Grep/Bash hooks. The `mcp__.*` hook
+    is not a precondition: `veil doctor` reports it, operator commands do not
+    refuse for it.
   - Under **Codex, Gemini CLI, Cursor, or a plain shell/CI sandbox**, Claude
     settings are not consulted; veil reports its hook wiring as `unverified`
     rather than blocking.
@@ -564,7 +631,8 @@ attests the model boundary.
 It can decide whether an agent may read a local path, grep file contents, or run
 a shell reader that would expose raw sensitive bytes. It can also help wrappers
 preflight attachment paths before send-time workflows hand those files to an
-email or chat client.
+email or chat client, and it refuses a protected path handed to an MCP tool in
+its arguments (see MCP Tools).
 
 It does not decide whether an outbound message body is safe, complete,
 appropriate for a counterpart, or compliant with a relationship-specific

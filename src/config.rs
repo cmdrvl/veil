@@ -58,6 +58,47 @@ pub struct Config {
     pub policy: PolicyConfig,
     /// `[protected_corpus]`: how much a protected-corpus filter build may read.
     pub protected_corpus: CorpusLimits,
+    /// `[mcp]`: whether the paths in the arguments of an MCP tool call are judged.
+    pub mcp: McpConfig,
+}
+
+/// `[mcp]`: veil judges the paths an MCP tool is handed (bd-1wa).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpConfig {
+    /// Judge the string values in an MCP tool's arguments that name a path.
+    /// On by default: an MCP tool that sends mail, uploads or posts is a way
+    /// out for a protected file. Off, MCP tool calls are not judged at all.
+    pub screen: bool,
+    /// Tools whose arguments are never judged: an exact name
+    /// (`mcp__server__tool`) or a prefix ending in `*` (`mcp__server__*`).
+    pub ignore_tools: Vec<String>,
+}
+
+impl McpConfig {
+    /// Whether the arguments of the MCP tool `tool_name` are judged.
+    pub fn screens(&self, tool_name: &str) -> bool {
+        self.screen
+            && !self
+                .ignore_tools
+                .iter()
+                .any(|ignored| ignores(ignored, tool_name))
+    }
+}
+
+fn ignores(pattern: &str, tool_name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => tool_name.starts_with(prefix),
+        None => pattern == tool_name,
+    }
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            screen: true,
+            ignore_tools: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -225,6 +266,7 @@ impl Config {
                 dynamic_args: DynamicArgsMode::Deny,
             },
             protected_corpus: CorpusLimits::default(),
+            mcp: McpConfig::default(),
         })
     }
 
@@ -295,6 +337,16 @@ impl Config {
                 self.protected_corpus.max_walk_entries = max_walk_entries;
             }
         }
+
+        if let Some(mcp) = partial.mcp {
+            if let Some(screen) = mcp.screen {
+                self.mcp.screen = screen;
+            }
+
+            if let Some(ignore_tools) = mcp.ignore_tools {
+                self.mcp.ignore_tools = ignore_tools;
+            }
+        }
     }
 }
 
@@ -345,6 +397,7 @@ struct PartialConfig {
     spine: Option<PartialSpineConfig>,
     policy: Option<PartialPolicyConfig>,
     protected_corpus: Option<PartialProtectedCorpusConfig>,
+    mcp: Option<PartialMcpConfig>,
 }
 
 impl PartialConfig {
@@ -386,8 +439,16 @@ impl PartialConfig {
                 None
             },
             protected_corpus: None,
+            mcp: None,
         })
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialMcpConfig {
+    screen: Option<bool>,
+    ignore_tools: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -471,6 +532,24 @@ fn validate_partial(config: &PartialConfig) -> Result<(), String> {
         ] {
             if value == Some(0) {
                 return Err(format!("protected_corpus.{name} must be greater than zero"));
+            }
+        }
+    }
+
+    if let Some(ignore_tools) = config
+        .mcp
+        .as_ref()
+        .and_then(|mcp| mcp.ignore_tools.as_ref())
+    {
+        for tool in ignore_tools {
+            let name = tool.strip_suffix('*').unwrap_or(tool);
+            let well_formed = name.starts_with("mcp__")
+                && !name.contains('*')
+                && !name.chars().any(char::is_whitespace);
+            if !well_formed {
+                return Err(format!(
+                    "mcp.ignore_tools entry `{tool}` must be an MCP tool name such as `mcp__server__tool`, or a prefix such as `mcp__server__*`"
+                ));
             }
         }
     }
@@ -1396,6 +1475,7 @@ mod tests {
                 dynamic_args: None,
             }),
             protected_corpus: None,
+            mcp: None,
         };
 
         let config = load_for_test(
@@ -1447,6 +1527,7 @@ mod tests {
                 dynamic_args: None,
             }),
             protected_corpus: None,
+            mcp: None,
         };
 
         let config = load_for_test(
@@ -1569,6 +1650,7 @@ mod tests {
             spine: None,
             policy: None,
             protected_corpus: None,
+            mcp: None,
         };
 
         let config = load_for_test(
@@ -1703,6 +1785,131 @@ mod tests {
             .dynamic_args,
             DynamicArgsMode::Allow
         );
+    }
+
+    #[test]
+    fn mcp_screening_is_on_by_default_and_layers_system_user_project() {
+        // Fresh directories for every load, as for `dynamic_args`.
+        let load = |system: Option<&str>, user: Option<&str>, project: Option<&str>| {
+            let repo_root = unique_temp_root("repo");
+            let home = unique_temp_root("home");
+            load_for_test(
+                &repo_root,
+                &home,
+                system,
+                user,
+                project,
+                PartialConfig::default(),
+            )
+            .unwrap()
+        };
+        let screen = |on: bool| format!("[mcp]\nscreen = {on}\n");
+
+        let default = load(None, None, None);
+        assert!(default.mcp.screen);
+        assert!(default.mcp.ignore_tools.is_empty());
+
+        assert!(!load(Some(&screen(false)), None, None).mcp.screen);
+        // a later layer wins, in either direction
+        assert!(
+            load(Some(&screen(false)), Some(&screen(true)), None)
+                .mcp
+                .screen
+        );
+        assert!(
+            !load(None, Some(&screen(true)), Some(&screen(false)))
+                .mcp
+                .screen
+        );
+        // a layer that sets another key leaves it alone
+        assert!(
+            !load(
+                Some(&screen(false)),
+                None,
+                Some("[policy]\nrequire_dcg = true\n")
+            )
+            .mcp
+            .screen
+        );
+        // `ignore_tools` is replaced by the later layer, not merged
+        let config = load(
+            Some("[mcp]\nignore_tools = [\"mcp__a__b\"]\n"),
+            None,
+            Some("[mcp]\nignore_tools = [\"mcp__c__*\"]\n"),
+        );
+        assert_eq!(config.mcp.ignore_tools, ["mcp__c__*"]);
+        assert!(config.mcp.screen);
+    }
+
+    #[test]
+    fn mcp_ignore_tools_match_an_exact_name_or_a_prefix_and_screen_off_beats_all() {
+        let config = McpConfig {
+            screen: true,
+            ignore_tools: vec!["mcp__mail__send_email".to_owned(), "mcp__crm__*".to_owned()],
+        };
+
+        assert!(!config.screens("mcp__mail__send_email"));
+        assert!(
+            config.screens("mcp__mail__send_email_later"),
+            "an exact name matches exactly"
+        );
+        assert!(config.screens("mcp__mail__send_draft"));
+        assert!(!config.screens("mcp__crm__"));
+        assert!(!config.screens("mcp__crm__create"));
+        assert!(
+            config.screens("mcp__crmx__create"),
+            "a prefix ends at its `*`"
+        );
+
+        let off = McpConfig {
+            screen: false,
+            ignore_tools: Vec::new(),
+        };
+        assert!(!off.screens("mcp__a__b"));
+        assert!(McpConfig::default().screens("mcp__a__b"));
+    }
+
+    #[test]
+    fn mcp_ignore_tools_rejects_entries_that_could_never_match() {
+        let load = |entry: &str| {
+            let repo_root = unique_temp_root("repo");
+            let home = unique_temp_root("home");
+            load_for_test(
+                &repo_root,
+                &home,
+                None,
+                None,
+                Some(&format!("[mcp]\nignore_tools = [\"{entry}\"]\n")),
+                PartialConfig::default(),
+            )
+        };
+
+        for entry in ["mcp__a__b", "mcp__a__*", "mcp__*"] {
+            assert!(load(entry).is_ok(), "{entry}");
+        }
+        for entry in ["send_email", "a__b", "mcp__a__*__b", "mcp__a b", ""] {
+            let error = load(entry).expect_err("an entry that cannot match is refused");
+            assert!(error.to_string().contains("mcp.ignore_tools"), "{error}");
+            assert!(error.to_string().contains("project"), "{error}");
+        }
+    }
+
+    #[test]
+    fn mcp_table_rejects_keys_it_does_not_know() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let error = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            None,
+            Some("[mcp]\nscreeen = false\n"),
+            PartialConfig::default(),
+        )
+        .expect_err("a typo must not silently leave screening on");
+
+        assert!(error.to_string().contains("screeen"), "{error}");
     }
 
     #[test]

@@ -59,7 +59,7 @@ pub struct AuditArgs {
     #[arg(
         long,
         value_name = "CLASS",
-        value_parser = ["egress", "direct_read", "argv_path", "dynamic_path_unresolvable"],
+        value_parser = ["egress", "direct_read", "argv_path", "dynamic_path_unresolvable", "mcp_argument"],
         help = "Only entries of one class: `egress` (a command that sends a protected path), or a reason_class"
     )]
     pub class: Option<String>,
@@ -363,7 +363,12 @@ mod tests {
                 class: Some("egress".to_owned()),
             }))
         );
-        for class in ["direct_read", "argv_path", "dynamic_path_unresolvable"] {
+        for class in [
+            "direct_read",
+            "argv_path",
+            "dynamic_path_unresolvable",
+            "mcp_argument",
+        ] {
             assert_eq!(
                 parse(&["veil", "audit", "--class", class]),
                 Dispatch::Operator(OperatorCommand::Audit(AuditArgs {

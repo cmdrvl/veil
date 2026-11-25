@@ -31,6 +31,10 @@ pub enum ToolKind {
     Read,
     Grep,
     Bash,
+    /// A tool an MCP server provides (`mcp__server__tool`). Its arguments are
+    /// JSON veil does not know the meaning of, so every string in them that
+    /// names a path is judged (bd-1wa).
+    Mcp,
     Unknown,
 }
 
@@ -38,6 +42,10 @@ pub enum ToolKind {
 pub struct HookInput {
     pub protocol: HookProtocol,
     pub tool: ToolKind,
+    /// The tool's name as the harness sent it. The audit record and the reason
+    /// of an MCP decision carry it, because `ToolKind::Mcp` is every server's
+    /// every tool.
+    pub tool_name: String,
     pub cwd: PathBuf,
     pub session_id: Option<String>,
     pub raw_args: String,

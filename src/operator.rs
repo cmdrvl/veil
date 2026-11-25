@@ -681,7 +681,8 @@ fn render_string_list(output: &mut String, heading: &str, label: &str, values: &
 }
 
 /// Whether an audit entry is of `class`: its `class` (`egress`) or its
-/// `reason_class` (`direct_read`, `argv_path`, `dynamic_path_unresolvable`).
+/// `reason_class` (`direct_read`, `argv_path`, `dynamic_path_unresolvable`,
+/// `mcp_argument`).
 fn entry_has_class(entry: &Value, class: &str) -> bool {
     string_field(entry, "class") == Some(class)
         || string_field(entry, "reason_class") == Some(class)
@@ -796,10 +797,12 @@ fn build_doctor_report(
 ) -> DoctorReport {
     let mut checks = Vec::new();
     let mut require_dcg = false;
+    let mut mcp_screen = config::McpConfig::default().screen;
 
     match config::load_config(repo_root) {
         Ok(config) => {
             require_dcg = config.policy.require_dcg;
+            mcp_screen = config.mcp.screen;
             checks.push(DoctorCheck {
                 name: "config",
                 status: DoctorStatus::Ok,
@@ -833,11 +836,73 @@ fn build_doctor_report(
     };
     let posture = hooks::inspect_guard_posture(harness, require_dcg, settings_path, search_path);
     checks.push(hooks_doctor_check(&posture));
+    checks.extend(mcp_hook_doctor_check(&posture, mcp_screen));
 
     DoctorReport {
         checks,
         guard_posture: posture.to_json_value(),
     }
+}
+
+/// Whether the hook that sends MCP tool calls to veil is installed (bd-1wa).
+/// Reported apart from `hooks`: operator commands do not refuse to run without
+/// it, but an install without it does not screen MCP tool arguments. `None`
+/// where veil cannot read the hook configuration: `hooks` says why.
+fn mcp_hook_doctor_check(posture: &hooks::GuardPosture, screen: bool) -> Option<DoctorCheck> {
+    let (Some(veil), Some(path)) = (&posture.veil, &posture.settings_path) else {
+        return None;
+    };
+    let name = "mcp_hook";
+
+    if !screen {
+        return Some(DoctorCheck {
+            name,
+            status: DoctorStatus::Ok,
+            detail: "MCP screening is off (`[mcp] screen = false`): MCP tool calls are not judged"
+                .to_owned(),
+            remediation: None,
+        });
+    }
+
+    let status = veil.mcp().map(|matcher| &matcher.status);
+    Some(match status {
+        Some(hooks::ManagedHookStatus::Installed { executable, .. }) => DoctorCheck {
+            name,
+            status: DoctorStatus::Ok,
+            detail: format!(
+                "MCP tool calls are screened: the `{}` hook in {} resolves to {}",
+                hooks::MCP_MATCHER,
+                path.display(),
+                executable.display()
+            ),
+            remediation: None,
+        },
+        Some(hooks::ManagedHookStatus::Invalid { command, reason }) => DoctorCheck {
+            name,
+            status: DoctorStatus::ActionNeeded,
+            detail: format!(
+                "the `{}` hook command `{command}` does not resolve to an executable ({reason}), so MCP tool arguments are not screened",
+                hooks::MCP_MATCHER
+            ),
+            remediation: Some(
+                "run `veil install` to rewrite the managed hook commands to the current executable"
+                    .to_owned(),
+            ),
+        },
+        Some(hooks::ManagedHookStatus::Missing) | None => DoctorCheck {
+            name,
+            status: DoctorStatus::ActionNeeded,
+            detail: format!(
+                "no PreToolUse hook for MCP tools (`{}`) in {}, so MCP tool arguments are not screened",
+                hooks::MCP_MATCHER,
+                path.display()
+            ),
+            remediation: Some(
+                "run `veil install` to add the managed `mcp__.*` PreToolUse hook entry, or set `[mcp] screen = false` if MCP tools should not be screened"
+                    .to_owned(),
+            ),
+        },
+    })
 }
 
 fn hooks_doctor_check(posture: &hooks::GuardPosture) -> DoctorCheck {
@@ -1671,6 +1736,11 @@ fn doctor_capabilities_json_value() -> Value {
                 "name": "hooks",
                 "description": "Inspects managed Claude Read/Grep/Bash PreToolUse hook entries and executable resolution.",
                 "writes": false
+            },
+            {
+                "name": "mcp_hook",
+                "description": "Inspects the managed Claude `mcp__.*` PreToolUse hook entry that sends MCP tool calls to veil, and its executable resolution. Not required by operator preflight; reported ok when `[mcp] screen = false`.",
+                "writes": false
             }
         ],
         "fixers": [],
@@ -2233,14 +2303,16 @@ mod tests {
                       {{ "type": "command", "command": "{}" }},
                       {{ "type": "command", "command": "{}" }}
                     ]
-                  }}
+                  }},
+                  {{ "matcher": "mcp__.*", "hooks": [{{ "type": "command", "command": "{}" }}] }}
                 ]
               }}
             }}"#,
                 executable_path.display(),
                 executable_path.display(),
                 executable_path.display(),
-                dcg_path.display()
+                dcg_path.display(),
+                executable_path.display()
             ),
         );
 
@@ -2276,7 +2348,8 @@ mod tests {
                 .iter()
                 .filter(|check| check["status"] == "ok")
                 .count(),
-            3
+            4,
+            "config, audit, hooks and mcp_hook"
         );
     }
 
@@ -2307,6 +2380,168 @@ mod tests {
         assert!(rendered.contains("hooks [action_needed]"));
         assert!(rendered.contains("do not resolve to executables"));
         assert!(rendered.contains("run `veil install`"));
+    }
+
+    /// Claude settings with a hook for Read, Grep and Bash, and one for MCP
+    /// tools when `mcp_command` says what it runs.
+    fn settings_with_hooks(repo_root: &Path, command: &str, mcp_command: Option<&str>) -> PathBuf {
+        let settings_path = repo_root.join("claude/settings.json");
+        let hook = |matcher: &str, command: &str| {
+            format!(
+                r#"{{ "matcher": "{matcher}", "hooks": [{{ "type": "command", "command": "{command}" }}] }}"#
+            )
+        };
+        let mut entries = vec![
+            hook("Read", command),
+            hook("Grep", command),
+            hook("Bash", command),
+        ];
+        entries.extend(mcp_command.map(|mcp| hook("mcp__.*", mcp)));
+        write_file(
+            &settings_path,
+            &format!(
+                r#"{{ "hooks": {{ "PreToolUse": [{}] }} }}"#,
+                entries.join(", ")
+            ),
+        );
+        settings_path
+    }
+
+    fn mcp_hook_check(report: &DoctorReport) -> &DoctorCheck {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "mcp_hook")
+            .expect("a Claude Code report has an mcp_hook check")
+    }
+
+    #[test]
+    fn doctor_says_when_only_the_mcp_hook_is_missing_and_preflight_still_passes() {
+        let repo_root = unique_temp_dir("doctor-no-mcp-hook");
+        let executable_path = repo_root.join("bin/veil");
+        create_executable(&executable_path);
+        // an install made before MCP screening: Read, Grep and Bash only
+        let settings_path =
+            settings_with_hooks(&repo_root, &executable_path.display().to_string(), None);
+
+        let report = build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(settings_path.clone()),
+            hooks::Harness::ClaudeCode,
+            None,
+        );
+
+        let hooks_check = report.checks.iter().find(|check| check.name == "hooks");
+        assert_eq!(
+            hooks_check.map(|check| &check.status),
+            Some(&DoctorStatus::Ok)
+        );
+        let mcp = mcp_hook_check(&report);
+        assert_eq!(mcp.status, DoctorStatus::ActionNeeded);
+        assert!(
+            mcp.detail.contains("MCP tool arguments are not screened"),
+            "{}",
+            mcp.detail
+        );
+        assert!(
+            mcp.remediation
+                .as_deref()
+                .is_some_and(|remediation| remediation.contains("veil install")),
+            "{:?}",
+            mcp.remediation
+        );
+        assert_eq!(report.exit_code(), 1);
+
+        // operator commands are not refused for it: only the three required
+        // hooks are a precondition
+        let posture = hooks::inspect_guard_posture(
+            hooks::Harness::ClaudeCode,
+            false,
+            Ok(settings_path),
+            None,
+        );
+        assert!(posture.is_healthy(), "{:?}", posture.blockers());
+    }
+
+    #[test]
+    fn doctor_mcp_check_passes_when_the_hook_is_installed_or_screening_is_off() {
+        let repo_root = unique_temp_dir("doctor-mcp-hook-ok");
+        let executable_path = repo_root.join("bin/veil");
+        create_executable(&executable_path);
+        let command = executable_path.display().to_string();
+        let settings_path = settings_with_hooks(&repo_root, &command, Some(&command));
+
+        let installed = build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(settings_path),
+            hooks::Harness::ClaudeCode,
+            None,
+        );
+        assert_eq!(mcp_hook_check(&installed).status, DoctorStatus::Ok);
+        assert!(
+            mcp_hook_check(&installed).detail.contains("are screened"),
+            "{}",
+            mcp_hook_check(&installed).detail
+        );
+
+        // with `[mcp] screen = false` the hook is not wanted, so its absence is fine
+        let off_root = unique_temp_dir("doctor-mcp-screen-off");
+        write_file(&off_root.join(".veil.toml"), "[mcp]\nscreen = false\n");
+        let off_settings = settings_with_hooks(&off_root, &command, None);
+        let off = build_doctor_report(
+            &off_root,
+            SettingsPathStatus::Resolved(off_settings),
+            hooks::Harness::ClaudeCode,
+            None,
+        );
+        assert_eq!(mcp_hook_check(&off).status, DoctorStatus::Ok);
+        assert!(
+            mcp_hook_check(&off).detail.contains("screening is off"),
+            "{}",
+            mcp_hook_check(&off).detail
+        );
+    }
+
+    #[test]
+    fn doctor_mcp_check_reports_a_hook_command_that_does_not_resolve() {
+        let repo_root = unique_temp_dir("doctor-mcp-hook-invalid");
+        let executable_path = repo_root.join("bin/veil");
+        create_executable(&executable_path);
+        let settings_path = settings_with_hooks(
+            &repo_root,
+            &executable_path.display().to_string(),
+            Some("/definitely/missing/veil"),
+        );
+
+        let report = build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(settings_path),
+            hooks::Harness::ClaudeCode,
+            None,
+        );
+
+        let mcp = mcp_hook_check(&report);
+        assert_eq!(mcp.status, DoctorStatus::ActionNeeded);
+        assert!(mcp.detail.contains("does not resolve"), "{}", mcp.detail);
+        assert!(
+            mcp.detail.contains("/definitely/missing/veil"),
+            "{}",
+            mcp.detail
+        );
+    }
+
+    #[test]
+    fn a_harness_whose_hooks_veil_cannot_read_has_no_mcp_hook_check() {
+        let repo_root = unique_temp_dir("doctor-mcp-codex");
+
+        let report = build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(repo_root.join("claude/settings.json")),
+            hooks::Harness::Codex,
+            None,
+        );
+
+        assert!(report.checks.iter().all(|check| check.name != "mcp_hook"));
     }
 
     #[test]

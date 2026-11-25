@@ -6,7 +6,19 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-const MANAGED_MATCHERS: &[&str] = &["Read", "Grep", "Bash"];
+/// The `PreToolUse` matcher for the tools an MCP server provides (bd-1wa). It
+/// is a regular expression, not a tool name: Claude Code matches it against
+/// `mcp__<server>__<tool>`.
+pub(crate) const MCP_MATCHER: &str = "mcp__.*";
+
+/// The tools veil has always judged. An install without a hook for each is not
+/// guarded, and operator commands refuse to run in one.
+const REQUIRED_MATCHERS: &[&str] = &["Read", "Grep", "Bash"];
+
+/// Every matcher `veil install` writes. The MCP one is not required: an
+/// install made before bd-1wa is guarded as it always was, and `veil doctor`
+/// says that MCP tool calls are not screened until `veil install` is run again.
+const MANAGED_MATCHERS: &[&str] = &["Read", "Grep", "Bash", MCP_MATCHER];
 const LEGACY_VEIL_COMMAND: &str = "$HOME/.local/bin/veil";
 const SETTINGS_OVERRIDE_ENV: &str = "VEIL_CLAUDE_SETTINGS_PATH";
 const HARNESS_OVERRIDE_ENV: &str = "VEIL_HARNESS";
@@ -373,10 +385,20 @@ fn inspect_dcg_entries(entries: &[Value]) -> DcgHookInspection {
 }
 
 impl ManagedHooksInspection {
+    /// Every hook veil requires is installed and resolves. The MCP hook is not
+    /// required (see [`MANAGED_MATCHERS`]): it has its own check.
     pub(crate) fn is_healthy(&self) -> bool {
         self.matchers
             .iter()
+            .filter(|matcher| REQUIRED_MATCHERS.contains(&matcher.matcher))
             .all(|matcher| matches!(matcher.status, ManagedHookStatus::Installed { .. }))
+    }
+
+    /// The hook for MCP tool calls.
+    pub(crate) fn mcp(&self) -> Option<&ManagedMatcherInspection> {
+        self.matchers
+            .iter()
+            .find(|matcher| matcher.matcher == MCP_MATCHER)
     }
 }
 
@@ -826,7 +848,7 @@ mod tests {
         let entries = settings["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse should be an array");
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4, "Read, Grep, Bash and the MCP tools");
 
         for matcher in MANAGED_MATCHERS {
             let entry = entries
@@ -836,6 +858,114 @@ mod tests {
             let hooks = entry["hooks"].as_array().expect("hooks should be an array");
             assert_eq!(hooks, &[veil_hook(TEST_VEIL_COMMAND)]);
         }
+        assert!(
+            entries.iter().any(|entry| entry["matcher"] == "mcp__.*"),
+            "the MCP matcher is the regular expression `mcp__.*`"
+        );
+    }
+
+    #[test]
+    fn install_adds_the_mcp_hook_to_an_install_that_predates_it() {
+        let path = temp_settings_path("install-adds-mcp");
+        let executable_path = temp_executable_path("install-adds-mcp");
+        create_executable(&executable_path);
+        let command = quote_test_command(&executable_path);
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook(&command)] },
+                        { "matcher": "Grep", "hooks": [veil_hook(&command)] },
+                        { "matcher": "Bash", "hooks": [veil_hook(&command)] },
+                        {
+                            "matcher": "Custom",
+                            "hooks": [{ "type": "command", "command": "/usr/local/bin/custom" }]
+                        }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        // before: guarded as it always was, and the MCP hook is reported missing
+        let before = inspect_managed_hooks(&path).expect("managed hook probe should succeed");
+        assert!(before.is_healthy(), "the three required hooks are enough");
+        assert_eq!(
+            before.mcp().map(|matcher| &matcher.status),
+            Some(&ManagedHookStatus::Missing)
+        );
+        assert!(
+            inspect_guard_preflight(&path)
+                .expect("preflight probe should succeed")
+                .veil
+                .is_healthy(),
+            "operator commands must not start refusing for the missing MCP hook"
+        );
+
+        install_into_path_with_command(&path, &command).expect("install should succeed");
+
+        let after = inspect_managed_hooks(&path).expect("managed hook probe should succeed");
+        assert!(matches!(
+            after.mcp().map(|matcher| &matcher.status),
+            Some(ManagedHookStatus::Installed { .. })
+        ));
+        let settings = read_settings(&path);
+        let entries = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse should remain an array");
+        assert_eq!(entries.len(), 5, "the unrelated Custom entry is kept");
+        assert!(entries.iter().any(|entry| matcher_matches(entry, "Custom")));
+    }
+
+    #[test]
+    fn an_mcp_hook_inside_a_combined_matcher_counts_as_installed() {
+        let path = temp_settings_path("mcp-combined");
+        let executable_path = temp_executable_path("mcp-combined");
+        create_executable(&executable_path);
+        let command = quote_test_command(&executable_path);
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook(&command)] },
+                        { "matcher": "Grep", "hooks": [veil_hook(&command)] },
+                        { "matcher": "Bash", "hooks": [veil_hook(&command)] },
+                        { "matcher": "WebFetch|mcp__.*", "hooks": [veil_hook(&command)] }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        let inspection = inspect_managed_hooks(&path).expect("managed hook probe should succeed");
+        assert!(matches!(
+            inspection.mcp().map(|matcher| &matcher.status),
+            Some(ManagedHookStatus::Installed { .. })
+        ));
+
+        install_into_path_with_command(&path, &command).expect("install should succeed");
+        let settings = read_settings(&path);
+        assert_eq!(
+            settings["hooks"]["PreToolUse"].as_array().map(Vec::len),
+            Some(4),
+            "install reuses the combined entry instead of adding a second"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_the_mcp_hook_too() {
+        let path = temp_settings_path("uninstall-mcp");
+        install_into_path_with_command(&path, TEST_VEIL_COMMAND).expect("install should succeed");
+
+        uninstall_from_path(&path).expect("uninstall should succeed");
+
+        let settings = read_settings(&path);
+        let entries = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse should remain an array");
+        assert!(entries.is_empty(), "{entries:?}");
     }
 
     #[test]
@@ -852,7 +982,7 @@ mod tests {
             .as_array()
             .expect("PreToolUse should remain an array");
 
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         for matcher in MANAGED_MATCHERS {
             let entry = entries
                 .iter()
@@ -1046,11 +1176,22 @@ mod tests {
             !inspection.is_healthy(),
             "missing executables should fail the probe"
         );
-        assert!(
-            inspection
-                .matchers
-                .iter()
-                .all(|matcher| { matches!(matcher.status, ManagedHookStatus::Invalid { .. }) })
+        for matcher in inspection
+            .matchers
+            .iter()
+            .filter(|matcher| REQUIRED_MATCHERS.contains(&matcher.matcher))
+        {
+            assert!(
+                matches!(matcher.status, ManagedHookStatus::Invalid { .. }),
+                "{}: {:?}",
+                matcher.matcher,
+                matcher.status
+            );
+        }
+        assert_eq!(
+            inspection.mcp().map(|matcher| &matcher.status),
+            Some(&ManagedHookStatus::Missing),
+            "the fixture has no MCP entry"
         );
     }
 
