@@ -28,6 +28,8 @@ enum CompiledPattern {
     ExactName(String),
     ExactPath(Vec<String>),
     Directory(Vec<String>),
+    AbsoluteExactPath(Vec<String>),
+    AbsoluteDirectory(Vec<String>),
     BasenameGlob(String),
     PathGlob(String),
 }
@@ -126,10 +128,12 @@ impl SafePathMatcher {
         // which happens before its entries are read. Files therefore only
         // need the other pattern kinds, and most configs have none, which
         // keeps the walk to a directory read per directory.
-        let file_patterns = self
-            .patterns
-            .iter()
-            .any(|pattern| !matches!(pattern, CompiledPattern::Directory(_)));
+        let file_patterns = self.patterns.iter().any(|pattern| {
+            !matches!(
+                pattern,
+                CompiledPattern::Directory(_) | CompiledPattern::AbsoluteDirectory(_)
+            )
+        });
         let mut pending = VecDeque::from([directory.to_path_buf()]);
         let mut inspected = 0usize;
 
@@ -205,20 +209,34 @@ pub enum DirectoryScan {
 
 impl CompiledPattern {
     fn compile(pattern: &str) -> Self {
+        let absolute = is_absolute_pattern(pattern);
+        let normalized = absolute.then(|| normalize_absolute_pattern(pattern));
+        let pattern = normalized.as_deref().unwrap_or(pattern);
+
         if let Some(directory) = pattern.strip_suffix("/**") {
-            return Self::Directory(normalize_pattern_components(directory));
+            let components = normalize_pattern_components(directory);
+            return if absolute {
+                Self::AbsoluteDirectory(components)
+            } else {
+                Self::Directory(components)
+            };
         }
 
         if pattern.contains('*') {
-            if pattern.contains('/') {
+            if pattern.contains('/') || absolute {
                 return Self::PathGlob(pattern.to_owned());
             }
 
             return Self::BasenameGlob(pattern.to_owned());
         }
 
-        if pattern.contains('/') {
-            return Self::ExactPath(normalize_pattern_components(pattern));
+        if pattern.contains('/') || absolute {
+            let components = normalize_pattern_components(pattern);
+            return if absolute {
+                Self::AbsoluteExactPath(components)
+            } else {
+                Self::ExactPath(components)
+            };
         }
 
         Self::ExactName(pattern.to_owned())
@@ -233,6 +251,12 @@ impl CompiledPattern {
             Self::ExactName(name) => path.basename().is_some_and(|value| value == name),
             Self::ExactPath(components) => path.ends_with(components),
             Self::Directory(components) => path.contains_directory(components),
+            Self::AbsoluteExactPath(components) => {
+                components.is_empty() || path.components == *components
+            }
+            Self::AbsoluteDirectory(components) => {
+                path.components.starts_with(components) && path.components.len() > components.len()
+            }
             Self::BasenameGlob(pattern) => path
                 .basename()
                 .is_some_and(|value| wildcard_matches(pattern, value)),
@@ -258,6 +282,7 @@ impl CompiledPattern {
 struct PatternIndex {
     names: HashSet<String>,
     segments: Trie,
+    absolute_segments: Trie,
     globs: GlobIndex,
 }
 
@@ -267,6 +292,8 @@ struct Trie {
     nodes: Vec<TrieNode>,
     /// A pattern with no components (`/`) ends every path.
     ends_every_path: bool,
+    /// A root `/**` pattern covers every non-root path.
+    root_directory: bool,
 }
 
 impl Default for Trie {
@@ -274,6 +301,7 @@ impl Default for Trie {
         Self {
             nodes: vec![TrieNode::default()],
             ends_every_path: false,
+            root_directory: false,
         }
     }
 }
@@ -289,6 +317,10 @@ struct TrieNode {
 }
 
 impl Trie {
+    fn is_empty(&self) -> bool {
+        self.nodes.len() == 1 && !self.ends_every_path && !self.root_directory
+    }
+
     fn insert(&mut self, components: &[String], directory: bool) {
         if components.is_empty() {
             self.ends_every_path |= !directory;
@@ -336,6 +368,30 @@ impl Trie {
                 if directories && self.nodes[node].directory && !ends_path {
                     return true;
                 }
+            }
+        }
+
+        false
+    }
+
+    fn matches_absolute(&self, path: &[String], directories: bool) -> bool {
+        if self.ends_every_path || (directories && self.root_directory && !path.is_empty()) {
+            return true;
+        }
+
+        let mut node = 0;
+        for (index, component) in path.iter().enumerate() {
+            let Some(next) = self.nodes[node].children.get(component) else {
+                return false;
+            };
+            node = *next;
+            let ends_path = index + 1 == path.len();
+
+            if self.nodes[node].exact_path && ends_path {
+                return true;
+            }
+            if directories && self.nodes[node].directory && !ends_path {
+                return true;
             }
         }
 
@@ -488,6 +544,16 @@ impl PatternIndex {
                 CompiledPattern::Directory(components) => {
                     index.segments.insert(components, true);
                 }
+                CompiledPattern::AbsoluteExactPath(components) => {
+                    index.absolute_segments.insert(components, false);
+                }
+                CompiledPattern::AbsoluteDirectory(components) => {
+                    if components.is_empty() {
+                        index.absolute_segments.root_directory = true;
+                    } else {
+                        index.absolute_segments.insert(components, true);
+                    }
+                }
                 CompiledPattern::BasenameGlob(glob) => {
                     index.globs.insert(glob, GlobTarget::Basename);
                 }
@@ -507,7 +573,22 @@ impl PatternIndex {
         path.basename()
             .is_some_and(|name| self.names.contains(name))
             || self.segments.matches(&path.components, directories)
+            || (!self.absolute_segments.is_empty()
+                && self
+                    .absolute_segments
+                    .matches_absolute(&path.components, directories))
             || self.globs.matches(path)
+    }
+}
+
+fn is_absolute_pattern(pattern: &str) -> bool {
+    #[cfg(unix)]
+    {
+        pattern.starts_with('/')
+    }
+    #[cfg(not(unix))]
+    {
+        Path::new(pattern).is_absolute()
     }
 }
 
@@ -574,6 +655,25 @@ fn normalize_pattern_components(pattern: &str) -> Vec<String> {
         .collect()
 }
 
+fn normalize_absolute_pattern(pattern: &str) -> String {
+    let mut components = Vec::new();
+    for component in Path::new(pattern).components() {
+        match component {
+            Component::Prefix(prefix) => {
+                components.push(prefix.as_os_str().to_string_lossy().into_owned());
+            }
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                components.pop();
+            }
+            Component::Normal(part) => {
+                components.push(part.to_string_lossy().into_owned());
+            }
+        }
+    }
+    components.join("/")
+}
+
 fn wildcard_matches(pattern: &str, candidate: &str) -> bool {
     wildcard_matches_bytes(pattern.as_bytes(), candidate.as_bytes())
 }
@@ -594,6 +694,7 @@ fn wildcard_matches_bytes(pattern: &[u8], candidate: &[u8]) -> bool {
             .any(|index| wildcard_matches_bytes(rest, &candidate[index..]));
     }
 
+    // ubs:ignore — this compares glob syntax, not a credential or token.
     if pattern[0] == b'*' {
         let rest = &pattern[1..];
         let max = candidate
@@ -605,6 +706,7 @@ fn wildcard_matches_bytes(pattern: &[u8], candidate: &[u8]) -> bool {
     }
 
     match candidate.split_first() {
+        // ubs:ignore — this compares filename-pattern bytes, not credentials.
         Some((first, tail)) if *first == pattern[0] => wildcard_matches_bytes(&pattern[1..], tail),
         _ => false,
     }
@@ -1010,8 +1112,10 @@ mod tests {
                 let expected = matcher.is_safe_linear(path);
                 let normalized = NormalizedPath::from_path(path);
                 let expected_files = matcher.patterns.iter().any(|pattern| {
-                    !matches!(pattern, CompiledPattern::Directory(_))
-                        && pattern.matches(&normalized)
+                    !matches!(
+                        pattern,
+                        CompiledPattern::Directory(_) | CompiledPattern::AbsoluteDirectory(_)
+                    ) && pattern.matches(&normalized)
                 });
 
                 assert_eq!(
@@ -1057,6 +1161,22 @@ mod tests {
         assert!(matcher(&["*.csv"]).is_safe(path("/repo/data/x.csv")));
         assert!(!matcher(&["*.csv"]).is_safe(path("/repo/x.csv/y")));
         assert!(matcher(&[".env"]).is_safe(path("/repo/.env")));
+    }
+
+    #[test]
+    fn absolute_patterns_are_anchored_to_their_full_path() {
+        let matcher = matcher(&[
+            "/repo/project/vault/**",
+            "/repo/project/exports/*.csv",
+            "/repo/project/notes.md",
+        ]);
+
+        assert!(matcher.is_safe("/repo/project/vault/secret.txt"));
+        assert!(!matcher.is_safe("/repo/project/nested/vault/secret.txt"));
+        assert!(matcher.is_safe("/repo/project/exports/annual.csv"));
+        assert!(!matcher.is_safe("/repo/other/project/exports/annual.csv"));
+        assert!(matcher.is_safe("/repo/project/notes.md"));
+        assert!(!matcher.is_safe("/repo/other/project/notes.md"));
     }
 
     #[test]

@@ -69,11 +69,11 @@ fn repo(label: &str, policy: &str) -> Repo {
     };
     fs::write(root.join(".veil.toml"), config("data/**")).expect("config should be written");
 
-    // veil reads `.veil.toml` from the directory the hook runs in, so a command
-    // run from inside `vault/` sees this one: its own directory is protected.
-    fs::create_dir_all(root.join("vault")).expect("vault dir");
-    fs::write(root.join("vault/keys.txt"), "k\n").expect("vault file");
-    fs::write(root.join("vault/.veil.toml"), config("vault/**")).expect("vault config");
+    // The nearest `.veil.toml` wins, and this path pattern is relative to the
+    // nested config file's directory.
+    fs::create_dir_all(root.join("vault/local")).expect("nested protected dir");
+    fs::write(root.join("vault/local/keys.txt"), "k\n").expect("vault file");
+    fs::write(root.join("vault/.veil.toml"), config("local/**")).expect("vault config");
 
     Repo { root, audit }
 }
@@ -97,6 +97,7 @@ fn run(repo: &Repo, cwd: &Path, command: &str, env: &[(&str, &str)]) -> Verdict 
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_veil"));
     child
+        .current_dir(cwd)
         .env("HOME", &repo.root)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_STATE_HOME")
@@ -174,6 +175,81 @@ fn assert_allowed(repo: &Repo, command: &str) {
         "should be allowed: {command} (reason: {:?})",
         verdict.reason
     );
+}
+
+#[test]
+fn project_config_is_found_when_the_hook_runs_from_a_subdirectory() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "veil-dyn-subdir-config-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("vault")).expect("vault dir");
+    fs::create_dir_all(root.join("data")).expect("data dir");
+    fs::create_dir_all(root.join("data/vault")).expect("nested unprotected vault dir");
+    fs::write(root.join("vault/secret.txt"), "secret\n").expect("protected file");
+    fs::write(root.join("data/vault/note.txt"), "ordinary\n").expect("unprotected file");
+    fs::write(
+        root.join(".veil.toml"),
+        "[sensitivity]\nprotected = [\"vault/**\"]\n",
+    )
+    .expect("project config");
+    let root = fs::canonicalize(root).expect("project root should canonicalize");
+    let repo = Repo {
+        audit: root.join("state/audit.jsonl"),
+        root: root.clone(),
+    };
+
+    assert!(bash(&repo, "cat vault/secret.txt").denied());
+    assert!(bash_in(&repo, "data", "cat ../vault/secret.txt").denied());
+    assert!(
+        bash_in(
+            &repo,
+            "data",
+            &format!("cat {}", root.join("vault/secret.txt").display())
+        )
+        .denied()
+    );
+    assert!(!bash(&repo, "cat data/vault/note.txt").denied());
+}
+
+#[test]
+fn the_nearest_project_config_replaces_the_outer_project_config() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after the epoch")
+        .as_nanos();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "veil-dyn-nested-config-{}-{nanos}-{counter}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("vault")).expect("outer protected dir");
+    fs::create_dir_all(root.join("child/local")).expect("nested protected dir");
+    fs::write(root.join("vault/outer.txt"), "outer\n").expect("outer protected file");
+    fs::write(root.join("child/local/inner.txt"), "inner\n").expect("nested protected file");
+    fs::write(
+        root.join(".veil.toml"),
+        "[sensitivity]\nprotected = [\"vault/**\"]\n",
+    )
+    .expect("outer project config");
+    fs::write(
+        root.join("child/.veil.toml"),
+        "[sensitivity]\nprotected = [\"local/**\"]\n",
+    )
+    .expect("nested project config");
+    let root = fs::canonicalize(root).expect("project root should canonicalize");
+    let repo = Repo {
+        audit: root.join("state/audit.jsonl"),
+        root,
+    };
+
+    assert!(bash_in(&repo, "child", "cat local/inner.txt").denied());
+    assert!(!bash_in(&repo, "child", "cat ../vault/outer.txt").denied());
 }
 
 #[test]
@@ -515,14 +591,14 @@ fn any_command_is_blocked_where_a_protected_path_is_in_play() {
         "python3 $SCRIPT",
     ] {
         assert_allowed(&repo, command);
-        let verdict = bash_in(&repo, "vault", command);
+        let verdict = bash_in(&repo, "vault/local", command);
         assert!(verdict.denied(), "inside vault: {command}");
         let reason = verdict.reason.expect("a denial carries its reason");
         assert!(reason.contains("inside a protected directory"), "{reason}");
     }
     assert!(!bash_in(&repo, "src", "echo $UNSET").denied());
     // arguments that resolve are not unresolved there
-    assert!(!bash_in(&repo, "vault", "ls .").denied());
+    assert!(!bash_in(&repo, "vault/local", "ls .").denied());
 
     // A string that sets a variable to a protected path, literal or from a pack.
     for command in [

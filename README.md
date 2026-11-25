@@ -570,6 +570,13 @@ screen = true              # false: MCP tool calls are not judged
 ignore_tools = []          # e.g. ["mcp__crm__*"]
 ```
 
+The hook looks for `.veil.toml` in its working directory and walks up through
+parent directories to the filesystem root. The nearest file is the project
+config; a nested file replaces the outer project config. Patterns with path
+components, such as `data/clients/**` and `exports/*.csv`, are rooted at the
+directory containing that file. Bare filenames and basename globs such as
+`*.nport.xml` keep matching by filename.
+
 veil also ships a built-in CMD+RVL config-protection profile. Direct content
 reads under the canonical `~/.cmdrvl/` config and secret-bearing subtrees are
 denied by default, including `config/`, `secrets/`, guard receipts, Gmail watch

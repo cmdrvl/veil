@@ -2083,8 +2083,16 @@ mod tests {
         let protected = value["sensitivity"]["protected"]
             .as_array()
             .expect("protected patterns should be an array");
+        let project_pattern = format!(
+            "{}/data/**",
+            fs::canonicalize(&repo_root)
+                .expect("repo root should canonicalize")
+                .display()
+        );
         assert!(
-            protected.iter().any(|pattern| pattern == "data/**"),
+            protected
+                .iter()
+                .any(|pattern| pattern.as_str() == Some(project_pattern.as_str())),
             "project protected pattern should be preserved"
         );
         for suffix in [
@@ -2989,15 +2997,22 @@ mod tests {
             protected = ["protected/**"]
             "#,
         );
+        write_file(&repo_root.join("protected/dataset.tsv"), "id,value\n1,2\n");
 
         let rendered =
             render_explain_for_repo(&repo_root, Path::new("protected/dataset.tsv"), false)
                 .expect("explain rendering should succeed");
+        let protected_pattern = format!(
+            "{}/protected/**",
+            fs::canonicalize(&repo_root)
+                .expect("repo root should canonicalize")
+                .display()
+        );
 
         assert!(rendered.contains("Explain"));
         assert!(rendered.contains("matched_by: pack"));
         assert!(rendered.contains("pack: data.tabular"));
-        assert!(rendered.contains("protected_pattern: protected/**"));
+        assert!(rendered.contains(&format!("protected_pattern: {protected_pattern}")));
         assert!(rendered.contains("decision: deny"));
     }
 

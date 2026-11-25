@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -223,20 +223,123 @@ fn load_config_from_paths(
         )?;
     }
 
-    let project_path = repo_root.join(".veil.toml");
-
-    for (path, layer_name) in [
-        (system_path, "system"),
-        (user_path.as_path(), "user"),
-        (project_path.as_path(), "project"),
-    ] {
+    for (path, layer_name) in [(system_path, "system"), (user_path.as_path(), "user")] {
         if let Some(layer) = load_optional_config(path, layer_name, home)? {
             config.apply_partial(layer);
         }
     }
 
+    if let Some(project_path) = find_project_config(repo_root)?
+        && let Some(mut layer) = load_optional_config(&project_path, "project", home)?
+    {
+        let project_dir = project_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "project config has no parent directory: {}",
+                    project_path.display()
+                ),
+            )
+        })?;
+        let project_dir = fs::canonicalize(project_dir)?;
+        resolve_project_patterns(&mut layer, &project_dir, home);
+        config.apply_partial(layer);
+    }
+
     config.apply_partial(env_overrides);
     Ok(config)
+}
+
+/// Find the nearest project config above `start_dir`. A nested `.veil.toml`
+/// replaces outer project configs; searching includes the filesystem root.
+fn find_project_config(start_dir: &Path) -> io::Result<Option<PathBuf>> {
+    let start_dir = absolute_lexical_path(start_dir)?;
+
+    for directory in start_dir.ancestors() {
+        let candidate = directory.join(".veil.toml");
+        match fs::metadata(&candidate) {
+            Ok(_) => return Ok(Some(candidate)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(None)
+}
+
+fn absolute_lexical_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Path-bearing patterns in a project config are rooted at the directory
+/// containing that config. Bare names and basename globs retain their
+/// repository-wide matching behavior.
+fn resolve_project_patterns(config: &mut PartialConfig, project_dir: &Path, home: Option<&Path>) {
+    if let Some(sensitivity) = &mut config.sensitivity
+        && let Some(patterns) = &mut sensitivity.protected
+    {
+        for pattern in patterns {
+            *pattern = resolve_project_pattern(pattern, project_dir, home);
+        }
+    }
+
+    if let Some(allowlist) = &mut config.allowlist
+        && let Some(patterns) = &mut allowlist.safe_patterns
+    {
+        for pattern in patterns {
+            *pattern = resolve_project_pattern(pattern, project_dir, home);
+        }
+    }
+}
+
+fn resolve_project_pattern(pattern: &str, project_dir: &Path, home: Option<&Path>) -> String {
+    let expanded = expand_tilde(Path::new(pattern), home, None);
+    let path = expanded.as_path();
+    if !path.is_absolute() && path.components().count() <= 1 {
+        return pattern.to_owned();
+    }
+
+    let rooted = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_dir.join(path)
+    };
+    normalize_absolute_pattern(&rooted)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn normalize_absolute_pattern(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 impl Config {
