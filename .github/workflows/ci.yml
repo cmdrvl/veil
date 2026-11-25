@@ -74,6 +74,24 @@ jobs:
       - name: Prove Seatbelt read and hardlink restrictions
         run: cargo test --locked --test sandbox
 
+  linux-landlock-sandbox:
+    name: linux-landlock-sandbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prove compiled Landlock read restrictions on the kernel
+        run: cargo test --locked --test sandbox landlock_applies_compiled_read_rules -- --nocapture
+
   # bd-sel. The hook is installed (`cargo install`, then `veil install` inside the
   # script), and every row of docs/bypass-matrix.json is sent to the command
   # `veil install` wrote, as a PreToolUse payload, on both platforms. The matrix

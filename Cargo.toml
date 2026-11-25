@@ -52,3 +52,6 @@ harness = false
 
 [dev-dependencies]
 spine-rules = { git = "https://github.com/cmdrvl/spine-rules" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+landlock = "=0.4.8"

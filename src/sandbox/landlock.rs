@@ -4,8 +4,9 @@
 //! broad parent and subtract one protected child, so this compiler omits an
 //! entire top-level hierarchy whenever a configured protected pattern could
 //! match anywhere beneath it. The result is safe but can make a normal
-//! workspace unreadable. This module compiles rules; applying them and proving
-//! kernel behavior requires a Linux runner and belongs to the sandbox launcher.
+//! workspace unreadable. This module compiles rules. A Linux integration test
+//! applies the compiled paths to a real kernel ruleset and verifies an allowed
+//! and excluded read. Hook-time application remains launcher work.
 
 use std::collections::BTreeSet;
 use std::fs;
