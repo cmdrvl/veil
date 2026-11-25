@@ -33,6 +33,32 @@ fn veil_command(home: &Path) -> Command {
     command.env_remove("VEIL_AUDIT_LOG");
     command.env_remove("VEIL_AUDIT_PATH");
     command.env_remove("VEIL_CLAUDE_SETTINGS_PATH");
+    // Deterministic harness regardless of where the suite runs (agent, CI, shell).
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_THREAD_ID",
+        "CODEX_CI",
+        "GEMINI_CLI",
+        "CURSOR_AGENT",
+        "CURSOR_TRACE_ID",
+    ] {
+        command.env_remove(marker);
+    }
+    command.env("VEIL_HARNESS", "claude-code");
+    command
+}
+
+/// A veil command under `harness` whose PATH contains only `path_dirs`, so
+/// `dcg` is discoverable only when the test put it there.
+fn veil_command_for(home: &Path, harness: &str, path_dirs: &[&Path]) -> Command {
+    let mut command = veil_command(home);
+    command.env("VEIL_HARNESS", harness);
+    command.env(
+        "PATH",
+        env::join_paths(path_dirs).expect("test PATH should join"),
+    );
     command
 }
 
@@ -251,9 +277,136 @@ fn domain_commands_fail_closed_without_guard_hooks() {
         "stderr should report the failed guard preflight, got: {stderr}"
     );
     assert!(
-        stderr.contains("dcg") && stderr.contains("veil"),
-        "stderr should name both required guards, got: {stderr}"
+        stderr.contains("veil Read/Grep/Bash hooks"),
+        "stderr should name the missing veil hooks, got: {stderr}"
     );
+    assert!(
+        !stderr.contains("require_dcg` but"),
+        "dcg must not be a blocker unless require_dcg is set, got: {stderr}"
+    );
+}
+
+#[test]
+fn claude_code_with_healthy_veil_hooks_does_not_need_dcg() {
+    let home = unique_home("preflight-no-dcg");
+    install_healthy_guard_hooks(&home);
+    let empty_bin = home.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin dir should be creatable");
+    // Rewrite settings so no dcg Bash hook exists at all.
+    let veil = env!("CARGO_BIN_EXE_veil");
+    fs::write(
+        home.join(".claude/settings.json"),
+        format!(
+            r#"{{"hooks":{{"PreToolUse":[
+              {{"matcher":"Read","hooks":[{{"type":"command","command":"{veil}"}}]}},
+              {{"matcher":"Grep","hooks":[{{"type":"command","command":"{veil}"}}]}},
+              {{"matcher":"Bash","hooks":[{{"type":"command","command":"{veil}"}}]}}
+            ]}}}}"#
+        ),
+    )
+    .expect("settings should be writable");
+
+    let output = veil_command_for(&home, "claude-code", &[&empty_bin])
+        .args(["packs", "--json"])
+        .output()
+        .expect("domain command should run");
+
+    assert!(
+        output.status.success(),
+        "veil hooks alone must satisfy preflight; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn non_claude_harnesses_pass_preflight_without_claude_hooks_or_dcg() {
+    for harness in ["codex", "gemini-cli", "cursor", "plain"] {
+        let home = unique_home(&format!("preflight-{harness}"));
+        let empty_bin = home.join("empty-bin");
+        fs::create_dir_all(&empty_bin).expect("empty bin dir should be creatable");
+
+        let output = veil_command_for(&home, harness, &[&empty_bin])
+            .args(["packs", "--json"])
+            .output()
+            .expect("domain command should run");
+
+        assert!(
+            output.status.success(),
+            "{harness}: preflight must not require Claude hooks or dcg; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !home.join(".claude/settings.json").exists(),
+            "{harness}: must not touch Claude settings"
+        );
+    }
+}
+
+#[test]
+fn require_dcg_is_enforced_for_non_claude_harnesses_via_path() {
+    let home = unique_home("preflight-require-dcg");
+    let empty_bin = home.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin dir should be creatable");
+    let config_dir = home.join(".cmdrvl/config/veil");
+    fs::create_dir_all(&config_dir).expect("config dir should be creatable");
+    fs::write(
+        config_dir.join("config.toml"),
+        "[policy]\nrequire_dcg = true\n",
+    )
+    .expect("config should be writable");
+
+    let refused = veil_command_for(&home, "codex", &[&empty_bin])
+        .args(["packs", "--json"])
+        .output()
+        .expect("domain command should run");
+    assert!(
+        !refused.status.success(),
+        "require_dcg without dcg must refuse"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("dcg is required by `[policy] require_dcg` but is missing"),
+        "stderr should explain the dcg requirement, got: {stderr}"
+    );
+
+    let dcg_bin = home.join("dcg-bin");
+    create_executable(&dcg_bin.join("dcg"));
+    let allowed = veil_command_for(&home, "codex", &[&dcg_bin])
+        .args(["packs", "--json"])
+        .output()
+        .expect("domain command should run");
+    assert!(
+        allowed.status.success(),
+        "require_dcg with dcg on PATH must pass; stderr: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+}
+
+#[test]
+fn doctor_json_reports_guard_posture_for_agents() {
+    let home = unique_home("posture-json");
+    let empty_bin = home.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin dir should be creatable");
+
+    for (subcommand_args, label) in [
+        (vec!["doctor", "health", "--json"], "doctor health"),
+        (vec!["doctor", "--robot-triage"], "doctor --robot-triage"),
+        (vec!["--robot-triage"], "--robot-triage"),
+    ] {
+        let output = veil_command_for(&home, "codex", &[&empty_bin])
+            .args(&subcommand_args)
+            .output()
+            .expect("doctor should run");
+        assert!(output.status.success(), "{label} should exit zero");
+        let value: Value =
+            serde_json::from_slice(&output.stdout).expect("doctor JSON should parse");
+        let posture = &value["guard_posture"];
+        assert_eq!(posture["harness"], "codex", "{label}");
+        assert_eq!(posture["veil_hooks"]["status"], "unverified", "{label}");
+        assert_eq!(posture["dcg"]["required"], false, "{label}");
+        assert_eq!(posture["dcg"]["status"], "missing", "{label}");
+        assert_eq!(posture["preflight_ok"], true, "{label}");
+    }
 }
 
 #[test]

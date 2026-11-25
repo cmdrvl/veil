@@ -46,6 +46,7 @@ struct DoctorCheck {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DoctorReport {
     checks: Vec<DoctorCheck>,
+    guard_posture: Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,6 +190,8 @@ fn render_doctor_health_for_repo(
             Ok(path) => SettingsPathStatus::Resolved(path),
             Err(error) => SettingsPathStatus::Error(error.to_string()),
         },
+        hooks::detect_harness(|name| env::var(name).ok()),
+        env::var_os("PATH").as_deref(),
     );
 
     if json_output {
@@ -219,9 +222,12 @@ fn render_doctor_robot_triage_for_repo(
             Ok(path) => SettingsPathStatus::Resolved(path),
             Err(error) => SettingsPathStatus::Error(error.to_string()),
         },
+        hooks::detect_harness(|name| env::var(name).ok()),
+        env::var_os("PATH").as_deref(),
     );
 
     Ok(serde_json::to_string_pretty(&json!({
+        "guard_posture": report.guard_posture,
         "schema_version": DOCTOR_TRIAGE_SCHEMA_VERSION,
         "tool": "veil",
         "version": env!("CARGO_PKG_VERSION"),
@@ -671,11 +677,18 @@ fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
     value.get(field)?.as_str()
 }
 
-fn build_doctor_report(repo_root: &Path, settings_status: SettingsPathStatus) -> DoctorReport {
+fn build_doctor_report(
+    repo_root: &Path,
+    settings_status: SettingsPathStatus,
+    harness: hooks::Harness,
+    search_path: Option<&std::ffi::OsStr>,
+) -> DoctorReport {
     let mut checks = Vec::new();
+    let mut require_dcg = false;
 
     match config::load_config(repo_root) {
         Ok(config) => {
+            require_dcg = config.policy.require_dcg;
             checks.push(DoctorCheck {
                 name: "config",
                 status: DoctorStatus::Ok,
@@ -703,49 +716,74 @@ fn build_doctor_report(repo_root: &Path, settings_status: SettingsPathStatus) ->
         }),
     }
 
-    match settings_status {
-        SettingsPathStatus::Resolved(path) => match hooks::inspect_guard_preflight(&path) {
-            Ok(inspection) if inspection.is_healthy() => checks.push(DoctorCheck {
-                name: "hooks",
-                status: DoctorStatus::Ok,
-                detail: healthy_guard_hook_detail(&path, &inspection),
-                remediation: None,
-            }),
-            Ok(inspection) => checks.push(DoctorCheck {
-                name: "hooks",
-                status: DoctorStatus::ActionNeeded,
-                detail: actionable_guard_hook_detail(&path, &inspection),
-                remediation: Some(actionable_guard_hook_remediation(&inspection)),
-            }),
-            Err(error) => checks.push(DoctorCheck {
-                name: "hooks",
-                status: DoctorStatus::ActionNeeded,
-                detail: format!(
-                    "failed to inspect Claude settings at {}: {error}",
-                    path.display()
-                ),
-                remediation: Some("repair the settings file or rerun `veil install`".to_owned()),
-            }),
-        },
-        SettingsPathStatus::Error(message) => checks.push(DoctorCheck {
-            name: "hooks",
-            status: DoctorStatus::ActionNeeded,
-            detail: format!("could not resolve Claude settings path: {message}"),
-            remediation: Some(
-                "set `VEIL_CLAUDE_SETTINGS_PATH` or `HOME`, then rerun `veil doctor`".to_owned(),
-            ),
-        }),
-    }
+    let settings_path = match settings_status {
+        SettingsPathStatus::Resolved(path) => Ok(path),
+        SettingsPathStatus::Error(message) => Err(message),
+    };
+    let posture = hooks::inspect_guard_posture(harness, require_dcg, settings_path, search_path);
+    checks.push(hooks_doctor_check(&posture));
 
-    DoctorReport { checks }
+    DoctorReport {
+        checks,
+        guard_posture: posture.to_json_value(),
+    }
 }
 
-fn healthy_guard_hook_detail(path: &Path, inspection: &hooks::GuardPreflightInspection) -> String {
-    format!(
-        "{}; {}",
-        healthy_hook_detail(path, &inspection.veil),
-        dcg_hook_detail(&inspection.dcg)
-    )
+fn hooks_doctor_check(posture: &hooks::GuardPosture) -> DoctorCheck {
+    if posture.is_healthy() {
+        let scope = match (&posture.veil, &posture.settings_path) {
+            (Some(veil), Some(path)) => healthy_hook_detail(path, veil),
+            _ => format!(
+                "harness {}: veil hook configuration is not inspectable from here (unverified); no Claude hooks required",
+                posture.harness.name()
+            ),
+        };
+        let dcg = if posture.dcg.is_healthy() {
+            dcg_hook_detail(&posture.dcg)
+        } else {
+            format!(
+                "dcg not detected (optional; set `[policy] require_dcg = true` to require it): {}",
+                dcg_hook_detail(&posture.dcg)
+            )
+        };
+        return DoctorCheck {
+            name: "hooks",
+            status: DoctorStatus::Ok,
+            detail: format!("{scope}; {dcg}"),
+            remediation: None,
+        };
+    }
+
+    let mut details = Vec::new();
+    let mut remediations = Vec::new();
+    if posture.harness == hooks::Harness::ClaudeCode {
+        if let Some(error) = &posture.settings_error {
+            details.push(error.clone());
+            remediations.push(
+                "set `VEIL_CLAUDE_SETTINGS_PATH` or `HOME`, repair the settings file, or rerun `veil install`"
+                    .to_owned(),
+            );
+        } else if let (Some(veil), Some(path)) = (&posture.veil, &posture.settings_path)
+            && !veil.is_healthy()
+        {
+            details.push(actionable_hook_detail(path, veil));
+            remediations.push(actionable_hook_remediation(veil));
+        }
+    }
+    if posture.require_dcg && !posture.dcg.is_healthy() {
+        details.push(dcg_hook_detail(&posture.dcg));
+        remediations.push(
+            "install dcg, or set `[policy] require_dcg = false`, then rerun `veil doctor`"
+                .to_owned(),
+        );
+    }
+
+    DoctorCheck {
+        name: "hooks",
+        status: DoctorStatus::ActionNeeded,
+        detail: details.join("; "),
+        remediation: Some(remediations.join("; ")),
+    }
 }
 
 fn audit_check_detail(path: &Path) -> String {
@@ -781,35 +819,6 @@ fn healthy_hook_detail(path: &Path, inspection: &hooks::ManagedHooksInspection) 
             "managed Read/Grep/Bash hooks are installed in {} and all configured commands resolve to executables",
             path.display()
         )
-    }
-}
-
-fn actionable_guard_hook_detail(
-    path: &Path,
-    inspection: &hooks::GuardPreflightInspection,
-) -> String {
-    let mut details = Vec::new();
-
-    if !inspection.veil.is_healthy() {
-        details.push(actionable_hook_detail(path, &inspection.veil));
-    }
-
-    if !inspection.dcg.is_healthy() {
-        details.push(dcg_hook_detail(&inspection.dcg));
-    }
-
-    details.join("; ")
-}
-
-fn actionable_guard_hook_remediation(inspection: &hooks::GuardPreflightInspection) -> String {
-    let veil_unhealthy = !inspection.veil.is_healthy();
-    let dcg_unhealthy = !inspection.dcg.is_healthy();
-
-    match (veil_unhealthy, dcg_unhealthy) {
-        (true, true) => "run `veil install` to restore veil PreToolUse entries, then install or repair the dcg Bash PreToolUse hook".to_owned(),
-        (true, false) => actionable_hook_remediation(&inspection.veil),
-        (false, true) => "install or repair the dcg Bash PreToolUse hook, then rerun `veil doctor`".to_owned(),
-        (false, false) => "rerun `veil doctor` after reinstalling the hooks".to_owned(),
     }
 }
 
@@ -979,7 +988,9 @@ fn render_robot_docs_guide() -> String {
         "- Do not run bare `veil` as a discovery command; use `veil --help` or the robot surfaces above.",
         "",
         "Guard preflight:",
-        "- Domain commands fail closed unless healthy veil Read/Grep/Bash hooks and a dcg Bash hook are installed.",
+        "- Under Claude Code, domain commands fail closed unless healthy veil Read/Grep/Bash hooks are installed. Other harnesses (Codex, Gemini CLI, Cursor, plain shell) do not need Claude hooks; their veil wiring is reported as unverified.",
+        "- dcg is optional: set `[policy] require_dcg = true` to make a healthy dcg a hard requirement.",
+        "- `veil doctor health --json` and `veil --robot-triage` report the detected harness and `guard_posture`. Set `VEIL_HARNESS` (claude-code, codex, gemini-cli, cursor, plain) to override detection.",
         "- `veil doctor`, `veil --robot-triage`, `veil capabilities --json`, `veil robot-docs guide`, `veil install`, and `veil uninstall` remain available for maintenance.",
         "",
         "Composition:",
@@ -1412,6 +1423,7 @@ impl DoctorReport {
             "summary": self.summary_json_value(),
             "checks": self.checks_json_value(),
             "recommended_actions": self.recommended_actions_json_value(),
+            "guard_posture": self.guard_posture,
             "fixers": [],
         })
     }
@@ -1990,6 +2002,8 @@ mod tests {
         let rendered = render_doctor_human(&build_doctor_report(
             &repo_root,
             SettingsPathStatus::Resolved(settings_path),
+            hooks::Harness::ClaudeCode,
+            None,
         ));
 
         assert!(rendered.contains("Doctor"));
@@ -2031,8 +2045,13 @@ mod tests {
             ),
         );
 
-        let value = build_doctor_report(&repo_root, SettingsPathStatus::Resolved(settings_path))
-            .to_json_value();
+        let value = build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(settings_path),
+            hooks::Harness::ClaudeCode,
+            None,
+        )
+        .to_json_value();
 
         assert_eq!(value["schema_version"], DOCTOR_HEALTH_SCHEMA_VERSION);
         assert_eq!(value["contract"], READ_ONLY_DOCTOR_CONTRACT);
@@ -2068,6 +2087,8 @@ mod tests {
         let rendered = render_doctor_human(&build_doctor_report(
             &repo_root,
             SettingsPathStatus::Resolved(settings_path),
+            hooks::Harness::ClaudeCode,
+            None,
         ));
 
         assert!(rendered.contains("hooks [action_needed]"));
@@ -2098,7 +2119,12 @@ mod tests {
     fn doctor_robot_triage_json_includes_recommendations_for_missing_hooks() {
         let repo_root = unique_temp_dir("doctor-robot-triage");
         let settings_path = repo_root.join("claude/settings.json");
-        let report = build_doctor_report(&repo_root, SettingsPathStatus::Resolved(settings_path));
+        let report = build_doctor_report(
+            &repo_root,
+            SettingsPathStatus::Resolved(settings_path),
+            hooks::Harness::ClaudeCode,
+            None,
+        );
         let value = json!({
             "schema_version": DOCTOR_TRIAGE_SCHEMA_VERSION,
             "tool": "veil",

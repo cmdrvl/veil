@@ -95,19 +95,19 @@ fn command_requires_guard_preflight(command: &cli::OperatorCommand) -> bool {
 }
 
 fn enforce_guard_preflight() -> Result<(), Box<dyn std::error::Error>> {
-    let settings_path = hooks::default_settings_path().map_err(|error| {
-        format!("guard preflight failed: could not resolve active hook settings path: {error}")
-    })?;
-    let inspection = hooks::inspect_guard_preflight(&settings_path).map_err(|error| {
-        format!(
-            "guard preflight failed: could not inspect hook settings at {}: {error}",
-            settings_path.display()
-        )
-    })?;
+    let repo_root = std::env::current_dir()?;
+    let config = veil::config::load_config(&repo_root)
+        .map_err(|error| format!("guard preflight failed: could not load config: {error}"))?;
+    let posture = hooks::inspect_guard_posture(
+        hooks::detect_harness(|name| std::env::var(name).ok()),
+        config.policy.require_dcg,
+        hooks::default_settings_path().map_err(|error| error.to_string()),
+        std::env::var_os("PATH").as_deref(),
+    );
 
-    if inspection.is_healthy() {
+    if posture.is_healthy() {
         Ok(())
     } else {
-        Err(hooks::guard_preflight_refusal(&settings_path, &inspection).into())
+        Err(posture.refusal().into())
     }
 }

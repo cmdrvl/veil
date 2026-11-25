@@ -112,6 +112,10 @@ authorized_tools = [
     "verify", "assess", "benchmark", "airlock",
 ]
 
+[policy]
+# Require a healthy dcg companion guard for operator commands (default: false)
+require_dcg = false
+
 [allowlist]
 # Files always safe to read
 safe_patterns = [
@@ -225,10 +229,21 @@ File access attempt (Read/Grep/Bash)
 - Unknown file outside `[sensitivity] protected` directories is allowed.
 - Unknown file inside a protected directory is treated as sensitive and resolved through `[policy] default`.
 - Classified-sensitive file anywhere is resolved through pack-specific rules or `[policy] default`, with direct reads denied by default.
-- Operator/domain commands fail closed unless the active Claude `PreToolUse`
-  settings contain healthy `veil` Read/Grep/Bash hooks and a healthy `dcg` Bash
-  hook. `veil doctor`, `veil install`, and `veil uninstall` remain available as
-  guard-maintenance commands when the preflight is failing.
+- Operator/domain commands run a harness-aware guard preflight:
+  - Under **Claude Code**, they fail closed unless the active Claude `PreToolUse`
+    settings contain healthy `veil` Read/Grep/Bash hooks.
+  - Under **Codex, Gemini CLI, Cursor, or a plain shell/CI sandbox**, Claude
+    settings are not consulted; veil reports its hook wiring as `unverified`
+    rather than blocking.
+  - `dcg` is optional. Set `[policy] require_dcg = true` to require it (a
+    Bash PreToolUse hook under Claude Code, an executable on `PATH` elsewhere).
+  - The harness is detected from its environment markers; set `VEIL_HARNESS`
+    (`claude-code`, `codex`, `gemini-cli`, `cursor`, `plain`) to override.
+  - `veil doctor health --json` and `veil --robot-triage` include a
+    `guard_posture` object showing the harness, veil-hook and dcg status, and
+    any blockers.
+  - `veil doctor`, `veil install`, and `veil uninstall` remain available as
+    guard-maintenance commands when the preflight is failing.
 
 ---
 

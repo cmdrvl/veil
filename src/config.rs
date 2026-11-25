@@ -72,6 +72,8 @@ pub struct PolicyConfig {
     pub default: PolicyMode,
     pub audit_log: bool,
     pub audit_path: PathBuf,
+    /// Opt-in: operator preflight additionally requires a healthy dcg companion guard.
+    pub require_dcg: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -176,6 +178,7 @@ impl Config {
                 default: PolicyMode::Deny,
                 audit_log: true,
                 audit_path: default_audit_path(home, xdg_state_home)?,
+                require_dcg: false,
             },
         })
     }
@@ -211,6 +214,10 @@ impl Config {
 
             if let Some(audit_path) = policy.audit_path {
                 self.policy.audit_path = audit_path;
+            }
+
+            if let Some(require_dcg) = policy.require_dcg {
+                self.policy.require_dcg = require_dcg;
             }
         }
     }
@@ -290,6 +297,7 @@ impl PartialConfig {
                     default: default_mode,
                     audit_log,
                     audit_path,
+                    require_dcg: None,
                 })
             } else {
                 None
@@ -323,6 +331,7 @@ struct PartialPolicyConfig {
     default: Option<PolicyMode>,
     audit_log: Option<bool>,
     audit_path: Option<PathBuf>,
+    require_dcg: Option<bool>,
 }
 
 fn load_optional_config(
@@ -1039,6 +1048,7 @@ mod tests {
                 default: Some(PolicyMode::Warn),
                 audit_log: Some(false),
                 audit_path: None,
+                require_dcg: None,
             }),
         };
 
@@ -1086,6 +1096,7 @@ mod tests {
                 default: Some(PolicyMode::Warn),
                 audit_log: Some(false),
                 audit_path: Some(home.join("custom/audit.jsonl")),
+                require_dcg: None,
             }),
         };
 
@@ -1239,6 +1250,34 @@ mod tests {
             config.sensitivity.protected,
             expected_with_cmdrvl_profile(&home, &["env-only/**"])
         );
+    }
+
+    #[test]
+    fn require_dcg_defaults_off_and_can_be_enabled_in_config() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let defaults = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            None,
+            None,
+            PartialConfig::default(),
+        )
+        .unwrap();
+        assert!(!defaults.policy.require_dcg);
+
+        let strict = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            None,
+            Some("[policy]\nrequire_dcg = true\n"),
+            PartialConfig::default(),
+        )
+        .unwrap();
+        assert!(strict.policy.require_dcg);
     }
 
     #[test]

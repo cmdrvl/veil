@@ -317,6 +317,7 @@ mod tests {
                 default: PolicyMode::Deny,
                 audit_log: true,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
+                require_dcg: false,
             },
         }
     }
@@ -496,6 +497,7 @@ mod tests {
                 default: PolicyMode::Deny,
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
+                require_dcg: false,
             },
         };
 
@@ -538,6 +540,7 @@ mod tests {
                 default: PolicyMode::Deny,
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
+                require_dcg: false,
             },
         };
 
@@ -579,6 +582,7 @@ mod tests {
                 default: PolicyMode::Deny,
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
+                require_dcg: false,
             },
         };
 
@@ -607,6 +611,7 @@ mod tests {
                 default: PolicyMode::Deny,
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
+                require_dcg: false,
             },
         };
 
@@ -678,6 +683,7 @@ mod tests {
                 default: PolicyMode::Deny,
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
+                require_dcg: false,
             },
         };
 
@@ -745,6 +751,7 @@ mod tests {
                 default: PolicyMode::Deny,
                 audit_log: false,
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
+                require_dcg: false,
             },
         };
 

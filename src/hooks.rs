@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 const MANAGED_MATCHERS: &[&str] = &["Read", "Grep", "Bash"];
 const LEGACY_VEIL_COMMAND: &str = "$HOME/.local/bin/veil";
 const SETTINGS_OVERRIDE_ENV: &str = "VEIL_CLAUDE_SETTINGS_PATH";
+const HARNESS_OVERRIDE_ENV: &str = "VEIL_HARNESS";
 const DCG_COMMAND_STEMS: &[&str] = &[
     "dcg",
     "destructive_command_guard",
@@ -86,34 +87,245 @@ pub(crate) fn inspect_guard_preflight(path: &Path) -> io::Result<GuardPreflightI
     })
 }
 
-pub(crate) fn guard_preflight_refusal(
-    path: &Path,
-    inspection: &GuardPreflightInspection,
-) -> String {
-    let mut findings = Vec::new();
+/// The agent harness veil is running under. Only `ClaudeCode` has hook
+/// configuration veil can inspect (`~/.claude/settings.json`); for the others
+/// veil reports the guard posture as unverified rather than failing closed on
+/// a file format that harness does not use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Harness {
+    ClaudeCode,
+    Codex,
+    GeminiCli,
+    Cursor,
+    Plain,
+}
 
-    if !inspection.veil.is_healthy() {
-        findings.push("veil Read/Grep/Bash hooks are missing or invalid".to_owned());
+impl Harness {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Harness::ClaudeCode => "claude-code",
+            Harness::Codex => "codex",
+            Harness::GeminiCli => "gemini-cli",
+            Harness::Cursor => "cursor",
+            Harness::Plain => "plain",
+        }
     }
 
-    match &inspection.dcg.status {
-        ManagedHookStatus::Installed { .. } => {}
-        ManagedHookStatus::Missing => findings.push("dcg Bash hook is missing".to_owned()),
-        ManagedHookStatus::Invalid { command, reason } => findings.push(format!(
-            "dcg Bash hook command `{command}` is invalid: {reason}"
-        )),
+    fn from_override(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "claude" | "claude-code" => Some(Harness::ClaudeCode),
+            "codex" => Some(Harness::Codex),
+            "gemini" | "gemini-cli" => Some(Harness::GeminiCli),
+            "cursor" => Some(Harness::Cursor),
+            "plain" | "none" | "shell" | "ci" => Some(Harness::Plain),
+            _ => None,
+        }
+    }
+}
+
+/// Detects the active harness. `VEIL_HARNESS` is authoritative; otherwise the
+/// harness's own environment markers are used, falling back to `Plain`.
+pub(crate) fn detect_harness(var: impl Fn(&str) -> Option<String>) -> Harness {
+    if let Some(harness) =
+        var(HARNESS_OVERRIDE_ENV).and_then(|value| Harness::from_override(&value))
+    {
+        return harness;
     }
 
-    let findings = if findings.is_empty() {
-        "unknown guard-hook failure".to_owned()
+    let set = |name: &str| var(name).is_some_and(|value| !value.is_empty());
+    if set("CLAUDECODE") || set("CLAUDE_CODE_ENTRYPOINT") {
+        Harness::ClaudeCode
+    } else if set("CODEX_SANDBOX") || set("CODEX_THREAD_ID") || set("CODEX_CI") {
+        Harness::Codex
+    } else if set("GEMINI_CLI") {
+        Harness::GeminiCli
+    } else if set("CURSOR_AGENT") || set("CURSOR_TRACE_ID") {
+        Harness::Cursor
     } else {
-        findings.join("; ")
-    };
+        Harness::Plain
+    }
+}
 
-    format!(
-        "guard preflight failed: {findings}. Refusing to run domain work until both dcg and veil hooks are installed and healthy. Run `veil doctor` for details; run `veil install` to repair veil hooks and install or repair dcg. Settings: {}",
-        path.display()
-    )
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardPosture {
+    pub harness: Harness,
+    pub require_dcg: bool,
+    /// `Some` only when the harness is Claude Code and its settings were readable.
+    pub veil: Option<ManagedHooksInspection>,
+    pub dcg: DcgHookInspection,
+    pub settings_path: Option<PathBuf>,
+    pub settings_error: Option<String>,
+}
+
+/// Inspects what guard enforcement is genuinely active for `harness`.
+///
+/// * Claude Code: veil Read/Grep/Bash hooks in Claude settings are required.
+/// * Other harnesses / plain shell: Claude settings are not consulted.
+/// * dcg is required only when `require_dcg` is set. Under Claude Code it is
+///   looked up as a Bash PreToolUse hook; elsewhere as an executable on PATH.
+pub(crate) fn inspect_guard_posture(
+    harness: Harness,
+    require_dcg: bool,
+    settings_path: Result<PathBuf, String>,
+    search_path: Option<&std::ffi::OsStr>,
+) -> GuardPosture {
+    if harness != Harness::ClaudeCode {
+        return GuardPosture {
+            harness,
+            require_dcg,
+            veil: None,
+            dcg: DcgHookInspection {
+                status: dcg_status_from_path(search_path),
+            },
+            settings_path: None,
+            settings_error: None,
+        };
+    }
+
+    let missing_dcg = DcgHookInspection {
+        status: ManagedHookStatus::Missing,
+    };
+    match settings_path {
+        Err(error) => GuardPosture {
+            harness,
+            require_dcg,
+            veil: None,
+            dcg: missing_dcg,
+            settings_path: None,
+            settings_error: Some(format!(
+                "could not resolve active hook settings path: {error}"
+            )),
+        },
+        Ok(path) => match inspect_guard_preflight(&path) {
+            Ok(inspection) => GuardPosture {
+                harness,
+                require_dcg,
+                veil: Some(inspection.veil),
+                dcg: inspection.dcg,
+                settings_path: Some(path),
+                settings_error: None,
+            },
+            Err(error) => GuardPosture {
+                harness,
+                require_dcg,
+                veil: None,
+                dcg: missing_dcg,
+                settings_error: Some(format!(
+                    "could not inspect hook settings at {}: {error}",
+                    path.display()
+                )),
+                settings_path: Some(path),
+            },
+        },
+    }
+}
+
+fn dcg_status_from_path(search_path: Option<&std::ffi::OsStr>) -> ManagedHookStatus {
+    for stem in DCG_COMMAND_STEMS {
+        if let Some(candidate) = find_in_search_path(stem, search_path)
+            && let Ok(metadata) = fs::metadata(&candidate)
+            && metadata.is_file()
+            && is_executable(&metadata)
+        {
+            return ManagedHookStatus::Installed {
+                command: (*stem).to_owned(),
+                executable: fs::canonicalize(&candidate).unwrap_or(candidate),
+            };
+        }
+    }
+    ManagedHookStatus::Missing
+}
+
+impl GuardPosture {
+    /// Reasons operator commands must refuse. Empty means preflight passes.
+    pub(crate) fn blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+
+        if self.harness == Harness::ClaudeCode {
+            match (&self.settings_error, &self.veil) {
+                (Some(error), _) => blockers.push(error.clone()),
+                (None, Some(veil)) if !veil.is_healthy() => {
+                    blockers.push("veil Read/Grep/Bash hooks are missing or invalid".to_owned());
+                }
+                _ => {}
+            }
+        }
+
+        if self.require_dcg {
+            match &self.dcg.status {
+                ManagedHookStatus::Installed { .. } => {}
+                ManagedHookStatus::Missing => blockers
+                    .push("dcg is required by `[policy] require_dcg` but is missing".to_owned()),
+                ManagedHookStatus::Invalid { command, reason } => blockers.push(format!(
+                    "dcg is required by `[policy] require_dcg` but `{command}` is invalid: {reason}"
+                )),
+            }
+        }
+
+        blockers
+    }
+
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.blockers().is_empty()
+    }
+
+    pub(crate) fn refusal(&self) -> String {
+        let settings = self
+            .settings_path
+            .as_ref()
+            .map(|path| format!(" Settings: {}", path.display()))
+            .unwrap_or_default();
+        format!(
+            "guard preflight failed ({}): {}. Refusing to run domain work. Run `veil doctor` for details; run `veil install` to repair veil hooks, or set `[policy] require_dcg = false` if dcg is not wanted.{settings}",
+            self.harness.name(),
+            self.blockers().join("; ")
+        )
+    }
+
+    pub(crate) fn to_json_value(&self) -> Value {
+        let (veil_status, veil_detail) = match (self.harness, &self.veil, &self.settings_error) {
+            (Harness::ClaudeCode, _, Some(error)) => ("unverified", error.clone()),
+            (Harness::ClaudeCode, Some(veil), None) if veil.is_healthy() => (
+                "healthy",
+                "veil Read/Grep/Bash PreToolUse hooks are installed in Claude settings".to_owned(),
+            ),
+            (Harness::ClaudeCode, _, None) => (
+                "unhealthy",
+                "veil Read/Grep/Bash PreToolUse hooks are missing or invalid in Claude settings"
+                    .to_owned(),
+            ),
+            (harness, _, _) => (
+                "unverified",
+                format!(
+                    "veil cannot inspect {} hook configuration; wire `veil` as that harness's pre-tool hook",
+                    harness.name()
+                ),
+            ),
+        };
+        let (dcg_status, dcg_detail) = match &self.dcg.status {
+            ManagedHookStatus::Installed { executable, .. } => (
+                "installed",
+                format!("dcg resolves to {}", executable.display()),
+            ),
+            ManagedHookStatus::Missing => ("missing", "dcg not found".to_owned()),
+            ManagedHookStatus::Invalid { command, reason } => (
+                "invalid",
+                format!("dcg `{command}` does not resolve: {reason}"),
+            ),
+        };
+
+        json!({
+            "harness": self.harness.name(),
+            "veil_hooks": { "status": veil_status, "detail": veil_detail },
+            "dcg": {
+                "required": self.require_dcg,
+                "status": dcg_status,
+                "detail": dcg_detail,
+            },
+            "preflight_ok": self.is_healthy(),
+            "blockers": self.blockers(),
+        })
+    }
 }
 
 fn inspect_veil_entries(entries: &[Value]) -> ManagedHooksInspection {
@@ -174,6 +386,7 @@ impl DcgHookInspection {
     }
 }
 
+#[cfg(test)]
 impl GuardPreflightInspection {
     pub(crate) fn is_healthy(&self) -> bool {
         self.veil.is_healthy() && self.dcg.is_healthy()
@@ -490,8 +703,12 @@ fn references_path(program: &str) -> bool {
 }
 
 fn find_in_path(program: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
+    find_in_search_path(program, std::env::var_os("PATH").as_deref())
+}
+
+fn find_in_search_path(program: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    search_path.and_then(|path| {
+        std::env::split_paths(path)
             .map(|dir| dir.join(program))
             .find(|candidate| candidate.exists())
     })
@@ -863,7 +1080,12 @@ mod tests {
         assert!(inspection.veil.is_healthy());
         assert!(!inspection.is_healthy());
         assert!(matches!(inspection.dcg.status, ManagedHookStatus::Missing));
-        assert!(guard_preflight_refusal(&path, &inspection).contains("dcg Bash hook is missing"));
+        let posture = inspect_guard_posture(Harness::ClaudeCode, true, Ok(path.clone()), None);
+        assert!(
+            posture
+                .refusal()
+                .contains("dcg is required by `[policy] require_dcg` but is missing")
+        );
     }
 
     #[test]
@@ -992,5 +1214,167 @@ mod tests {
             "dcg hook under a combined Bash|PowerShell matcher should be recognized as installed"
         );
         assert!(inspection.is_healthy());
+    }
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn detects_each_harness_from_its_environment_markers() {
+        assert_eq!(detect_harness(env_of(&[])), Harness::Plain);
+        assert_eq!(
+            detect_harness(env_of(&[("CLAUDECODE", "1")])),
+            Harness::ClaudeCode
+        );
+        assert_eq!(
+            detect_harness(env_of(&[("CODEX_SANDBOX", "seatbelt")])),
+            Harness::Codex
+        );
+        assert_eq!(
+            detect_harness(env_of(&[("GEMINI_CLI", "1")])),
+            Harness::GeminiCli
+        );
+        assert_eq!(
+            detect_harness(env_of(&[("CURSOR_AGENT", "1")])),
+            Harness::Cursor
+        );
+        // Empty markers do not count, and VEIL_HARNESS wins over markers.
+        assert_eq!(
+            detect_harness(env_of(&[("CLAUDECODE", "")])),
+            Harness::Plain
+        );
+        assert_eq!(
+            detect_harness(env_of(&[("CLAUDECODE", "1"), ("VEIL_HARNESS", "plain")])),
+            Harness::Plain
+        );
+        // An unrecognized override falls back to marker detection.
+        assert_eq!(
+            detect_harness(env_of(&[("GEMINI_CLI", "1"), ("VEIL_HARNESS", "bogus")])),
+            Harness::GeminiCli
+        );
+    }
+
+    #[test]
+    fn non_claude_posture_ignores_claude_settings_and_missing_dcg() {
+        // Settings path is deliberately unresolvable: it must not matter.
+        let posture = inspect_guard_posture(
+            Harness::Codex,
+            false,
+            Err("HOME unset".to_owned()),
+            Some(OsStr::new("")),
+        );
+
+        assert!(posture.is_healthy());
+        assert!(posture.blockers().is_empty());
+        assert_eq!(
+            posture.to_json_value()["veil_hooks"]["status"],
+            "unverified"
+        );
+    }
+
+    #[test]
+    fn require_dcg_blocks_non_claude_harness_until_dcg_is_on_path() {
+        let dir = temp_executable_path("posture-require-dcg")
+            .parent()
+            .expect("temp dir has a parent")
+            .to_path_buf();
+        fs::create_dir_all(&dir).expect("temp dir should be creatable");
+
+        let missing = inspect_guard_posture(
+            Harness::Cursor,
+            true,
+            Err(String::new()),
+            Some(dir.as_os_str()),
+        );
+        assert!(!missing.is_healthy());
+        assert!(missing.refusal().contains("require_dcg"));
+
+        create_executable(&dir.join("dcg"));
+        let present = inspect_guard_posture(
+            Harness::Cursor,
+            true,
+            Err(String::new()),
+            Some(dir.as_os_str()),
+        );
+        assert!(present.is_healthy());
+        assert_eq!(present.to_json_value()["dcg"]["status"], "installed");
+    }
+
+    #[test]
+    fn non_executable_dcg_on_path_does_not_satisfy_require_dcg() {
+        let dir = temp_executable_path("posture-dcg-not-executable")
+            .parent()
+            .expect("temp dir has a parent")
+            .to_path_buf();
+        fs::create_dir_all(&dir).expect("temp dir should be creatable");
+        fs::write(dir.join("dcg"), "not executable").expect("fixture should be writable");
+
+        let posture = inspect_guard_posture(
+            Harness::Plain,
+            true,
+            Err(String::new()),
+            Some(dir.as_os_str()),
+        );
+
+        #[cfg(unix)]
+        assert!(!posture.is_healthy());
+        #[cfg(not(unix))]
+        let _ = posture;
+    }
+
+    #[test]
+    fn claude_code_still_requires_healthy_veil_hooks_without_require_dcg() {
+        let path = temp_settings_path("posture-claude-no-hooks");
+        write_settings(&path, &json!({})).expect("fixture settings should be writable");
+
+        let posture = inspect_guard_posture(Harness::ClaudeCode, false, Ok(path), None);
+
+        assert!(!posture.is_healthy());
+        assert_eq!(
+            posture.blockers(),
+            vec!["veil Read/Grep/Bash hooks are missing or invalid".to_owned()]
+        );
+
+        let unresolvable = inspect_guard_posture(
+            Harness::ClaudeCode,
+            false,
+            Err("HOME unset".to_owned()),
+            None,
+        );
+        assert!(!unresolvable.is_healthy());
+    }
+
+    #[test]
+    fn claude_code_with_healthy_veil_hooks_passes_without_dcg_unless_required() {
+        let path = temp_settings_path("posture-claude-veil-only");
+        let executable_path = temp_executable_path("posture-claude-veil-only");
+        create_executable(&executable_path);
+        let command = quote_test_command(&executable_path);
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [veil_hook(&command)] },
+                        { "matcher": "Grep", "hooks": [veil_hook(&command)] },
+                        { "matcher": "Bash", "hooks": [veil_hook(&command)] }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        let optional = inspect_guard_posture(Harness::ClaudeCode, false, Ok(path.clone()), None);
+        assert!(optional.is_healthy());
+
+        let required = inspect_guard_posture(Harness::ClaudeCode, true, Ok(path), None);
+        assert!(!required.is_healthy());
+        assert_eq!(required.blockers().len(), 1);
     }
 }
