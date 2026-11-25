@@ -135,9 +135,13 @@ pub fn evaluate_access_with(
     };
     let effective = canonical_input.as_ref().unwrap_or(input);
 
-    evaluate_with_matchers(effective, config, matchers, |directory_sensitive| {
-        Ok(registry.classify(&effective.path, directory_sensitive))
-    })
+    evaluate_with_matchers(
+        effective,
+        config,
+        matchers,
+        registry,
+        |directory_sensitive| Ok(registry.classify(&effective.path, directory_sensitive)),
+    )
 }
 
 /// Attempts to resolve the input path to a canonical, absolute path via
@@ -163,13 +167,21 @@ fn evaluate_access_with_classifier<F>(
 where
     F: FnOnce(bool) -> Result<Option<SensitivityResult>, EvaluationFailure>,
 {
-    evaluate_with_matchers(input, config, &PolicyMatchers::new(config), classify)
+    let registry = PackRegistry::with_built_ins();
+    evaluate_with_matchers(
+        input,
+        config,
+        &PolicyMatchers::new(config),
+        &registry,
+        classify,
+    )
 }
 
 fn evaluate_with_matchers<F>(
     input: &EvaluationInput,
     config: &Config,
     matchers: &PolicyMatchers,
+    registry: &PackRegistry,
     classify: F,
 ) -> Decision
 where
@@ -189,6 +201,7 @@ where
             input,
             config,
             &matchers.protected,
+            registry,
             DIRECTORY_SCOPE_MAX_ENTRIES,
         )
     {
@@ -382,54 +395,52 @@ fn directory_scope_decision(
     max_entries: usize,
 ) -> Option<Decision> {
     let matcher = SafePathMatcher::from_patterns(config.sensitivity.protected.iter());
-    directory_scope_with(input, config, &matcher, max_entries)
+    let registry = PackRegistry::with_built_ins();
+    directory_scope_with(input, config, &matcher, &registry, max_entries)
 }
 
 fn directory_scope_with(
     input: &EvaluationInput,
     config: &Config,
     matcher: &SafePathMatcher,
+    registry: &PackRegistry,
     max_entries: usize,
 ) -> Option<Decision> {
     if input.exposure != PathExposure::ReadsContents
         || !input.scan_directories
-        || config.sensitivity.protected.is_empty()
         || !input.path.is_dir()
     {
         return None;
     }
 
     let (reason, remediation) = match (
-        matcher.scan_directory(&input.path, max_entries),
+        matcher.scan_directory_with(&input.path, max_entries, |path| {
+            registry.classify(path, matcher.is_safe(path)).is_some()
+        }),
         input.argv_command.as_deref(),
     ) {
         (DirectoryScan::Clear, _) => return None,
         (DirectoryScan::Protected(_), None) => (
-            "a content search of this directory would read paths covered by \
-             [sensitivity] protected, and is blocked by policy default"
+            "a content search of this directory would read protected paths, and is blocked by \
+             policy default"
                 .to_owned(),
             DIRECTORY_SEARCH_REMEDIATION,
         ),
         (DirectoryScan::Protected(_), Some(command)) => (
-            argv_path_reason(
-                command,
-                "a directory that holds paths covered by [sensitivity] protected",
-            ),
+            argv_path_reason(command, "a directory that holds protected paths"),
             ARGV_PATH_REMEDIATION,
         ),
         (DirectoryScan::Unverified { max_entries }, None) => (
             format!(
                 "this directory holds more than {max_entries} entries, so veil cannot show that a \
-                 content search of it would not read paths covered by [sensitivity] protected; \
-                 blocked by policy default"
+                 content search of it would not read protected paths; blocked by policy default"
             ),
             DIRECTORY_SEARCH_REMEDIATION,
         ),
         (DirectoryScan::Unverified { max_entries }, Some(command)) => (
             format!(
                 "`{command}` names a directory that holds more than {max_entries} entries, so veil \
-                 cannot show that it holds nothing covered by [sensitivity] protected \
-                 (label: protected); blocked by policy default"
+                 cannot show that it holds no protected paths (label: protected); blocked by policy default"
             ),
             ARGV_PATH_REMEDIATION,
         ),
@@ -1329,8 +1340,8 @@ mod tests {
             decision
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("[sensitivity] protected")),
-            "reason should name the policy that blocks the search, got {:?}",
+                .is_some_and(|reason| reason.contains("protected paths")),
+            "reason should say that the directory search reaches protected paths, got {:?}",
             decision.reason
         );
         assert!(

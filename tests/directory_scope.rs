@@ -4,10 +4,9 @@
 //! `PreToolUse` payloads against real directories on disk.
 //!
 //! What they do not cover: searches the extractor does not recognise as
-//! searches (`git grep`), and built-in packs such as `.env` found beneath a
-//! searched directory. Those are separate gaps, named in the bd-1si comment.
-//! Searches after the first command of a line, inside `sh -c` and behind
-//! `find -exec` are covered since bd-2kr; see `tests/shell_decomposition.rs`.
+//! searches (`git grep`). Searches after the first command of a line, inside
+//! `sh -c` and behind `find -exec` are covered since bd-2kr; see
+//! `tests/shell_decomposition.rs`.
 
 use std::fs;
 use std::io::Write;
@@ -131,7 +130,11 @@ fn bash(repo: &Repo, command: &str) -> Verdict {
 }
 
 fn audit_records(repo: &Repo) -> Vec<Value> {
-    fs::read_to_string(&repo.audit)
+    audit_records_at(&repo.audit)
+}
+
+fn audit_records_at(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
         .map(|text| {
             text.lines()
                 .map(|line| serde_json::from_str(line).expect("audit line should parse"))
@@ -201,7 +204,7 @@ fn grep_denial_says_why_and_does_not_name_the_protected_file() {
     );
 
     let reason = verdict.reason.expect("a denial carries a reason");
-    assert!(reason.contains("[sensitivity] protected"), "{reason}");
+    assert!(reason.contains("protected paths"), "{reason}");
     assert!(
         verdict.stderr.contains("files_with_matches"),
         "the guidance should point at a metadata-only search: {}",
@@ -409,28 +412,35 @@ fn pack_only_repo(label: &str) -> (PathBuf, PathBuf) {
     ));
     fs::create_dir_all(base.join("repo/src")).expect("repo dir");
     fs::create_dir_all(base.join("home")).expect("home dir");
-    fs::write(base.join("repo/.env"), "API_SECRET=hunter2\n").expect("pack-only file");
+    fs::write(base.join("repo/.env"), "API_SECRET=dummy-value-not-real\n").expect("pack-only file");
     fs::write(base.join("repo/src/main.rs"), "fn main() {}\n").expect("source file");
 
     let base = fs::canonicalize(&base).expect("base should canonicalize");
     (base.join("repo"), base)
 }
 
-fn bash_pack_only(command: &str) -> Verdict {
+fn pack_only_hook(tool_name: &str, tool_input: Value) -> (Verdict, PathBuf) {
     let (repo, base) = pack_only_repo("search");
+    let audit = base.join("audit.jsonl");
     let payload = json!({
         "session_id": "dirscope-pack-only",
         "cwd": repo,
         "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": { "command": command },
+        "tool_name": tool_name,
+        "tool_input": tool_input,
     });
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
         .env("HOME", base.join("home"))
         .env("XDG_CONFIG_HOME", base.join("xdg-config"))
         .env("XDG_STATE_HOME", base.join("xdg-state"))
-        .env("VEIL_AUDIT_PATH", base.join("audit.jsonl"))
+        .env_remove("VEIL_PROTECTED")
+        .env_remove("VEIL_SAFE_PATTERNS")
+        .env_remove("VEIL_SPINE_TOOLS")
+        .env_remove("VEIL_POLICY")
+        .env_remove("VEIL_DYNAMIC_ARGS")
+        .env("VEIL_AUDIT_LOG", "true")
+        .env("VEIL_AUDIT_PATH", &audit)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -447,27 +457,34 @@ fn bash_pack_only(command: &str) -> Verdict {
         serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
     let specific = &decision["hookSpecificOutput"];
 
-    Verdict {
-        action: specific["permissionDecision"]
-            .as_str()
-            .expect("decision should carry permissionDecision")
-            .to_owned(),
-        reason: specific["permissionDecisionReason"]
-            .as_str()
-            .map(str::to_owned),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
+    (
+        Verdict {
+            action: specific["permissionDecision"]
+                .as_str()
+                .expect("decision should carry permissionDecision")
+                .to_owned(),
+            reason: specific["permissionDecisionReason"]
+                .as_str()
+                .map(str::to_owned),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+        audit,
+    )
 }
 
-/// bd-1si reopened: the directory walk only looks for paths covered by
-/// `[sensitivity] protected`, so a file that a built-in pack alone recognises
-/// is not found beneath a searched directory. Each of these commands reads
-/// `.env` and is allowed today. Run with `cargo test --test directory_scope --
-/// --ignored` to see the failure; remove the `ignore` when the walk consults
-/// the packs.
+fn bash_pack_only(command: &str) -> (Verdict, PathBuf) {
+    pack_only_hook("Bash", json!({ "command": command }))
+}
+
+fn grep_pack_only(input: Value) -> (Verdict, PathBuf) {
+    pack_only_hook("Grep", input)
+}
+
+/// A path protected by a built-in pack must also be protected when a
+/// content-search command names its containing directory. Metadata-only
+/// searches remain allowed and audited.
 #[test]
-#[ignore = "bd-1si reopened: directory walk ignores built-in packs (.env found only by name)"]
-fn a_recursive_search_finds_a_file_only_a_builtin_pack_protects() {
+fn recursive_searches_of_a_directory_with_pack_protected_files_are_denied() {
     let mut allowed = Vec::new();
 
     for command in [
@@ -476,19 +493,46 @@ fn a_recursive_search_finds_a_file_only_a_builtin_pack_protects() {
         "rg SECRET",
         r"find . -exec cat {} \;",
     ] {
-        let verdict = bash_pack_only(command);
+        let (verdict, audit) = bash_pack_only(command);
         if !verdict.denied() {
             allowed.push(command);
         }
+        let records = audit_records_at(&audit);
+        assert_eq!(records.len(), 1, "{command} is audited: {records:?}");
+        assert_eq!(records[0]["decision"], "deny", "{command}: {records:?}");
     }
 
-    // Naming the file is denied today, which is what makes the gap a gap.
+    // Naming the file directly and searching its containing directory must
+    // both be denied by the same built-in pack.
     assert!(
-        bash_pack_only("cat .env").denied(),
+        bash_pack_only("cat .env").0.denied(),
         "naming `.env` is expected to be denied by the pack"
     );
     assert!(
         allowed.is_empty(),
         "these commands read `.env` and must be denied: {allowed:?}"
     );
+
+    let (verdict, audit) = grep_pack_only(json!({
+        "pattern": "SECRET",
+        "path": ".",
+        "output_mode": "content"
+    }));
+    assert!(verdict.denied(), "Grep content search of . must be denied");
+    let records = audit_records_at(&audit);
+    assert_eq!(records.len(), 1, "Grep is audited: {records:?}");
+    assert_eq!(records[0]["tool"], "Grep");
+    assert_eq!(records[0]["decision"], "deny");
+
+    for command in ["grep -rl SECRET .", "grep -l SECRET .env", "rg --files ."] {
+        let (verdict, audit) = bash_pack_only(command);
+        assert!(
+            !verdict.denied(),
+            "`{command}` returns names only and must remain allowed"
+        );
+        let records = audit_records_at(&audit);
+        assert_eq!(records.len(), 1, "{command} is audited: {records:?}");
+        assert_eq!(records[0]["tool"], "Bash");
+        assert_eq!(records[0]["decision"], "allow");
+    }
 }

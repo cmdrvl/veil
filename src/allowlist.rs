@@ -105,6 +105,23 @@ impl SafePathMatcher {
             return DirectoryScan::Clear;
         }
 
+        self.scan_directory_with(directory, max_entries, |_| false)
+    }
+
+    /// Like [`Self::scan_directory`], also treating any path matched by
+    /// `is_sensitive` as protected. This lets callers add their file-level
+    /// sensitivity classifiers without changing the glob walk or its budget.
+    /// It still walks when no configured patterns exist, since the additional
+    /// classifier may recognize paths independently of those patterns.
+    pub fn scan_directory_with<F>(
+        &self,
+        directory: &Path,
+        max_entries: usize,
+        mut is_sensitive: F,
+    ) -> DirectoryScan
+    where
+        F: FnMut(&Path) -> bool,
+    {
         // A file under a `dir/**` root is found when its directory is probed,
         // which happens before its entries are read. Files therefore only
         // need the other pattern kinds, and most configs have none, which
@@ -117,7 +134,7 @@ impl SafePathMatcher {
         let mut inspected = 0usize;
 
         while let Some(current) = pending.pop_front() {
-            if self.is_safe(current.join(DIRECTORY_PROBE)) {
+            if self.is_safe(current.join(DIRECTORY_PROBE)) || is_sensitive(&current) {
                 return DirectoryScan::Protected(current);
             }
 
@@ -137,9 +154,14 @@ impl SafePathMatcher {
 
                 if kind.is_dir() {
                     pending.push_back(entry.path());
-                } else if file_patterns || kind.is_symlink() {
+                } else {
                     let path = entry.path();
-                    if (file_patterns && self.matches_file_pattern(&path))
+                    let classified = is_sensitive(&path)
+                        || (kind.is_symlink()
+                            && fs::canonicalize(&path).is_ok_and(|target| is_sensitive(&target)));
+                    let matched_pattern = file_patterns && self.matches_file_pattern(&path);
+                    if matched_pattern
+                        || classified
                         || (kind.is_symlink() && self.covers_target(&path))
                     {
                         return DirectoryScan::Protected(path);
@@ -170,12 +192,12 @@ impl SafePathMatcher {
     }
 }
 
-/// What `SafePathMatcher::scan_directory` established about a directory.
+/// What a directory scan established about configured patterns or an extra classifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DirectoryScan {
-    /// This path, at or beneath the directory, is covered by a pattern.
+    /// This path, at or beneath the directory, is covered by a pattern or classifier.
     Protected(PathBuf),
-    /// Every entry was inspected and none is covered.
+    /// Every entry was inspected and none is covered by a pattern or classifier.
     Clear,
     /// The directory holds more entries than the budget allows inspecting.
     Unverified { max_entries: usize },
@@ -684,6 +706,30 @@ mod tests {
         let scan = matcher(&["data/**", "secrets/**"]).scan_directory(&root, 1_000);
 
         assert_eq!(scan, DirectoryScan::Clear);
+    }
+
+    #[test]
+    fn extra_classifier_finds_sensitive_paths_without_globs() {
+        let root = unique_dir("extra-classifier");
+        let env_file = put(&root, ".env");
+        put(&root, "src/main.rs");
+
+        let scan = matcher(&[]).scan_directory_with(&root, 1_000, |path| {
+            path.file_name().is_some_and(|name| name == ".env")
+        });
+
+        assert_eq!(scan, DirectoryScan::Protected(env_file));
+    }
+
+    #[test]
+    fn extra_classifier_scans_still_stop_at_the_entry_budget() {
+        let root = unique_dir("extra-budget");
+        put(&root, "a.txt");
+        put(&root, "b.txt");
+
+        let scan = matcher(&[]).scan_directory_with(&root, 1, |_| false);
+
+        assert_eq!(scan, DirectoryScan::Unverified { max_entries: 1 });
     }
 
     #[test]
