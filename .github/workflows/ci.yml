@@ -73,3 +73,66 @@ jobs:
 
       - name: Prove Seatbelt read and hardlink restrictions
         run: cargo test --locked --test sandbox
+
+  # bd-sel. The hook is installed (`cargo install`, then `veil install` inside the
+  # script), and every row of docs/bypass-matrix.json is sent to the command
+  # `veil install` wrote, as a PreToolUse payload, on both platforms. The matrix
+  # drift check itself runs in the `rust` job's `cargo test`
+  # (tests/bypass_matrix.rs): this job is the installed binary on macOS and Linux.
+  e2e-hook-matrix:
+    name: e2e-hook-matrix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install veil
+        run: cargo install --path . --locked --root "$RUNNER_TEMP/veil-install"
+
+      - name: Run every matrix row through the installed hook
+        # `shell: bash` is what turns on pipefail: without it `| tee` would hide
+        # the script's exit status and a mismatch would pass the job.
+        shell: bash
+        run: |
+          tests/e2e_hook_matrix.sh \
+            --veil "$RUNNER_TEMP/veil-install/bin/veil" \
+            --run-dir "$RUNNER_TEMP/e2e-hook-matrix" \
+            | tee "$RUNNER_TEMP/e2e-hook-matrix.log"
+
+      - name: Show the summary table
+        if: always()
+        shell: bash
+        run: |
+          summary="$RUNNER_TEMP/e2e-hook-matrix/summary.txt"
+          if [ -f "$summary" ]; then
+            {
+              echo '### Installed-hook matrix (${{ matrix.os }})'
+              echo '```'
+              cat "$summary"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no summary.txt: the run did not get as far as the table" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep the run directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-hook-matrix-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/e2e-hook-matrix
+            ${{ runner.temp }}/e2e-hook-matrix.log
+          if-no-files-found: warn

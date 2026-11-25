@@ -227,6 +227,27 @@ fn every_new_record_says_which_schema_it_is() {
     }
 }
 
+#[test]
+fn every_record_says_a_hook_decided_because_nothing_enforces_a_sandbox_yet() {
+    let repo = repo("enforcement");
+    assert!(hook(&repo, "cat data/clients/holdings.csv"), "a denial");
+    assert!(!hook(&repo, "cat notes.md"), "an allow is recorded too");
+
+    let records = repo.records();
+
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record["decision"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>(),
+        ["deny", "allow"]
+    );
+    for record in &records {
+        assert_eq!(record["enforcement"], "hook", "{record}");
+    }
+}
+
 /// The log of a machine that has run several versions of veil and two hooks at once.
 fn mix_generations(repo: &Repo) {
     assert!(hook(repo, "cat data/clients/holdings.csv"));

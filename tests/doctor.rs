@@ -247,6 +247,54 @@ fn doctor_health_exits_one_when_claude_hooks_are_missing_and_writes_nothing() {
 }
 
 #[test]
+fn doctor_says_veil_is_hook_only_whether_or_not_it_is_healthy() {
+    // unhealthy: claude-code harness, no hooks installed
+    let home = unique_home("enforcement-unhealthy");
+    let output = veil_command(&home)
+        .arg("doctor")
+        .output()
+        .expect("doctor should run");
+    assert_eq!(output.status.code(), Some(1), "unhealthy doctor exits 1");
+    let text = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(
+        text.contains("enforcement: hook-only (advisory; parser-based)"),
+        "{text}"
+    );
+
+    // healthy: a harness with nothing to verify
+    let home = unique_home("enforcement-healthy");
+    let empty_bin = home.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty bin dir should be creatable");
+    let output = veil_command_for(&home, "codex", &[&empty_bin])
+        .arg("doctor")
+        .output()
+        .expect("doctor should run");
+    assert_eq!(output.status.code(), Some(0), "healthy doctor exits 0");
+    let text = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
+    assert!(
+        text.contains("enforcement: hook-only (advisory; parser-based)"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("enforcement: sandbox"),
+        "nothing in veil enforces a sandbox: {text}"
+    );
+}
+
+#[test]
+fn doctor_json_carries_the_enforcement_object() {
+    let home = unique_home("enforcement-json");
+    let (_, report) = doctor_json(&home);
+
+    assert_eq!(report["enforcement"]["mode"], "hook-only", "{report}");
+    assert_eq!(
+        report["enforcement"]["summary"], "advisory; parser-based",
+        "{report}"
+    );
+    assert_eq!(report["enforcement"]["sandbox"], false, "{report}");
+}
+
+#[test]
 fn doctor_health_exits_zero_when_healthy() {
     let home = unique_home("health-ok");
     let empty_bin = home.join("empty-bin");

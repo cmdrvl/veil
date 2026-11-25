@@ -13,6 +13,16 @@ use serde_json::{Value, json};
 /// that meets any other value, or none, is looking at a legacy record.
 pub const SCHEMA_VERSION: &str = "veil.audit.v1";
 
+/// Written on every record as `enforcement`: what stood behind the decision.
+/// `hook` is a hook reading the text of a tool call, which is advisory and
+/// parser-based: it can refuse what it can see and cannot stop what it cannot.
+/// The other value a record may carry is `sandbox`, for a decision enforced by
+/// an operating-system sandbox; nothing in veil enforces one yet, so nothing
+/// writes it, and today this is a constant because it is true. The sandbox
+/// work (bd-apj) has to make it depend on what ran. A record without the key,
+/// written before it existed, was a hook decision: that was the only kind.
+pub const ENFORCEMENT: &str = "hook";
+
 /// The audit log is rotated when it reaches this size...
 pub const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -69,6 +79,7 @@ impl AuditRecord {
             "origin": self.origin,
             "reason_class": self.reason_class,
             "class": self.class,
+            "enforcement": ENFORCEMENT,
         })
     }
 }
@@ -338,6 +349,10 @@ mod tests {
         assert_eq!(value["session_id"], "session-123");
         assert_eq!(value["origin"], "top");
         assert_eq!(value["schema_version"], "veil.audit.v1");
+        assert_eq!(
+            value["enforcement"], "hook",
+            "a record says what stood behind it: a hook, until a sandbox does"
+        );
     }
 
     fn numbered(number: usize, padding: usize) -> AuditRecord {

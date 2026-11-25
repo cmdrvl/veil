@@ -32,6 +32,13 @@ const HOOK_DECISION_SCHEMA: &str = include_str!("../hook-decision.schema.json");
 const DOCTOR_SCHEMA_VERSION: &str = "cmdrvl.doctor.v1";
 const DOCTOR_CAPABILITIES_SCHEMA_VERSION: &str = "veil.doctor.capabilities.v1";
 const READ_ONLY_DOCTOR_CONTRACT: &str = "cmdrvl.read_only_doctor.v1";
+/// What stands behind a veil decision, as `veil doctor` says it. veil is a hook
+/// that reads the text of a tool call; nothing in it enforces an OS sandbox, so
+/// every report says so and none says otherwise. The audit log's matching field
+/// is `audit::ENFORCEMENT` (`hook`). Whatever makes this depend on whether a
+/// sandbox is actually wrapping the agent (bd-apj) changes both together.
+const ENFORCEMENT_MODE: &str = "hook-only";
+const ENFORCEMENT_SUMMARY: &str = "advisory; parser-based";
 /// Version tag on every `test`, `explain` and `scan` `--json` document,
 /// including their error documents. These documents are decisions about
 /// paths only: veil does not read file contents or message bodies to produce
@@ -1219,6 +1226,10 @@ fn render_doctor_human(report: &DoctorReport) -> String {
     );
     let _ = writeln!(output, "Doctor");
     let _ = writeln!(output, "  overall: {overall}");
+    let _ = writeln!(
+        output,
+        "  enforcement: {ENFORCEMENT_MODE} ({ENFORCEMENT_SUMMARY})"
+    );
 
     for check in &report.checks {
         let status = check.status.as_str();
@@ -1298,7 +1309,7 @@ fn render_robot_docs_guide() -> String {
         "Guard preflight:",
         "- Under Claude Code, domain commands fail closed unless healthy veil Read/Grep/Bash hooks are installed. Other harnesses (Codex, Gemini CLI, Cursor, plain shell) do not need Claude hooks; their veil wiring is reported as unverified.",
         "- dcg is optional: set `[policy] require_dcg = true` to make a healthy dcg a hard requirement.",
-        "- `veil doctor --json` and `veil doctor triage --json` report the detected harness and `guard_posture`. Set `VEIL_HARNESS` (claude-code, codex, gemini-cli, cursor, plain) to override detection.",
+        "- `veil doctor --json` and `veil doctor triage --json` report the detected harness and `guard_posture`; `veil doctor` and `veil doctor --json` also say `enforcement: hook-only (advisory; parser-based)`, because nothing in veil enforces an OS sandbox. Set `VEIL_HARNESS` (claude-code, codex, gemini-cli, cursor, plain) to override detection.",
         "- `veil doctor`, `veil capabilities --json`, `veil --describe`, `veil robot-docs guide`, `veil install`, and `veil uninstall` remain available for maintenance.",
         "",
         "Composition:",
@@ -1779,6 +1790,11 @@ impl DoctorReport {
             "checks": self.checks_json_value(),
             "recommended_actions": self.recommended_actions_json_value(),
             "guard_posture": self.guard_posture,
+            "enforcement": {
+                "mode": ENFORCEMENT_MODE,
+                "summary": ENFORCEMENT_SUMMARY,
+                "sandbox": false,
+            },
             "fixers": [],
         })
     }
