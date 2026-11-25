@@ -25,10 +25,13 @@ const FINANCIAL_CONFIDENCE: f32 = 0.96;
 const PII_CONFIDENCE: f32 = 0.97;
 const HIPAA_CONFIDENCE: f32 = 0.98;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ClassificationRequest<'a> {
     pub path: &'a Path,
     pub directory_sensitive: bool,
+    /// The path split and lowercased once, for every pack to read: building it
+    /// per pack cost more than the matching did (bd-29r).
+    view: PathView,
 }
 
 impl<'a> ClassificationRequest<'a> {
@@ -36,7 +39,12 @@ impl<'a> ClassificationRequest<'a> {
         Self {
             path,
             directory_sensitive,
+            view: PathView::new(path),
         }
+    }
+
+    fn view(&self) -> &PathView {
+        &self.view
     }
 }
 
@@ -195,7 +203,7 @@ impl SensitivityPack for FilesystemPack {
     }
 
     fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
-        let path = PathView::new(request.path);
+        let path = request.view();
         let basename = path.basename()?;
 
         if is_sensitive_env_file(basename)
@@ -223,10 +231,10 @@ impl SensitivityPack for CredentialsPack {
     }
 
     fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
-        let path = PathView::new(request.path);
+        let path = request.view();
         let basename = path.basename()?;
 
-        if is_credentials_file(&path, basename) {
+        if is_credentials_file(path, basename) {
             return Some(PackMatch {
                 severity: SensitivitySeverity::Critical,
                 confidence: CREDENTIALS_CONFIDENCE,
@@ -247,7 +255,7 @@ impl SensitivityPack for DatabasePack {
     }
 
     fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
-        let path = PathView::new(request.path);
+        let path = request.view();
         let basename = path.basename()?;
 
         if is_database_file(basename) {
@@ -271,10 +279,10 @@ impl SensitivityPack for FinancialPack {
     }
 
     fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
-        let path = PathView::new(request.path);
+        let path = request.view();
         let basename = path.basename()?;
 
-        if is_financial_file(&path, basename) {
+        if is_financial_file(path, basename) {
             return Some(PackMatch {
                 severity: SensitivitySeverity::High,
                 confidence: FINANCIAL_CONFIDENCE,
@@ -295,10 +303,10 @@ impl SensitivityPack for PiiPack {
     }
 
     fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
-        let path = PathView::new(request.path);
+        let path = request.view();
         let basename = path.basename()?;
 
-        if is_pii_file(&path, basename) {
+        if is_pii_file(path, basename) {
             return Some(PackMatch {
                 severity: SensitivitySeverity::High,
                 confidence: PII_CONFIDENCE,
@@ -319,10 +327,10 @@ impl SensitivityPack for HipaaPack {
     }
 
     fn classify(&self, request: &ClassificationRequest<'_>) -> Option<PackMatch> {
-        let path = PathView::new(request.path);
+        let path = request.view();
         let basename = path.basename()?;
 
-        if is_hipaa_file(&path, basename) {
+        if is_hipaa_file(path, basename) {
             return Some(PackMatch {
                 severity: SensitivitySeverity::Critical,
                 confidence: HIPAA_CONFIDENCE,
@@ -347,7 +355,7 @@ impl SensitivityPack for TabularPack {
             return None;
         }
 
-        let path = PathView::new(request.path);
+        let path = request.view();
         let basename = path.basename()?;
 
         if is_tabular_file(basename) {
@@ -375,7 +383,7 @@ impl SensitivityPack for XmlPack {
             return None;
         }
 
-        let path = PathView::new(request.path);
+        let path = request.view();
         let basename = path.basename()?;
 
         if is_xml_filing_file(basename) {
@@ -390,7 +398,7 @@ impl SensitivityPack for XmlPack {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PathView {
     components: Vec<String>,
 }

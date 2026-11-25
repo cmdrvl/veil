@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -34,7 +34,10 @@ enum CompiledPattern {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SafePathMatcher {
+    /// The patterns as written. They define what a match is; `index` answers
+    /// the same question without trying each one.
     patterns: Vec<CompiledPattern>,
+    index: PatternIndex,
 }
 
 impl Default for SafePathMatcher {
@@ -49,12 +52,13 @@ impl SafePathMatcher {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let patterns = patterns
+        let patterns: Vec<CompiledPattern> = patterns
             .into_iter()
             .map(|pattern| CompiledPattern::compile(pattern.as_ref()))
             .collect();
+        let index = PatternIndex::build(&patterns);
 
-        Self { patterns }
+        Self { patterns, index }
     }
 
     pub fn is_safe<P>(&self, path: P) -> bool
@@ -62,6 +66,14 @@ impl SafePathMatcher {
         P: AsRef<Path>,
     {
         let normalized = NormalizedPath::from_path(path.as_ref());
+        self.index.matches(&normalized, true)
+    }
+
+    /// `is_safe` by trying every pattern in turn: the definition the index must
+    /// agree with.
+    #[cfg(test)]
+    fn is_safe_linear(&self, path: &Path) -> bool {
+        let normalized = NormalizedPath::from_path(path);
         self.patterns
             .iter()
             .any(|pattern| pattern.matches(&normalized))
@@ -136,9 +148,7 @@ impl SafePathMatcher {
     /// Whether a pattern other than `dir/**` covers `path`.
     fn matches_file_pattern(&self, path: &Path) -> bool {
         let normalized = NormalizedPath::from_path(path);
-        self.patterns.iter().any(|pattern| {
-            !matches!(pattern, CompiledPattern::Directory(_)) && pattern.matches(&normalized)
-        })
+        self.index.matches(&normalized, false)
     }
 
     fn covers_target(&self, link: &Path) -> bool {
@@ -186,6 +196,10 @@ impl CompiledPattern {
         Self::ExactName(pattern.to_owned())
     }
 
+    /// What it means for this one pattern to cover `path`. The index answers
+    /// the same question for all patterns at once; this is the reference the
+    /// differential test checks it against.
+    #[cfg(test)]
     fn matches(&self, path: &NormalizedPath) -> bool {
         match self {
             Self::ExactName(name) => path.basename().is_some_and(|value| value == name),
@@ -196,6 +210,276 @@ impl CompiledPattern {
                 .is_some_and(|value| wildcard_matches(pattern, value)),
             Self::PathGlob(pattern) => wildcard_matches(pattern, &path.full_path),
         }
+    }
+}
+
+/// The patterns of one matcher, arranged so that a lookup touches only the
+/// patterns that could match instead of every one (bd-29r). Building it is
+/// linear in the number of patterns; a lookup is linear in the depth of the
+/// path, plus the few patterns that share its file name ending or a directory
+/// name with it. It answers exactly what trying each pattern in order does: the
+/// differential test in this module holds it to that.
+///
+/// - `names`: a pattern that is one file name (`.env`).
+/// - `segments`: a trie of path components for patterns that name components
+///   (`data/clients/x.csv`, which must end the path, and `data/**`, which may
+///   sit anywhere in it).
+/// - `globs`: patterns with a `*`, reached through a component they must
+///   contain, a literal ending, a literal start, or, failing those, scanned.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PatternIndex {
+    names: HashSet<String>,
+    segments: Trie,
+    globs: GlobIndex,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Trie {
+    /// Node 0 is the root.
+    nodes: Vec<TrieNode>,
+    /// A pattern with no components (`/`) ends every path.
+    ends_every_path: bool,
+}
+
+impl Default for Trie {
+    fn default() -> Self {
+        Self {
+            nodes: vec![TrieNode::default()],
+            ends_every_path: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TrieNode {
+    children: HashMap<String, usize>,
+    /// An exact-path pattern ends here: the path must end with these components.
+    exact_path: bool,
+    /// A `dir/**` pattern ends here: these components must be followed by at
+    /// least one more.
+    directory: bool,
+}
+
+impl Trie {
+    fn insert(&mut self, components: &[String], directory: bool) {
+        if components.is_empty() {
+            self.ends_every_path |= !directory;
+            return;
+        }
+
+        let mut node = 0;
+        for component in components {
+            node = match self.nodes[node].children.get(component) {
+                Some(next) => *next,
+                None => {
+                    self.nodes.push(TrieNode::default());
+                    let next = self.nodes.len() - 1;
+                    self.nodes[node].children.insert(component.clone(), next);
+                    next
+                }
+            };
+        }
+
+        if directory {
+            self.nodes[node].directory = true;
+        } else {
+            self.nodes[node].exact_path = true;
+        }
+    }
+
+    fn matches(&self, path: &[String], directories: bool) -> bool {
+        if self.ends_every_path {
+            return true;
+        }
+
+        for start in 0..path.len() {
+            let mut node = 0;
+
+            for (offset, component) in path[start..].iter().enumerate() {
+                let Some(next) = self.nodes[node].children.get(component) else {
+                    break;
+                };
+                node = *next;
+                let ends_path = start + offset + 1 == path.len();
+
+                if self.nodes[node].exact_path && ends_path {
+                    return true;
+                }
+                if directories && self.nodes[node].directory && !ends_path {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlobTarget {
+    /// Matched against the file name (`*.csv`).
+    Basename,
+    /// Matched against the whole path (`data/*.csv`).
+    FullPath,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Glob {
+    pattern: String,
+    target: GlobTarget,
+}
+
+impl Glob {
+    fn matches(&self, path: &NormalizedPath) -> bool {
+        match self.target {
+            GlobTarget::Basename => path
+                .basename()
+                .is_some_and(|name| wildcard_matches(&self.pattern, name)),
+            GlobTarget::FullPath => wildcard_matches(&self.pattern, &path.full_path),
+        }
+    }
+}
+
+/// Globs filed under a literal piece of text and the lengths of the pieces in
+/// use, so a lookup tries one string per length instead of every glob.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TextBuckets {
+    buckets: HashMap<String, Vec<Glob>>,
+    lengths: Vec<usize>,
+}
+
+impl TextBuckets {
+    fn insert(&mut self, text: &str, glob: Glob) {
+        if !self.lengths.contains(&text.len()) {
+            self.lengths.push(text.len());
+        }
+        self.buckets.entry(text.to_owned()).or_default().push(glob);
+    }
+
+    fn any_ending(&self, text: &str, path: &NormalizedPath) -> bool {
+        self.lengths.iter().any(|length| {
+            text.len() >= *length
+                && text
+                    .get(text.len() - length..)
+                    .and_then(|tail| self.buckets.get(tail))
+                    .is_some_and(|globs| globs.iter().any(|glob| glob.matches(path)))
+        })
+    }
+
+    fn any_starting(&self, text: &str, path: &NormalizedPath) -> bool {
+        self.lengths.iter().any(|length| {
+            text.get(..*length)
+                .and_then(|head| self.buckets.get(head))
+                .is_some_and(|globs| globs.iter().any(|glob| glob.matches(path)))
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct GlobIndex {
+    /// Globs with a literal path component of their own, such as `area7` in
+    /// `**/area7/*.csv`: a path that lacks that component cannot match.
+    by_component: HashMap<String, Vec<Glob>>,
+    /// The rest, by the literal text after their last `*`...
+    by_ending: TextBuckets,
+    /// ...or, when they end in `*`, by the literal text before their first one
+    /// (kept apart by what they match against, since the starts differ).
+    by_basename_start: TextBuckets,
+    by_path_start: TextBuckets,
+    /// Globs that start and end with `*` (`**/*`, `*key*`): nothing to file them by.
+    loose: Vec<Glob>,
+}
+
+impl GlobIndex {
+    fn insert(&mut self, pattern: &str, target: GlobTarget) {
+        let glob = Glob {
+            pattern: pattern.to_owned(),
+            target,
+        };
+
+        if target == GlobTarget::FullPath
+            && let Some(component) = required_component(pattern)
+        {
+            self.by_component
+                .entry(component.to_owned())
+                .or_default()
+                .push(glob);
+        } else if let Some(ending) = pattern.rsplit('*').next().filter(|text| !text.is_empty()) {
+            self.by_ending.insert(ending, glob);
+        } else if let Some(start) = pattern.split('*').next().filter(|text| !text.is_empty()) {
+            match target {
+                GlobTarget::Basename => self.by_basename_start.insert(start, glob),
+                GlobTarget::FullPath => self.by_path_start.insert(start, glob),
+            }
+        } else {
+            self.loose.push(glob);
+        }
+    }
+
+    fn matches(&self, path: &NormalizedPath) -> bool {
+        path.components.iter().any(|component| {
+            self.by_component
+                .get(component)
+                .is_some_and(|globs| globs.iter().any(|glob| glob.matches(path)))
+        }) || self.by_ending.any_ending(&path.full_path, path)
+            || path
+                .basename()
+                .is_some_and(|name| self.by_basename_start.any_starting(name, path))
+            || self.by_path_start.any_starting(&path.full_path, path)
+            || self.loose.iter().any(|glob| glob.matches(path))
+    }
+}
+
+/// A component written in full, with a `/` after it, in a path glob: the text
+/// `/area7/` (or a leading `area7/`) can only match a path that has a component
+/// `area7`, since a `*` never turns part of a component into another.
+fn required_component(pattern: &str) -> Option<&str> {
+    let mut components = pattern.split('/').peekable();
+
+    while let Some(component) = components.next() {
+        if components.peek().is_some() && !component.is_empty() && !component.contains('*') {
+            return Some(component);
+        }
+    }
+
+    None
+}
+
+impl PatternIndex {
+    fn build(patterns: &[CompiledPattern]) -> Self {
+        let mut index = Self::default();
+
+        for pattern in patterns {
+            match pattern {
+                CompiledPattern::ExactName(name) => {
+                    index.names.insert(name.clone());
+                }
+                CompiledPattern::ExactPath(components) => {
+                    index.segments.insert(components, false);
+                }
+                CompiledPattern::Directory(components) => {
+                    index.segments.insert(components, true);
+                }
+                CompiledPattern::BasenameGlob(glob) => {
+                    index.globs.insert(glob, GlobTarget::Basename);
+                }
+                CompiledPattern::PathGlob(glob) => {
+                    index.globs.insert(glob, GlobTarget::FullPath);
+                }
+            }
+        }
+
+        index
+    }
+
+    /// Whether any pattern covers `path`. With `directories` false the
+    /// `dir/**` patterns are left out: the question a directory walk asks of
+    /// each file, since it already asked it of the directory.
+    fn matches(&self, path: &NormalizedPath, directories: bool) -> bool {
+        path.basename()
+            .is_some_and(|name| self.names.contains(name))
+            || self.segments.matches(&path.components, directories)
+            || self.globs.matches(path)
     }
 }
 
@@ -230,10 +514,12 @@ impl NormalizedPath {
         self.components.last().map(String::as_str)
     }
 
+    #[cfg(test)]
     fn ends_with(&self, suffix: &[String]) -> bool {
         self.components.ends_with(suffix)
     }
 
+    #[cfg(test)]
     fn contains_directory(&self, directory: &[String]) -> bool {
         if directory.is_empty() || self.components.len() <= directory.len() {
             return false;
@@ -540,5 +826,230 @@ mod tests {
         } else {
             assert_eq!(scan, DirectoryScan::Clear);
         }
+    }
+
+    // --- bd-29r: the pattern index answers what trying every pattern answers ---
+
+    /// A small deterministic generator (xorshift64*), so a failure replays.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[self.below(items.len())]
+        }
+    }
+
+    const LITERALS: &[&str] = &[
+        "data", "clients", "x.csv", "y.csv", "d", "data2", ".env", "a", "b", "sub",
+    ];
+    const WILDCARDS: &[&str] = &["*", "**", "d*", "*.csv", "x*y", "*x*", "*data*", "*.env"];
+    const ODD_PATTERNS: &[&str] = &[
+        "/",
+        "/**",
+        "**",
+        "*",
+        "**/*",
+        "./x",
+        "a//b",
+        "**/data/**",
+        "*/*",
+        "data*",
+        "*.csv",
+        "data/*",
+        "**/clients/*.csv",
+        "a/*/b",
+        "x*y",
+        "**/.env",
+        "/data/x.csv",
+        "",
+    ];
+
+    fn random_pattern(rng: &mut Rng) -> String {
+        if rng.below(6) == 0 {
+            return rng.pick(ODD_PATTERNS).to_owned();
+        }
+
+        let count = 1 + rng.below(4);
+        let mut parts: Vec<&str> = (0..count)
+            .map(|_| {
+                if rng.below(10) < 6 {
+                    rng.pick(LITERALS)
+                } else {
+                    rng.pick(WILDCARDS)
+                }
+            })
+            .collect();
+        match rng.below(6) {
+            0 => parts.insert(0, "**"),
+            1 => parts.insert(0, ""),
+            2 => parts.insert(0, "."),
+            _ => {}
+        }
+
+        let mut pattern = parts.join("/");
+        if rng.below(3) == 0 {
+            pattern.push_str("/**");
+        }
+        pattern
+    }
+
+    fn random_path(rng: &mut Rng) -> String {
+        let count = rng.below(7);
+        let parts: Vec<&str> = (0..count)
+            .map(|_| match rng.below(14) {
+                0 => "..",
+                1 => ".",
+                _ => rng.pick(LITERALS),
+            })
+            .collect();
+        let joined = parts.join("/");
+
+        if rng.below(2) == 0 {
+            format!("/{joined}")
+        } else {
+            joined
+        }
+    }
+
+    #[test]
+    fn the_index_agrees_with_trying_every_pattern_on_random_patterns_and_paths() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut covered = 0usize;
+        let mut total = 0usize;
+
+        for _ in 0..4_000 {
+            let patterns: Vec<String> = (0..1 + rng.below(10))
+                .map(|_| random_pattern(&mut rng))
+                .collect();
+            let matcher = SafePathMatcher::from_patterns(patterns.iter());
+
+            for _ in 0..30 {
+                let path = random_path(&mut rng);
+                let path = Path::new(&path);
+                let expected = matcher.is_safe_linear(path);
+                let normalized = NormalizedPath::from_path(path);
+                let expected_files = matcher.patterns.iter().any(|pattern| {
+                    !matches!(pattern, CompiledPattern::Directory(_))
+                        && pattern.matches(&normalized)
+                });
+
+                assert_eq!(
+                    matcher.is_safe(path),
+                    expected,
+                    "patterns {patterns:?}, path {path:?}"
+                );
+                assert_eq!(
+                    matcher.matches_file_pattern(path),
+                    expected_files,
+                    "file patterns {patterns:?}, path {path:?}"
+                );
+                total += 1;
+                covered += usize::from(expected);
+            }
+        }
+
+        // The comparison is only worth something if both answers occur often.
+        assert!(
+            covered > total / 20 && covered < total - total / 20,
+            "{covered} of {total} paths matched"
+        );
+    }
+
+    #[test]
+    fn the_index_keeps_the_quirks_of_the_patterns_as_written() {
+        let path = |text: &str| Path::new(text).to_path_buf();
+
+        // `/` is an exact path with no components, so it ends every path
+        assert!(matcher(&["/"]).is_safe(path("anything/at/all")));
+        // `dir/**` needs something below the directory, and may sit anywhere
+        assert!(!matcher(&["data/**"]).is_safe(path("/repo/data")));
+        assert!(matcher(&["data/**"]).is_safe(path("/repo/data/x")));
+        assert!(matcher(&["data/**"]).is_safe(path("/repo/deep/data/x")));
+        // a bare path pattern must end the path
+        assert!(matcher(&["data/x.csv"]).is_safe(path("/repo/data/x.csv")));
+        assert!(!matcher(&["data/x.csv"]).is_safe(path("/repo/data/x.csv/y")));
+        // a glob with a slash is matched against the whole path, from its start
+        assert!(matcher(&["data/*.csv"]).is_safe(path("data/x.csv")));
+        assert!(!matcher(&["data/*.csv"]).is_safe(path("/repo/data/x.csv")));
+        assert!(matcher(&["**/data/*.csv"]).is_safe(path("/repo/data/x.csv")));
+        // a glob without one is matched against the file name
+        assert!(matcher(&["*.csv"]).is_safe(path("/repo/data/x.csv")));
+        assert!(!matcher(&["*.csv"]).is_safe(path("/repo/x.csv/y")));
+        assert!(matcher(&[".env"]).is_safe(path("/repo/.env")));
+    }
+
+    #[test]
+    fn ten_thousand_patterns_resolve_a_command_worth_of_paths_inside_a_millisecond() {
+        let mut patterns: Vec<String> = Vec::new();
+        for index in 0..2_000 {
+            patterns.push(format!("zone{index}/**"));
+            patterns.push(format!("vault{index}/file{index}.csv"));
+            patterns.push(format!("secret{index}.txt"));
+            patterns.push(format!("report{index}*.json"));
+            patterns.push(format!("**/area{index}/*.parquet"));
+        }
+        assert_eq!(patterns.len(), 10_000);
+
+        let build_start = std::time::Instant::now();
+        let matcher = SafePathMatcher::from_patterns(patterns.iter());
+        let build = build_start.elapsed();
+
+        // Sixty-four paths, as many as one command's words get resolved: some
+        // that a pattern covers, most that none does.
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for index in 0..64usize {
+            paths.push(match index % 8 {
+                0 => PathBuf::from(format!("/repo/zone{}/deep/x.csv", index * 31)),
+                1 => PathBuf::from(format!("/repo/vault{0}/file{0}.csv", index * 17)),
+                2 => PathBuf::from(format!("/repo/notes/secret{}.txt", index * 7)),
+                3 => PathBuf::from(format!("/repo/out/report{}-final.json", index * 11)),
+                4 => PathBuf::from(format!("/repo/lake/area{}/part.parquet", index * 13)),
+                5 => PathBuf::from(format!("/repo/src/module{index}/lib.rs")),
+                6 => PathBuf::from(format!("/repo/docs/chapter{index}/README.md")),
+                _ => PathBuf::from(format!("/repo/data/unrelated{index}.csv")),
+            });
+        }
+
+        let mut best = std::time::Duration::MAX;
+        let mut matched = 0usize;
+        for _ in 0..50 {
+            let start = std::time::Instant::now();
+            matched = paths.iter().filter(|path| matcher.is_safe(path)).count();
+            best = best.min(start.elapsed());
+        }
+
+        let linear_start = std::time::Instant::now();
+        let linear_matched = paths
+            .iter()
+            .filter(|path| matcher.is_safe_linear(path))
+            .count();
+        let linear = linear_start.elapsed();
+
+        eprintln!(
+            "10k patterns: build {build:?}, 64 lookups {best:?} (trying every pattern: {linear:?}), {matched} matched"
+        );
+        assert_eq!(linear_matched, matched);
+        assert_eq!(matched, 40);
+        assert!(
+            paths
+                .iter()
+                .all(|path| matcher.is_safe(path) == matcher.is_safe_linear(path)),
+            "the index must agree with the linear matcher on these paths"
+        );
+        assert!(
+            best < std::time::Duration::from_millis(1),
+            "64 lookups took {best:?}"
+        );
     }
 }

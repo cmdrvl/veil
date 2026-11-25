@@ -122,6 +122,66 @@ the list above (`docker exec`, `ssh host cmd`, `git grep`), command text it
 cannot parse, and anything past the 64th command of one line or the 8th level of
 nesting. Those are allowed today.
 
+Each of those commands is then judged by the paths it names, not by whether veil
+knows it as a reader. `awk 1 data/x.csv`, `sed`, `jq`, `base64`, `xxd`, `perl`,
+`sqlite3`, `duckdb`, `cp`, `mv`, `tar`, `zip`, `rsync`, `scp` and `curl -F
+file=@data/x.csv` all name a protected path, and each is denied unless the
+command is an authorized spine tool (which may name every path it is given, but
+not with a raw-value flag). A word counts as a path when it has a slash or a
+data-file extension, when something by that name exists (`shortcut`, a symlink
+into `data/`, or `data` itself), or when it sits inside a longer word as the
+value of `--opt=` or `key=@`, after a `:` (`git show HEAD:data/x.csv`,
+`scp host:data/x.csv`), or between quotes (`select * from 'data/x.csv'`). Naming
+a directory to a command that carries whole trees (`cp -r`, `tar`, `zip`,
+`rsync`, `scp`, `curl`, `docker`...) is a read of everything beneath it, so
+`tar czf out.tgz data` is denied when `data/` holds protected paths; for any other
+command a directory is just a name. `cat`, `head`, `tail`, `less`, `more`, `bat`
+and the grep family keep their own parsing, so a grep pattern with a slash is
+not a path. `/dev` and `/proc` are ignored, except the file-descriptor paths
+that stay blocked.
+
+A short list of commands only print names, counts, sizes or types, or create,
+remove or re-permission what they name, and are allowed with an audit record:
+`ls`, `wc`, `stat`, `du`, `file`, `test`, `find` (its `-exec` command is judged
+on its own), `mkdir`, `touch`, `rm`, `chmod`, `echo`, `cd`, and `git add`, `rm`,
+`mv`, `restore`, `reset`, `checkout`, `status`, `ls-files`, `check-ignore`,
+`commit`. Anything else that names a protected path, including `git diff`,
+`git show`, `git log` and `ln`, is judged as a read.
+
+Denials say which command named the path and carry the label
+(`(label: protected)`, from the `public < derived < protected` model in
+`docs/plan.md`). Each audit record has a `reason_class`: `direct_read` for a
+Read or Grep call or a command veil recognises as a reader, `argv_path` for a
+path named by any other command. A word that is not protected writes no record.
+
+Limits to know about:
+- Output redirections are not paths when attached (`2>/dev/null`, `>out`). A bare
+  `>` is dropped but the word after it is kept, because `cut -d '>' -f1 x.csv`
+  hands the operator to the command as data; so `cmd > data/out.csv` is denied
+  while `cmd >data/out.csv` is not. Writing into a protected directory is not
+  what the rule is for, and the asymmetry goes away when the decomposer strips
+  redirections itself.
+- At most 64 words of a command are resolved against the filesystem (symlinks
+  followed, existence checked). A word with a slash or a data-file extension
+  past the 64th is still compared with `[sensitivity] protected` as text, but a
+  bare name or a symlink past it is not checked.
+- Not a path, so not checked: anything a shell expands (`cat $f`), what `xargs`
+  reads from standard input, files a script opens on its own, and a path in a
+  quoted literal that holds more than the path (`"cat data/x.csv"`).
+- A `cd` earlier in the line is not followed; paths resolve against the
+  directory the hook started in.
+
+`[sensitivity] protected` patterns are held in an index (names, a trie of path
+components, and globs filed by a literal part they must contain), so a lookup
+costs the depth of the path rather than the number of patterns. With 10,000
+patterns, 64 lookups take about 56 µs in a release build, against about 24 ms
+for trying every pattern; building the index once per hook call takes about
+5 ms. The index answers exactly what trying each pattern in turn answers, and a
+differential test checks that on random patterns and paths. Judging a command that
+names 64 files takes about 0.8 ms in a release build (a few words take a tenth of
+that); with 10,000 patterns the index build brings the same command to about 4.5
+ms.
+
 ### Configuration
 
 ```toml

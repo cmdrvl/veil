@@ -90,8 +90,34 @@ pub struct CommandExtraction {
     /// text that could not be analysed.
     pub argv: Vec<String>,
     pub exposure: PathExposure,
+    /// Paths a recognised reader (cat, grep, a redirect, an interpreter's
+    /// accessor...) reads. These are direct reads.
     pub candidates: Vec<PathBuf>,
+    /// Paths named in the command's words by any other command: `awk 1 x.csv`,
+    /// `cp x.csv /tmp`, `curl -F f=@x.csv`. Never a path already in
+    /// `candidates` (bd-29r).
+    pub argv_paths: Vec<ArgvPath>,
+    /// What the command does with `argv_paths`: it reads them, unless it is one
+    /// of the commands that print only names, counts or sizes.
+    pub argv_exposure: PathExposure,
+    /// Whether a directory among `argv_paths` stands for everything beneath it.
+    /// True for the commands that copy, archive or upload whole trees.
+    pub argv_scans_directories: bool,
 }
+
+/// A path a command names in its words. `resolved` says veil followed symlinks
+/// and checked the filesystem; it is false for the words past
+/// [`ARGV_FILESYSTEM_BUDGET`], which are only normalised as text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArgvPath {
+    pub path: PathBuf,
+    pub resolved: bool,
+}
+
+/// How many words of one command veil resolves against the filesystem for the
+/// path-anywhere-in-argv rule (bd-29r): the performance bound on the stat calls
+/// one command can cost. Words past it are normalised as text, never statted.
+pub const ARGV_FILESYSTEM_BUDGET: usize = 64;
 
 impl CommandExtraction {
     /// A Read or Grep call: one path source with no command words.
@@ -101,6 +127,9 @@ impl CommandExtraction {
             argv: Vec::new(),
             exposure: extraction.exposure,
             candidates: extraction.candidates,
+            argv_paths: Vec::new(),
+            argv_exposure: PathExposure::None,
+            argv_scans_directories: false,
         }
     }
 }
@@ -123,6 +152,9 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             argv: Vec::new(),
             exposure: PathExposure::None,
             candidates: Vec::new(),
+            argv_paths: Vec::new(),
+            argv_exposure: PathExposure::None,
+            argv_scans_directories: false,
         };
     };
 
@@ -151,12 +183,433 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         exposure
     };
 
+    // The readers above know which of their words are paths. Any other command
+    // is judged by the path-shaped words it carries (bd-29r).
+    let (argv_paths, argv_exposure, argv_scans_directories) = if is_known_reader(program) {
+        (Vec::new(), PathExposure::None, false)
+    } else {
+        let exposure = argv_exposure(program, args);
+        let scans_directories = BULK_TRANSFER_COMMANDS.contains(&command_name(program));
+        let paths = argv_paths(
+            program,
+            args,
+            exposure == PathExposure::ReadsContents,
+            &candidates,
+            cwd,
+        );
+        (paths, exposure, scans_directories)
+    };
+
     CommandExtraction {
         origin: command.origin,
         argv: command.argv.clone(),
         exposure,
         candidates,
+        argv_paths,
+        argv_exposure,
+        argv_scans_directories,
     }
+}
+
+/// Commands whose own parser tells veil exactly which words are paths, so the
+/// generic rule would only add the pattern of a search or a number of lines.
+fn is_known_reader(program: &str) -> bool {
+    let name = command_name(program);
+    search_spec(name).is_some() || matches!(name, "cat" | "bat" | "less" | "more" | "head" | "tail")
+}
+
+/// Commands that print names, counts, sizes or types, or that only create,
+/// remove or re-permission what they name. Naming a protected path does not
+/// put its content in the agent's context or copy it anywhere, so the rule
+/// allows them and the audit log records the access. A short, closed list:
+/// anything else that names a protected path is judged as a read.
+const NAMES_AND_COUNTS_COMMANDS: &[&str] = &[
+    "ls", "dir", "vdir", "wc", "stat", "du", "df", "tree", "file", "test", "[", "[[", "find",
+    "realpath", "readlink", "basename", "dirname", "mkdir", "rmdir", "touch", "rm", "chmod",
+    "chown", "chgrp", "cd", "pushd", "popd", "pwd", "echo", "printf", "true", "false", "which",
+    "type", "mktemp",
+];
+
+/// `git` subcommands that stage, restore, list or commit paths without
+/// printing what is in them. `diff`, `show`, `log -p`, `blame`, `cat-file`,
+/// `archive` and the rest print or export content and stay reads.
+const GIT_NAMES_ONLY_SUBCOMMANDS: &[&str] = &[
+    "add",
+    "rm",
+    "mv",
+    "restore",
+    "reset",
+    "checkout",
+    "switch",
+    "status",
+    "ls-files",
+    "ls-tree",
+    "check-ignore",
+    "commit",
+    "rev-parse",
+    "clean",
+    "stash",
+    "update-index",
+];
+
+/// Commands that carry a whole directory tree somewhere: copy, archive, sync or
+/// upload. Naming a directory to one of them names everything beneath it.
+const BULK_TRANSFER_COMMANDS: &[&str] = &[
+    "cp", "mv", "tar", "zip", "unzip", "gzip", "bzip2", "xz", "7z", "7za", "rsync", "scp", "sftp",
+    "rclone", "ditto", "pax", "cpio", "install", "curl", "wget", "aws", "gsutil", "az", "docker",
+    "podman",
+];
+
+/// Extensions that mark a word as a file name even when nothing by that name
+/// exists yet, or exists only after the shell expands a glob.
+const FILE_EXTENSIONS: &[&str] = &[
+    "csv", "tsv", "psv", "txt", "log", "json", "jsonl", "ndjson", "geojson", "xml", "xlsx", "xlsm",
+    "xls", "ods", "parquet", "feather", "arrow", "orc", "avro", "sqlite", "sqlite3", "db",
+    "duckdb", "mdb", "accdb", "sql", "dump", "bak", "pkl", "pickle", "npy", "npz", "h5", "hdf5",
+    "sav", "dta", "sas7bdat", "pdf", "doc", "docx", "ppt", "pptx", "rtf", "zip", "gz", "tgz",
+    "bz2", "xz", "zst", "tar", "7z", "yaml", "yml", "toml", "ini", "conf", "cfg", "env", "pem",
+    "key", "crt", "cer", "p12", "pfx", "kdbx", "sh", "py", "rb", "pl", "js", "ts",
+];
+
+fn argv_exposure(program: &str, args: &[String]) -> PathExposure {
+    let name = command_name(program);
+
+    if NAMES_AND_COUNTS_COMMANDS.contains(&name) {
+        return PathExposure::MetadataOnly;
+    }
+
+    if name == "git"
+        && git_subcommand(args).is_some_and(|sub| GIT_NAMES_ONLY_SUBCOMMANDS.contains(&sub))
+    {
+        return PathExposure::MetadataOnly;
+    }
+
+    PathExposure::ReadsContents
+}
+
+/// The subcommand of a `git` command line, after the global options that take
+/// a value (`-C dir`, `-c key=value`, `--git-dir=...`).
+fn git_subcommand(args: &[String]) -> Option<&str> {
+    const WITH_VALUE: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--exec-path",
+        "--config-env",
+    ];
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = args[index].as_str();
+        index += 1;
+
+        if WITH_VALUE.contains(&arg) {
+            index += 1;
+        } else if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+
+    None
+}
+
+/// The path-shaped words of one command, resolved. Redirections are not
+/// words: `2>/dev/null` and `> out.txt` are not paths the command reads, and
+/// `< file` is already a read through `redirects_in`. `reads` says whether the
+/// command reads what it names, in which case a glob also names the directory
+/// it starts from.
+fn argv_paths(
+    program: &str,
+    args: &[String],
+    reads: bool,
+    already: &[PathBuf],
+    cwd: &Path,
+) -> Vec<ArgvPath> {
+    let mut found: Vec<ArgvPath> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = already.iter().cloned().collect();
+    let mut budget = ARGV_FILESYSTEM_BUDGET;
+    let mut resolver = ArgvResolver::new(cwd);
+
+    for word in argv_path_words(program, args) {
+        let mut resolve = |raw: &str, found: &mut Vec<ArgvPath>| {
+            let resolved = budget > 0;
+            let path = if resolved {
+                budget -= 1;
+                resolver.resolve(raw, !word.certain)
+            } else if word.certain {
+                lexical_path(raw, cwd)
+            } else {
+                // Whether a bare word names anything takes a stat.
+                None
+            };
+            let Some(path) = path else {
+                return;
+            };
+
+            if ignorable_system_path(&path) || !seen.insert(path.clone()) {
+                return;
+            }
+            found.push(ArgvPath { path, resolved });
+        };
+
+        resolve(&word.text, &mut found);
+        if reads && let Some(directory) = directory_before_wildcard(&word.text) {
+            resolve(&directory, &mut found);
+        }
+    }
+
+    found
+}
+
+/// `/dev` and `/proc` hold devices and process state, not files an agent
+/// could use to read protected data; the exception is the file-descriptor
+/// paths the evaluator blocks outright.
+fn ignorable_system_path(path: &Path) -> bool {
+    (path.starts_with("/dev") || path.starts_with("/proc"))
+        && !crate::evaluator::is_blocked_device_path(path)
+}
+
+struct PathWord {
+    text: String,
+    /// Shaped like a file name (a slash, or a known extension), so it names a
+    /// path whether or not one exists. A bare word is only one if it exists.
+    certain: bool,
+}
+
+/// The words of a command that may name a path, in order, without
+/// duplicates. Besides whole words it takes the value of `--opt=value` and
+/// `key=value` (curl's `file=@x.csv`), drops a leading `@` or `<`, and takes
+/// each quoted literal inside a longer word (`select * from 'x.csv'`,
+/// `open('x.csv')`). The script handed to a shell is skipped: the decomposer
+/// runs it as commands of its own.
+fn argv_path_words(program: &str, args: &[String]) -> Vec<PathWord> {
+    let mut words: Vec<PathWord> = Vec::new();
+    let mut add = |text: &str| {
+        let text = text.trim_start_matches(['@', '<']);
+        let shaped = path_shaped(text);
+        let plain = is_plain_name(text);
+
+        if text.is_empty()
+            || text == "-"
+            || !(shaped || plain)
+            || words.iter().any(|word| word.text == text)
+        {
+            return;
+        }
+        words.push(PathWord {
+            text: text.to_owned(),
+            certain: shaped,
+        });
+    };
+    let shell = wrappers::SHELLS.contains(&command_name(program));
+    let mut options_ended = false;
+
+    if program.contains('/') {
+        add(program);
+    }
+
+    for word in strip_redirection_words(args) {
+        if word == "--" && !options_ended {
+            options_ended = true;
+            continue;
+        }
+
+        if shell && word.contains(char::is_whitespace) {
+            continue;
+        }
+
+        let option = !options_ended && word.starts_with('-') && word.len() > 1;
+        if !option {
+            add(word);
+        } else if !word.starts_with("--")
+            && let Some(attached) = word.get(2..)
+            && path_shaped(attached)
+        {
+            // `-fdata/x.csv`, `-C/srv/data`: a short option with its value attached.
+            add(attached);
+        }
+        if let Some((_, value)) = word.split_once('=') {
+            add(value);
+        }
+        // `git show HEAD:data/x.csv`, `scp data/x.csv host:/tmp`, `rsync host:x .`
+        if let Some((_, tail)) = word.rsplit_once(':') {
+            add(tail);
+        }
+        if word.contains(['\'', '"']) {
+            for literal in quoted_literals(word) {
+                add(literal);
+            }
+        }
+    }
+
+    words
+}
+
+/// The words of `args` that are not redirections. An attached redirection
+/// (`2>/dev/null`, `>out`, `2>&1`) is dropped whole. A bare operator (`>`) is
+/// dropped but the word after it is kept: `cut -d '>' -f1 x.csv` hands the
+/// operator to the command as data once the quotes are gone, and the word
+/// after it must not disappear with it. A redirect target in a protected
+/// directory is therefore still named.
+fn strip_redirection_words(args: &[String]) -> Vec<&str> {
+    args.iter()
+        .map(String::as_str)
+        .filter(|word| !is_redirection_word(word))
+        .collect()
+}
+
+/// `>`, `>>`, `2>`, `&>`, `<<<`, `>|`, `2>&1`, `2>/dev/null`, `>out`...: a word
+/// that starts with an optional file descriptor and a redirection operator.
+fn is_redirection_word(word: &str) -> bool {
+    let operator = match word.strip_prefix('&') {
+        Some(rest) => rest,
+        None => word.trim_start_matches(|ch: char| ch.is_ascii_digit()),
+    };
+
+    operator.starts_with(['<', '>'])
+}
+
+/// Whether a word is shaped like a file name: it has a slash, or one of the
+/// extensions in [`FILE_EXTENSIONS`].
+fn path_shaped(text: &str) -> bool {
+    text.contains('/')
+        || Path::new(text)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                FILE_EXTENSIONS
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(extension))
+            })
+}
+
+/// A bare word that could be a file or directory name: no spaces, quotes,
+/// wildcards or shell syntax. Whether it is one depends on the filesystem.
+fn is_plain_name(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with('-')
+        && !text.chars().all(|ch| ch.is_ascii_digit())
+        && !text.chars().any(|ch| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '\'' | '"'
+                        | '$'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | '|'
+                        | '&'
+                        | ';'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '`'
+                        | '\\'
+                        | '='
+                        | ','
+                )
+        })
+}
+
+/// The text between each pair of matching quotes in `word`, at most eight.
+fn quoted_literals(word: &str) -> Vec<&str> {
+    let mut literals = Vec::new();
+    let mut rest = word;
+
+    while literals.len() < 8
+        && let Some(open) = rest.find(['\'', '"'])
+    {
+        let quote = rest.as_bytes()[open] as char;
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(quote) else {
+            break;
+        };
+
+        literals.push(&after[..close]);
+        rest = &after[close + 1..];
+    }
+
+    literals
+}
+
+/// Resolves the words of one command to canonical paths. Words usually share a
+/// directory (`src/a.rs src/b.rs ...`), so each directory is canonicalized once
+/// and a word then costs one `lstat`, which also shows whether the word itself
+/// is a symlink; only a symlink, which can point anywhere, is canonicalized in
+/// full. A word that is not there is taken to be where its directory is.
+struct ArgvResolver<'a> {
+    cwd: &'a Path,
+    parents: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl<'a> ArgvResolver<'a> {
+    fn new(cwd: &'a Path) -> Self {
+        Self {
+            cwd,
+            parents: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The canonical path `raw` names. With `must_exist` a word that names
+    /// nothing is `None`, as for a bare word that may not be a path at all.
+    fn resolve(&mut self, raw: &str, must_exist: bool) -> Option<PathBuf> {
+        if raw.is_empty() || raw.chars().any(char::is_control) {
+            return None;
+        }
+
+        let lexical = lexical_path(raw, self.cwd)?;
+        if is_fd_indirection(&lexical) {
+            return normalize_path(raw, self.cwd);
+        }
+
+        let (Some(parent), Some(name)) = (lexical.parent(), lexical.file_name()) else {
+            // the root itself
+            return fs::canonicalize(&lexical).ok().or(Some(lexical));
+        };
+        let canonical_parent = self
+            .parents
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| fs::canonicalize(parent).ok())
+            .clone();
+        let Some(canonical_parent) = canonical_parent else {
+            // the directory is not there, so neither is the word
+            return if must_exist { None } else { Some(lexical) };
+        };
+
+        let candidate = canonical_parent.join(name);
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fs::canonicalize(&candidate).ok().or(Some(candidate))
+            }
+            Ok(_) => Some(candidate),
+            Err(_) if must_exist => None,
+            Err(_) => Some(candidate),
+        }
+    }
+}
+
+/// A word as a normalised absolute path, with no filesystem access.
+fn lexical_path(raw: &str, cwd: &Path) -> Option<PathBuf> {
+    if raw.is_empty() || raw.chars().any(char::is_control) {
+        return None;
+    }
+
+    let candidate = Path::new(raw);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        cwd.join(candidate)
+    };
+
+    lexical_normalize(&absolute)
 }
 
 /// Paths an interpreter reads when its script arrives as a here-document.
@@ -2184,6 +2637,312 @@ mod tests {
             ],
         );
         assert_eq!(reads("cat <<'EOF'\ncat data/x.csv\nEOF"), vec![]);
+    }
+
+    // --- bd-29r: the path-anywhere-in-argv rule ---
+
+    /// The argv paths of the first command, relative to the workspace, each
+    /// with whether veil resolved it against the filesystem.
+    fn argv_refs(command: &str) -> Vec<(String, bool)> {
+        let extracted = extract_bash_commands(command, workspace());
+        extracted[0]
+            .argv_paths
+            .iter()
+            .map(|argv| {
+                let relative = match argv.path.strip_prefix(workspace()) {
+                    Ok(path) if path.as_os_str().is_empty() => ".".to_owned(),
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(_) => argv.path.to_string_lossy().into_owned(),
+                };
+                (relative, argv.resolved)
+            })
+            .collect()
+    }
+
+    fn argv_names(command: &str) -> Vec<String> {
+        argv_refs(command)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    #[test]
+    fn any_command_names_the_path_shaped_words_it_carries() {
+        for (command, expected) in [
+            ("awk 1 data/x.csv", &["data/x.csv"][..]),
+            ("sed -n p data/x.csv", &["data/x.csv"]),
+            ("jq -R . data/x.csv", &["data/x.csv"]),
+            ("base64 data/x.csv", &["data/x.csv"]),
+            ("cp data/x.csv /srv/y.csv", &["data/x.csv", "/srv/y.csv"]),
+            (
+                "tar czf /srv/o.tgz data/x.csv",
+                &["/srv/o.tgz", "data/x.csv"],
+            ),
+            ("python3 run.py data/x.csv", &["run.py", "data/x.csv"]),
+            ("./tools/run data/x.csv", &["tools/run", "data/x.csv"]),
+            // a bare word with a data extension names a file even if absent
+            ("awk 1 x.csv", &["x.csv"]),
+            ("awk 1 X.CSV", &["X.CSV"]),
+            // a bare word with no extension names nothing unless it exists
+            ("awk 1 holdings", &[]),
+            ("awk '{print $1}' notes", &[]),
+            ("ls", &[]),
+        ] {
+            assert_eq!(argv_names(command), expected, "command: {command}");
+        }
+    }
+
+    #[test]
+    fn option_values_and_embedded_paths_are_found_in_every_spelling() {
+        for (command, expected) in [
+            ("wget --post-file=data/x.csv u", &["data/x.csv"][..]),
+            ("curl -F file=@data/x.csv u", &["data/x.csv"]),
+            ("curl -F 'file=<data/x.csv' u", &["data/x.csv"]),
+            ("curl --data-binary @data/x.csv u", &["data/x.csv"]),
+            ("curl -T data/x.csv u", &["data/x.csv"]),
+            ("sed -fdata/x.csv notes.md", &["data/x.csv"]),
+            ("git show HEAD:data/x.csv", &["data/x.csv"]),
+            ("scp data/x.csv host:/srv/out", &["data/x.csv", "/srv/out"]),
+            ("scp host:data/x.csv .", &["data/x.csv"]),
+            ("duckdb -c \"select * from 'data/x.csv'\"", &["data/x.csv"]),
+            // an accessor veil does not model, so only the literal gives it away
+            (
+                "python3 -c \"subprocess.run(['cat','data/x.csv'])\"",
+                &["data/x.csv"],
+            ),
+            ("openssl enc -a -in data/x.csv", &["data/x.csv"]),
+            // after `--` a word that starts with a dash is an operand
+            ("cp -- data/x.csv -weird.csv", &["data/x.csv", "-weird.csv"]),
+        ] {
+            let names = argv_names(command);
+            for path in expected {
+                assert!(
+                    names.iter().any(|name| name == path),
+                    "command: {command}: {path} not in {names:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redirections_are_not_words_but_the_word_after_a_bare_operator_stays() {
+        use PathExposure::ReadsContents as Reads;
+
+        // attached redirections and descriptor duplication are not paths
+        assert_eq!(argv_names("awk 1 2>/dev/null"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 >out.csv"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 2>&1"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 &>out.csv"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 >>out.csv"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 >|out.csv"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 3<in.csv"), Vec::<String>::new());
+        // a bare operator is dropped, its neighbour is not: `cut -d '>' x.csv`
+        assert_eq!(argv_names("cut -d '>' x.csv"), vec!["x.csv".to_owned()]);
+        assert_eq!(
+            argv_names("cut -f1 -d '>' data/x.csv"),
+            vec!["data/x.csv".to_owned()]
+        );
+        assert_eq!(argv_names("awk 1 > out.csv"), vec!["out.csv".to_owned()]);
+        // an input redirect is still a direct read, found once
+        assert_reads("awk 1 < data/x.csv", &[("top", Reads, &["data/x.csv"])]);
+        assert_eq!(argv_names("awk 1 < data/x.csv"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_path_a_reader_already_reads_is_not_named_twice() {
+        use PathExposure::ReadsContents as Reads;
+
+        // cat and the grep family know their own words, so the generic rule
+        // does not look at them: a grep pattern with a slash is not a path.
+        assert_reads("cat data/x.csv", &[("top", Reads, &["data/x.csv"])]);
+        assert_eq!(argv_names("cat data/x.csv"), Vec::<String>::new());
+        assert_eq!(
+            argv_names("grep data/clients notes.md"),
+            Vec::<String>::new()
+        );
+        assert_eq!(argv_names("rg -n 'a/b' src"), Vec::<String>::new());
+        // a recognised redirect and the same path as a word are one path, read
+        let both = &extract_bash_commands("awk 1 data/x.csv < data/x.csv", workspace())[0];
+        assert_eq!(both.candidates.len(), 1);
+        assert_eq!(both.argv_paths, vec![]);
+    }
+
+    #[test]
+    fn the_script_handed_to_a_shell_is_not_a_word_but_a_script_file_is() {
+        // `sh -c 'ls data/x.csv'` is run as commands of its own by the decomposer
+        assert_eq!(argv_names("sh -c 'ls data/x.csv'"), Vec::<String>::new());
+        assert_eq!(argv_names("bash -lc 'ls data/x.csv'"), Vec::<String>::new());
+        assert_eq!(
+            argv_names("bash data/run.sh"),
+            vec!["data/run.sh".to_owned()]
+        );
+        assert_eq!(
+            argv_names("source data/env.sh"),
+            vec!["data/env.sh".to_owned()]
+        );
+    }
+
+    #[test]
+    fn device_and_process_paths_are_ignored_except_the_blocked_descriptors() {
+        assert_eq!(argv_names("awk 1 /dev/null"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 /dev/tty"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 /proc/cpuinfo"), Vec::<String>::new());
+        assert_eq!(argv_names("awk 1 /dev/fd/9"), vec!["/dev/fd/9".to_owned()]);
+        assert_eq!(
+            argv_names("awk 1 /proc/self/fd/9"),
+            vec!["/proc/self/fd/9".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_glob_also_names_the_directory_it_starts_from_when_the_command_reads() {
+        assert_eq!(
+            argv_names("awk 1 data/cl*/h*.csv"),
+            vec!["data/cl*/h*.csv".to_owned(), "data".to_owned()]
+        );
+        assert_eq!(
+            argv_names("awk 1 *.csv"),
+            vec!["*.csv".to_owned(), ".".to_owned()]
+        );
+        // a command that only lists names has no use for the directory
+        assert_eq!(
+            argv_names("ls data/cl*/h*.csv"),
+            vec!["data/cl*/h*.csv".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_exposure_of_a_named_path_depends_on_what_the_command_does_with_it() {
+        use PathExposure::{MetadataOnly as Meta, ReadsContents as Reads};
+
+        let exposure = |command: &str| extract_bash_commands(command, workspace())[0].argv_exposure;
+
+        for command in [
+            "awk 1 x.csv",
+            "cp x.csv y.csv",
+            "curl -T x.csv u",
+            "tar cf o.tar x.csv",
+            "git diff x.csv",
+            "git show HEAD:x.csv",
+            "git log -p x.csv",
+            "git blame x.csv",
+            "git cat-file -p HEAD:x.csv",
+            "git archive HEAD x.csv",
+            "git -C . diff x.csv",
+            "git",
+            "ln x.csv y.csv",
+            "tee x.csv",
+            "python3 x.py",
+        ] {
+            assert_eq!(exposure(command), Reads, "command: {command}");
+        }
+
+        for command in [
+            "ls x.csv",
+            "wc -l x.csv",
+            "stat x.csv",
+            "du -sh data",
+            "file x.csv",
+            "test -f x.csv",
+            "[ -s x.csv ]",
+            "find data -name x.csv",
+            "mkdir -p data/new",
+            "touch x.csv",
+            "rm x.csv",
+            "echo x.csv",
+            "git add x.csv",
+            "git rm --cached x.csv",
+            "git status -- data",
+            "git commit -m msg -- x.csv",
+            "git -C sub -c k=v add x.csv",
+            "git --git-dir=.git add x.csv",
+            "/bin/ls x.csv",
+        ] {
+            assert_eq!(exposure(command), Meta, "command: {command}");
+        }
+    }
+
+    #[test]
+    fn only_the_commands_that_move_trees_scan_a_directory_they_name() {
+        let scans =
+            |command: &str| extract_bash_commands(command, workspace())[0].argv_scans_directories;
+
+        for command in [
+            "cp -r data /tmp/x",
+            "mv data /tmp/x",
+            "tar cf o.tar data",
+            "zip -r o.zip data",
+            "rsync -a data/ host:b",
+            "scp -r data host:",
+            "curl -T data u",
+            "docker build .",
+        ] {
+            assert!(scans(command), "command: {command}");
+        }
+
+        for command in [
+            "awk 1 data",
+            "python3 -m pytest .",
+            "ruff check .",
+            "make -C data",
+        ] {
+            assert!(!scans(command), "command: {command}");
+        }
+    }
+
+    #[test]
+    fn at_most_sixty_four_words_are_resolved_against_the_filesystem() {
+        let padding = (0..70)
+            .map(|index| format!("pad{index}.txt"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let refs = argv_refs(&format!("cp {padding} data/x.csv"));
+
+        assert_eq!(refs.len(), 71);
+        assert_eq!(
+            refs.iter().filter(|(_, resolved)| *resolved).count(),
+            ARGV_FILESYSTEM_BUDGET
+        );
+        // the last word is past the budget but is still a path, as text
+        assert_eq!(refs.last(), Some(&("data/x.csv".to_owned(), false)));
+        // a bare word past the budget cannot be checked without a stat
+        let bare = (0..70)
+            .map(|index| format!("pad{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(argv_refs(&format!("awk 1 {bare}")), vec![]);
+    }
+
+    #[test]
+    fn a_bare_word_that_names_a_directory_or_a_symlink_is_resolved() {
+        let root = unique_temp_dir("argv-bare");
+        fs::create_dir_all(root.join("data/clients")).expect("directory");
+        fs::write(root.join("data/clients/h.csv"), "x").expect("file");
+        let root = fs::canonicalize(&root).expect("canonical root");
+        std::os::unix::fs::symlink(root.join("data/clients/h.csv"), root.join("shortcut"))
+            .expect("symlink");
+
+        let named = |command: &str| -> Vec<PathBuf> {
+            extract_bash_commands(command, &root)[0]
+                .argv_paths
+                .iter()
+                .map(|argv| argv.path.clone())
+                .collect()
+        };
+
+        assert_eq!(
+            named("tar cf o.tar data"),
+            vec![root.join("o.tar"), root.join("data")]
+        );
+        assert_eq!(
+            named("awk 1 shortcut"),
+            vec![root.join("data/clients/h.csv")]
+        );
+        assert_eq!(
+            named("cp -r . /srv/x"),
+            vec![root.clone(), PathBuf::from("/srv/x")]
+        );
+        assert_eq!(named("awk 1 missing"), Vec::<PathBuf>::new());
     }
 
     #[cfg(unix)]

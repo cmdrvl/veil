@@ -21,6 +21,12 @@ pub struct AuditRecord {
     /// or backticks) or `wrapper` (`sh -c`, `xargs`, `find -exec`, `uv run`...).
     /// A Read or Grep call is `top`.
     pub origin: Option<String>,
+    /// What kind of reference the path was: `direct_read` (a Read or Grep call,
+    /// or a command veil recognises as a reader: `cat`, `grep`, a `<`
+    /// redirect...) or `argv_path` (a path named in the words of any other
+    /// command: `awk 1 x.csv`, `cp x.csv /tmp`, `curl -F f=@x.csv`). Lets an
+    /// operator tell the readers veil knew about from the generic rule.
+    pub reason_class: Option<String>,
 }
 
 impl AuditRecord {
@@ -35,6 +41,7 @@ impl AuditRecord {
             "confidence": self.confidence,
             "session_id": self.session_id,
             "origin": self.origin,
+            "reason_class": self.reason_class,
         })
     }
 }
@@ -93,6 +100,7 @@ mod tests {
             confidence: Some(0.95),
             session_id: Some("session-123".to_owned()),
             origin: Some("top".to_owned()),
+            reason_class: Some("direct_read".to_owned()),
         }
     }
 
@@ -180,6 +188,7 @@ mod tests {
                 confidence: Some(0.42),
                 session_id: Some("session-456".to_owned()),
                 origin: Some("wrapper".to_owned()),
+                reason_class: Some("argv_path".to_owned()),
             },
         )
         .expect("second append should succeed");
@@ -199,5 +208,7 @@ mod tests {
         assert_eq!(second["tool"], "Bash");
         assert_eq!(second["decision"], "allow");
         assert_eq!(second["origin"], "wrapper");
+        assert_eq!(first["reason_class"], "direct_read");
+        assert_eq!(second["reason_class"], "argv_path");
     }
 }

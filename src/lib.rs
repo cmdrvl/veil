@@ -17,10 +17,9 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use allowlist::SafePathMatcher;
 use audit::{AuditRecord, append_audit_record};
 use config::load_config;
-use evaluator::{EvaluationInput, evaluate_access};
+use evaluator::{EvaluationInput, PolicyMatchers, evaluate_access_with};
 use extract::{CommandExtraction, Origin, extract_bash_commands, extract_read_or_grep_paths};
 use hook::parse_hook_input;
 use packs::PackRegistry;
@@ -36,6 +35,24 @@ struct CandidateOutcome {
     sensitivity: Option<String>,
     /// How the command that reached this path was reached (bd-2kr).
     origin: Origin,
+    reason_class: ReasonClass,
+}
+
+/// How a path came to be judged (bd-29r): read by something veil recognises as
+/// a reader, or merely named in the words of some other command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReasonClass {
+    DirectRead,
+    ArgvPath,
+}
+
+impl ReasonClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectRead => "direct_read",
+            Self::ArgvPath => "argv_path",
+        }
+    }
 }
 
 const BARE_INVOCATION_GUIDANCE: &str = "no hook payload received on stdin; bare `veil` is hook mode. Pipe a Claude/Gemini/Copilot hook payload into stdin, or run `veil --robot-triage`, `veil capabilities --json`, or `veil robot-docs guide` for operator discovery. For help with veil, run `veil --help`.";
@@ -142,7 +159,9 @@ fn evaluate_commands(
     registry: &PackRegistry,
     commands: &[CommandExtraction],
 ) -> Vec<CandidateOutcome> {
-    let protected_matcher = SafePathMatcher::from_patterns(config.sensitivity.protected.iter());
+    // Built once: a command can name dozens of paths, and building the
+    // matchers is linear in the number of configured patterns.
+    let matchers = PolicyMatchers::new(config);
     let mut outcomes = Vec::new();
 
     for command in commands {
@@ -150,16 +169,13 @@ fn evaluate_commands(
         let mut candidates = command.candidates.clone();
 
         if candidates.is_empty()
+            && command.argv_paths.is_empty()
             && let Some(invocation) = spine_invocation.as_ref()
         {
             candidates.push(invocation.target_path.clone());
         }
 
         for path in &candidates {
-            let directory_sensitive = protected_matcher.is_safe(path);
-            let sensitivity = registry
-                .classify(path, directory_sensitive)
-                .map(|result| result.pack);
             let mut evaluation_input =
                 EvaluationInput::new(hook_input.tool, path.clone(), command.exposure);
 
@@ -169,14 +185,71 @@ fn evaluate_commands(
 
             outcomes.push(CandidateOutcome {
                 path: path.clone(),
-                decision: evaluate_access(&evaluation_input, config, registry),
-                sensitivity,
+                decision: evaluate_access_with(&evaluation_input, config, registry, &matchers),
+                sensitivity: sensitivity_pack(registry, &matchers, path),
                 origin: command.origin,
+                reason_class: ReasonClass::DirectRead,
+            });
+        }
+
+        let program = command.argv.first().map(|word| command_basename(word));
+
+        for argv in &command.argv_paths {
+            // Past the filesystem budget a word is only text, so it is judged
+            // only if the text already matches a protected pattern.
+            if !argv.resolved && !matchers.is_protected(&argv.path) {
+                continue;
+            }
+
+            let mut evaluation_input =
+                EvaluationInput::new(hook_input.tool, argv.path.clone(), command.argv_exposure)
+                    .with_argv_command(program.unwrap_or(""), command.argv_scans_directories);
+            if argv.resolved {
+                evaluation_input = evaluation_input.with_canonical_path();
+            }
+
+            // An authorized spine tool is authorized for every path it names.
+            if let Some(invocation) = spine_invocation.as_ref() {
+                evaluation_input =
+                    evaluation_input.with_spine_invocation(invocation.for_path(argv.path.clone()));
+            }
+
+            let decision = evaluate_access_with(&evaluation_input, config, registry, &matchers);
+
+            // A word that is not protected is the common case (`git commit -m
+            // a/b`, `sed s/a/b/`); it is neither blocked nor worth a record.
+            if decision.action == DecisionAction::Allow && decision.reason.is_none() {
+                continue;
+            }
+
+            outcomes.push(CandidateOutcome {
+                path: argv.path.clone(),
+                decision,
+                sensitivity: sensitivity_pack(registry, &matchers, &argv.path),
+                origin: command.origin,
+                reason_class: ReasonClass::ArgvPath,
             });
         }
     }
 
     outcomes
+}
+
+fn sensitivity_pack(
+    registry: &PackRegistry,
+    matchers: &PolicyMatchers,
+    path: &Path,
+) -> Option<String> {
+    registry
+        .classify(path, matchers.is_protected(path))
+        .map(|result| result.pack)
+}
+
+fn command_basename(program: &str) -> &str {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
 }
 
 fn detect_spine(
@@ -245,6 +318,7 @@ fn append_audit_records(
                 confidence: outcome.decision.confidence,
                 session_id: hook_input.session_id.clone(),
                 origin: Some(outcome.origin.as_str().to_owned()),
+                reason_class: Some(outcome.reason_class.as_str().to_owned()),
             },
         )?;
     }
@@ -560,5 +634,143 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
+    }
+
+    /// Extract, evaluate and select for one Bash command, the work the hook does
+    /// after it has read the payload and the config.
+    fn judge(command: &str, repo_root: &Path, config: &config::Config) -> (Decision, usize) {
+        let hook_input = HookInput {
+            protocol: types::HookProtocol::ClaudeCode,
+            tool: ToolKind::Bash,
+            cwd: repo_root.to_path_buf(),
+            session_id: None,
+            raw_args: serde_json::json!({ "command": command }).to_string(),
+        };
+        let registry = PackRegistry::with_built_ins();
+        let commands = extract_commands(&hook_input);
+        let outcomes = evaluate_commands(&hook_input, config, &registry, &commands);
+
+        (select_decision(&outcomes), outcomes.len())
+    }
+
+    #[test]
+    fn a_command_that_names_sixty_four_files_is_judged_in_about_a_millisecond() {
+        let repo_root = unique_temp_dir("hook-64-words");
+        configure_repo(&repo_root, &["data/**"]);
+        fs::create_dir_all(repo_root.join("data")).expect("data dir");
+        fs::create_dir_all(repo_root.join("src")).expect("src dir");
+        let mut words = Vec::new();
+        for index in 0..63 {
+            let name = format!("src/file{index}.rs");
+            fs::write(repo_root.join(&name), "fn f() {}\n").expect("source file");
+            words.push(name);
+        }
+        let repo_root = fs::canonicalize(&repo_root).expect("canonical root");
+        let config = load_config(&repo_root).expect("config should load");
+        let clean = format!("awk 1 {}", words.join(" "));
+        let dirty = format!("{clean} data/clients.csv");
+
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..50 {
+            let start = std::time::Instant::now();
+            let (decision, _) = judge(&clean, &repo_root, &config);
+            best = best.min(start.elapsed());
+            assert_eq!(decision.action, DecisionAction::Allow);
+        }
+        let (decision, records) = judge(&dirty, &repo_root, &config);
+
+        // Where the time goes, best of 50 for each stage.
+        let hook_input = HookInput {
+            protocol: types::HookProtocol::ClaudeCode,
+            tool: ToolKind::Bash,
+            cwd: repo_root.clone(),
+            session_id: None,
+            raw_args: serde_json::json!({ "command": clean }).to_string(),
+        };
+        let stage = |work: &mut dyn FnMut()| {
+            (0..50)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    work();
+                    start.elapsed()
+                })
+                .min()
+                .expect("fifty runs")
+        };
+        let registry_time = stage(&mut || drop(PackRegistry::with_built_ins()));
+        let registry = PackRegistry::with_built_ins();
+        let extract_time = stage(&mut || drop(extract_commands(&hook_input)));
+        let commands = extract_commands(&hook_input);
+        let evaluate_time = stage(&mut || {
+            drop(evaluate_commands(
+                &hook_input,
+                &config,
+                &registry,
+                &commands,
+            ))
+        });
+        eprintln!(
+            "64 words, 1 pattern: whole {best:?} = registry {registry_time:?} + extract {extract_time:?} + evaluate {evaluate_time:?}"
+        );
+        assert_eq!(decision.action, DecisionAction::Deny);
+        assert_eq!(records, 1, "only the protected word is worth a record");
+        // About 1 ms in a release build for the most words one command gets
+        // resolved (a typical command names a few and takes a tenth of that).
+        // The bound is a guard against a regression, loose enough for a debug
+        // build on a busy machine; the measurement is in the line above.
+        let bound = if cfg!(debug_assertions) { 20 } else { 3 };
+        assert!(
+            best < std::time::Duration::from_millis(bound),
+            "judging 63 clean words took {best:?}"
+        );
+    }
+
+    #[test]
+    fn ten_thousand_protected_patterns_do_not_slow_a_command_by_the_number_of_patterns() {
+        let repo_root = unique_temp_dir("hook-10k");
+        fs::create_dir_all(repo_root.join("src")).expect("src dir");
+        let audit_path = repo_root.join("state").join("audit.jsonl");
+        let patterns = (0..10_000)
+            .map(|index| format!("\"zone{index}/**\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        fs::write(
+            repo_root.join(".veil.toml"),
+            format!(
+                "[sensitivity]\nprotected = [{patterns}]\n\n[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
+                audit_path.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("config should be written");
+        let mut words = Vec::new();
+        for index in 0..63 {
+            let name = format!("src/file{index}.rs");
+            fs::write(repo_root.join(&name), "fn f() {}\n").expect("source file");
+            words.push(name);
+        }
+        let repo_root = fs::canonicalize(&repo_root).expect("canonical root");
+        let config = load_config(&repo_root).expect("config should load");
+        // the config adds a few built-in patterns to the 10,000 above
+        assert!(config.sensitivity.protected.len() >= 10_000);
+        let clean = format!("awk 1 {}", words.join(" "));
+        let dirty = format!("{clean} zone9999/x.csv");
+
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..20 {
+            let start = std::time::Instant::now();
+            let (decision, _) = judge(&clean, &repo_root, &config);
+            best = best.min(start.elapsed());
+            assert_eq!(decision.action, DecisionAction::Allow);
+        }
+        let (decision, _) = judge(&dirty, &repo_root, &config);
+
+        // The matchers are built once per command: that build, not a lookup per
+        // word, is what the patterns cost.
+        eprintln!("64 words, 10k patterns: {best:?}");
+        assert_eq!(decision.action, DecisionAction::Deny);
+        assert!(
+            best < std::time::Duration::from_millis(100),
+            "judging 63 clean words against 10,000 patterns took {best:?}"
+        );
     }
 }

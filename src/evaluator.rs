@@ -14,6 +14,8 @@ const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. Run `veil operator` 
 
 const RAW_FLAG_REMEDIATION: &str = "Raw-value flag blocked. Re-run the spine tool without it so its output stays metadata-only, or run `veil operator` to discover the authorized spine tools and the metadata-safe path for this file. Do not look for another way to see the raw values; if no metadata-safe path fits, stop and ask the operator.";
 
+const ARGV_PATH_REMEDIATION: &str = "Command names a protected path. Run `veil operator` to discover the authorized spine tools available in this repo, then choose the right metadata-safe path for this file. Do not copy, convert, archive or upload the protected file to get around this; if no listed tool fits, stop and ask the operator.";
+
 const DIRECTORY_SEARCH_REMEDIATION: &str = "Content search blocked: this directory holds, or may hold, protected data. Search a narrower directory that holds none, or ask for file names or counts only (Grep output_mode files_with_matches or count; `grep -l` or `grep -c`). Run `veil operator` to discover the authorized spine tools for protected data. Do not look for another way to read it; if no listed tool fits, stop and ask the operator.";
 
 /// How many directory entries a content search of one directory makes veil
@@ -28,6 +30,16 @@ pub struct EvaluationInput {
     pub path: PathBuf,
     pub exposure: PathExposure,
     pub spine_invocation: Option<SpineInvocation>,
+    /// Set when the path is named in the words of a command that is not a
+    /// recognised reader (`awk 1 x.csv`, `cp x.csv /tmp`): the command's name.
+    /// The decision is the same; the reason says so (bd-29r).
+    pub argv_command: Option<String>,
+    /// Whether a directory path stands for everything beneath it. True unless
+    /// the command only names the directory without reading it as a tree.
+    pub scan_directories: bool,
+    /// The path is already canonical, as the extractor leaves one it resolved,
+    /// so the evaluator does not walk it again.
+    pub canonical: bool,
 }
 
 impl EvaluationInput {
@@ -40,12 +52,52 @@ impl EvaluationInput {
             path: path.into(),
             exposure,
             spine_invocation: None,
+            argv_command: None,
+            scan_directories: true,
+            canonical: false,
         }
+    }
+
+    /// Says the path has already been resolved against the filesystem.
+    pub fn with_canonical_path(mut self) -> Self {
+        self.canonical = true;
+        self
     }
 
     pub fn with_spine_invocation(mut self, invocation: SpineInvocation) -> Self {
         self.spine_invocation = Some(invocation);
         self
+    }
+
+    /// Marks the path as one a command names in its words, not one a reader
+    /// reads. `scan_directories` says whether naming a directory names its tree.
+    pub fn with_argv_command(mut self, command: &str, scan_directories: bool) -> Self {
+        self.argv_command = Some(command.to_owned());
+        self.scan_directories = scan_directories;
+        self
+    }
+}
+
+/// The matchers one hook run builds from the config and reuses for every path
+/// it judges. Building them is linear in the number of patterns, so a command
+/// that names many paths must not rebuild them per path.
+#[derive(Clone, Debug)]
+pub struct PolicyMatchers {
+    protected: SafePathMatcher,
+    allowlist: SafePathMatcher,
+}
+
+impl PolicyMatchers {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            protected: SafePathMatcher::from_patterns(config.sensitivity.protected.iter()),
+            allowlist: SafePathMatcher::from_patterns(config.allowlist.safe_patterns.iter()),
+        }
+    }
+
+    /// Whether `path` is covered by `[sensitivity] protected`.
+    pub fn is_protected(&self, path: &Path) -> bool {
+        self.protected.is_safe(path)
     }
 }
 
@@ -54,15 +106,29 @@ pub fn evaluate_access(
     config: &Config,
     registry: &PackRegistry,
 ) -> Decision {
+    evaluate_access_with(input, config, registry, &PolicyMatchers::new(config))
+}
+
+/// [`evaluate_access`] with matchers built once by the caller.
+pub fn evaluate_access_with(
+    input: &EvaluationInput,
+    config: &Config,
+    registry: &PackRegistry,
+    matchers: &PolicyMatchers,
+) -> Decision {
     // Canonicalize the path to resolve symlinks and hardlinks before matching.
     // This ensures that an attacker cannot bypass protected-path patterns by
     // creating a hardlink or symlink outside the protected directory that
     // points to a file inside it.  If the file does not exist on disk,
     // canonicalization will fail and we fall back to the original path.
-    let canonical_input = canonicalize_input(input);
+    let canonical_input = if input.canonical {
+        None
+    } else {
+        canonicalize_input(input)
+    };
     let effective = canonical_input.as_ref().unwrap_or(input);
 
-    evaluate_access_with_classifier(effective, config, |directory_sensitive| {
+    evaluate_with_matchers(effective, config, matchers, |directory_sensitive| {
         Ok(registry.classify(&effective.path, directory_sensitive))
     })
 }
@@ -76,16 +142,27 @@ fn canonicalize_input(input: &EvaluationInput) -> Option<EvaluationInput> {
         return None;
     }
     Some(EvaluationInput {
-        tool: input.tool,
         path: canonical,
-        exposure: input.exposure,
-        spine_invocation: input.spine_invocation.clone(),
+        ..input.clone()
     })
 }
 
+#[cfg(test)]
 fn evaluate_access_with_classifier<F>(
     input: &EvaluationInput,
     config: &Config,
+    classify: F,
+) -> Decision
+where
+    F: FnOnce(bool) -> Result<Option<SensitivityResult>, EvaluationFailure>,
+{
+    evaluate_with_matchers(input, config, &PolicyMatchers::new(config), classify)
+}
+
+fn evaluate_with_matchers<F>(
+    input: &EvaluationInput,
+    config: &Config,
+    matchers: &PolicyMatchers,
     classify: F,
 ) -> Decision
 where
@@ -95,13 +172,18 @@ where
         return deny_device_path();
     }
 
-    let directory_sensitive = is_protected_path(&input.path, &config.sensitivity.protected);
+    let directory_sensitive = matchers.is_protected(&input.path);
 
     // A content search of a directory reads every file beneath it, so it is a
     // read of whatever protected paths sit under it. Like the checks below it
     // outranks the allowlist.
     if !directory_sensitive
-        && let Some(decision) = directory_scope_decision(input, config, DIRECTORY_SCOPE_MAX_ENTRIES)
+        && let Some(decision) = directory_scope_with(
+            input,
+            config,
+            &matchers.protected,
+            DIRECTORY_SCOPE_MAX_ENTRIES,
+        )
     {
         return decision;
     }
@@ -111,11 +193,8 @@ where
     // inside a protected directory — otherwise an overly broad safe_pattern
     // (e.g. "*.json") could allow access to sensitive protected-directory
     // files like "data/clients/credentials.json".
-    if !directory_sensitive {
-        let allowlist = SafePathMatcher::from_patterns(config.allowlist.safe_patterns.iter());
-        if allowlist.is_safe(&input.path) {
-            return allow_silent();
-        }
+    if !directory_sensitive && matchers.allowlist.is_safe(&input.path) {
+        return allow_silent();
     }
 
     let classification = match classify(directory_sensitive) {
@@ -169,15 +248,23 @@ where
             );
         }
 
-        return resolve_policy(
-            &config.policy.default,
-            Some(sensitivity),
-            format!(
-                "direct read of a path matched by {} is blocked by policy default",
-                sensitivity.pack
+        return match input.argv_command.as_deref() {
+            Some(command) => resolve_policy(
+                &config.policy.default,
+                Some(sensitivity),
+                argv_path_reason(command, &format!("a path matched by {}", sensitivity.pack)),
+                ARGV_PATH_REMEDIATION,
             ),
-            DIRECT_READ_REMEDIATION,
-        );
+            None => resolve_policy(
+                &config.policy.default,
+                Some(sensitivity),
+                format!(
+                    "direct read of a path matched by {} is blocked by policy default",
+                    sensitivity.pack
+                ),
+                DIRECT_READ_REMEDIATION,
+            ),
+        };
     }
 
     if directory_sensitive {
@@ -211,15 +298,33 @@ where
             );
         }
 
-        return resolve_policy(
-            &config.policy.default,
-            None,
-            "direct read inside a protected directory is blocked by policy default".to_owned(),
-            DIRECT_READ_REMEDIATION,
-        );
+        return match input.argv_command.as_deref() {
+            Some(command) => resolve_policy(
+                &config.policy.default,
+                None,
+                argv_path_reason(command, "a path inside a protected directory"),
+                ARGV_PATH_REMEDIATION,
+            ),
+            None => resolve_policy(
+                &config.policy.default,
+                None,
+                "direct read inside a protected directory is blocked by policy default".to_owned(),
+                DIRECT_READ_REMEDIATION,
+            ),
+        };
     }
 
     allow_silent()
+}
+
+/// Why a command that is not a recognised reader was blocked for naming a path.
+/// Files carry a label (`public < derived < protected`) and the agent's
+/// clearance is `derived`, so a path matched by `[sensitivity] protected` or by
+/// a sensitive pack carries `protected` (docs/plan.md, "Formal model").
+fn argv_path_reason(command: &str, subject: &str) -> String {
+    format!(
+        "`{command}` names {subject} (label: protected) and is not an authorized spine tool, so it is blocked by policy default"
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,7 +344,7 @@ const BLOCKED_DEVICE_PREFIXES: &[&str] = &[
     "/proc/self/fd/",
 ];
 
-fn is_blocked_device_path(path: &Path) -> bool {
+pub(crate) fn is_blocked_device_path(path: &Path) -> bool {
     let raw = path.to_string_lossy();
     BLOCKED_DEVICE_PREFIXES
         .iter()
@@ -259,40 +364,67 @@ fn deny_device_path() -> Decision {
     }
 }
 
-fn is_protected_path(path: &Path, protected_patterns: &[String]) -> bool {
-    if protected_patterns.is_empty() {
-        return false;
-    }
-
-    SafePathMatcher::from_patterns(protected_patterns.iter()).is_safe(path)
-}
-
 /// The decision for a content search of a directory that holds protected
 /// paths, or whose contents veil cannot inspect within `max_entries`. `None`
 /// means this check has nothing to say: the input does not read contents, is
 /// not an existing directory, or the directory holds nothing protected.
+#[cfg(test)]
 fn directory_scope_decision(
     input: &EvaluationInput,
     config: &Config,
     max_entries: usize,
 ) -> Option<Decision> {
+    let matcher = SafePathMatcher::from_patterns(config.sensitivity.protected.iter());
+    directory_scope_with(input, config, &matcher, max_entries)
+}
+
+fn directory_scope_with(
+    input: &EvaluationInput,
+    config: &Config,
+    matcher: &SafePathMatcher,
+    max_entries: usize,
+) -> Option<Decision> {
     if input.exposure != PathExposure::ReadsContents
+        || !input.scan_directories
         || config.sensitivity.protected.is_empty()
         || !input.path.is_dir()
     {
         return None;
     }
 
-    let matcher = SafePathMatcher::from_patterns(config.sensitivity.protected.iter());
-    let reason = match matcher.scan_directory(&input.path, max_entries) {
-        DirectoryScan::Clear => return None,
-        DirectoryScan::Protected(_) => "a content search of this directory would read paths \
-             covered by [sensitivity] protected, and is blocked by policy default"
-            .to_owned(),
-        DirectoryScan::Unverified { max_entries } => format!(
-            "this directory holds more than {max_entries} entries, so veil cannot show that a \
-             content search of it would not read paths covered by [sensitivity] protected; \
-             blocked by policy default"
+    let (reason, remediation) = match (
+        matcher.scan_directory(&input.path, max_entries),
+        input.argv_command.as_deref(),
+    ) {
+        (DirectoryScan::Clear, _) => return None,
+        (DirectoryScan::Protected(_), None) => (
+            "a content search of this directory would read paths covered by \
+             [sensitivity] protected, and is blocked by policy default"
+                .to_owned(),
+            DIRECTORY_SEARCH_REMEDIATION,
+        ),
+        (DirectoryScan::Protected(_), Some(command)) => (
+            argv_path_reason(
+                command,
+                "a directory that holds paths covered by [sensitivity] protected",
+            ),
+            ARGV_PATH_REMEDIATION,
+        ),
+        (DirectoryScan::Unverified { max_entries }, None) => (
+            format!(
+                "this directory holds more than {max_entries} entries, so veil cannot show that a \
+                 content search of it would not read paths covered by [sensitivity] protected; \
+                 blocked by policy default"
+            ),
+            DIRECTORY_SEARCH_REMEDIATION,
+        ),
+        (DirectoryScan::Unverified { max_entries }, Some(command)) => (
+            format!(
+                "`{command}` names a directory that holds more than {max_entries} entries, so veil \
+                 cannot show that it holds nothing covered by [sensitivity] protected \
+                 (label: protected); blocked by policy default"
+            ),
+            ARGV_PATH_REMEDIATION,
         ),
     };
 
@@ -300,7 +432,7 @@ fn directory_scope_decision(
         &config.policy.default,
         None,
         reason,
-        DIRECTORY_SEARCH_REMEDIATION,
+        remediation,
     ))
 }
 

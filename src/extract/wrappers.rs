@@ -264,7 +264,7 @@ const DENO: Options = Options {
     ],
 };
 
-const SHELLS: &[&str] = &[
+pub(super) const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh",
 ];
 

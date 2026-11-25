@@ -61,6 +61,18 @@ pub struct SpineInvocation {
     pub denied_flag: Option<String>,
 }
 
+impl SpineInvocation {
+    /// The same invocation, judged for another path its command names. An
+    /// authorized spine tool is authorized for everything its words name, not
+    /// only the first path (bd-29r); a denied flag still applies to all of it.
+    pub fn for_path(&self, path: PathBuf) -> Self {
+        Self {
+            target_path: path,
+            ..self.clone()
+        }
+    }
+}
+
 pub fn detect_spine_invocation(
     command: &str,
     authorized_tools: &[String],
