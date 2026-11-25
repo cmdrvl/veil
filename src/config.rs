@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::allowlist::DEFAULT_SAFE_PATTERNS;
+use crate::protected_corpus::CorpusLimits;
 use crate::spine::DeniedFlags;
 
 const DEFAULT_AUTHORIZED_TOOLS: &[&str] = &[
@@ -55,6 +56,8 @@ pub struct Config {
     pub allowlist: AllowlistConfig,
     pub spine: SpineConfig,
     pub policy: PolicyConfig,
+    /// `[protected_corpus]`: how much a protected-corpus filter build may read.
+    pub protected_corpus: CorpusLimits,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +190,7 @@ impl Config {
                 audit_path: default_audit_path(home, xdg_state_home)?,
                 require_dcg: false,
             },
+            protected_corpus: CorpusLimits::default(),
         })
     }
 
@@ -233,6 +237,24 @@ impl Config {
 
             if let Some(require_dcg) = policy.require_dcg {
                 self.policy.require_dcg = require_dcg;
+            }
+        }
+
+        if let Some(corpus) = partial.protected_corpus {
+            if let Some(max_files) = corpus.max_files {
+                self.protected_corpus.max_files = max_files;
+            }
+
+            if let Some(max_bytes) = corpus.max_bytes {
+                self.protected_corpus.max_bytes = max_bytes;
+            }
+
+            if let Some(max_file_bytes) = corpus.max_file_bytes {
+                self.protected_corpus.max_file_bytes = max_file_bytes;
+            }
+
+            if let Some(max_walk_entries) = corpus.max_walk_entries {
+                self.protected_corpus.max_walk_entries = max_walk_entries;
             }
         }
     }
@@ -284,6 +306,7 @@ struct PartialConfig {
     allowlist: Option<PartialAllowlistConfig>,
     spine: Option<PartialSpineConfig>,
     policy: Option<PartialPolicyConfig>,
+    protected_corpus: Option<PartialProtectedCorpusConfig>,
 }
 
 impl PartialConfig {
@@ -318,6 +341,7 @@ impl PartialConfig {
             } else {
                 None
             },
+            protected_corpus: None,
         })
     }
 }
@@ -353,6 +377,17 @@ struct PartialPolicyConfig {
     require_dcg: Option<bool>,
 }
 
+/// `[protected_corpus]`: limits for the one-way filter that `veil sandbox
+/// --egress airlock` builds over `[sensitivity] protected` files.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartialProtectedCorpusConfig {
+    max_files: Option<usize>,
+    max_bytes: Option<u64>,
+    max_file_bytes: Option<u64>,
+    max_walk_entries: Option<usize>,
+}
+
 fn load_optional_config(
     path: &Path,
     layer_name: &str,
@@ -376,8 +411,25 @@ fn load_optional_config(
 
 /// Rejects `[spine.denied_flags]` entries that could never match an argument,
 /// so a typo like `explicit` (missing dashes) fails loudly instead of leaving
-/// the flag silently allowed.
+/// the flag silently allowed. Also rejects a zero `[protected_corpus]` limit,
+/// which would silently build no filter.
 fn validate_partial(config: &PartialConfig) -> Result<(), String> {
+    if let Some(corpus) = config.protected_corpus.as_ref() {
+        for (name, value) in [
+            ("max_files", corpus.max_files.map(|value| value as u64)),
+            ("max_bytes", corpus.max_bytes),
+            ("max_file_bytes", corpus.max_file_bytes),
+            (
+                "max_walk_entries",
+                corpus.max_walk_entries.map(|value| value as u64),
+            ),
+        ] {
+            if value == Some(0) {
+                return Err(format!("protected_corpus.{name} must be greater than zero"));
+            }
+        }
+    }
+
     let Some(denied_flags) = config
         .spine
         .as_ref()
@@ -810,6 +862,105 @@ mod tests {
     }
 
     #[test]
+    fn protected_corpus_limits_default_and_layer_like_other_sections() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let defaults = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            None,
+            None,
+            PartialConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(defaults.protected_corpus, CorpusLimits::default());
+
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+        let layered = load_for_test(
+            &repo_root,
+            &home,
+            Some(
+                r#"
+                [protected_corpus]
+                max_files = 10
+                max_bytes = 1000
+                "#,
+            ),
+            Some(
+                r#"
+                [protected_corpus]
+                max_files = 20
+                "#,
+            ),
+            Some(
+                r#"
+                [protected_corpus]
+                max_file_bytes = 500
+                max_walk_entries = 99
+                "#,
+            ),
+            PartialConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            layered.protected_corpus,
+            CorpusLimits {
+                max_files: 20,
+                max_bytes: 1000,
+                max_file_bytes: 500,
+                max_walk_entries: 99,
+            },
+            "user overrides system per key; project and system keys survive"
+        );
+    }
+
+    #[test]
+    fn protected_corpus_rejects_zero_limits_and_unknown_keys() {
+        for (contents, needle) in [
+            (
+                "[protected_corpus]\nmax_files = 0\n",
+                "protected_corpus.max_files must be greater than zero",
+            ),
+            (
+                "[protected_corpus]\nmax_bytes = 0\n",
+                "protected_corpus.max_bytes must be greater than zero",
+            ),
+            (
+                "[protected_corpus]\nmax_file_bytes = 0\n",
+                "protected_corpus.max_file_bytes must be greater than zero",
+            ),
+            (
+                "[protected_corpus]\nmax_walk_entries = 0\n",
+                "protected_corpus.max_walk_entries must be greater than zero",
+            ),
+            ("[protected_corpus]\nmax_filez = 5\n", "unknown field"),
+        ] {
+            let repo_root = unique_temp_root("repo");
+            let home = unique_temp_root("home");
+
+            let error = load_for_test(
+                &repo_root,
+                &home,
+                None,
+                None,
+                Some(contents),
+                PartialConfig::default(),
+            )
+            .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains(needle),
+                "{contents:?} gave {error}"
+            );
+        }
+    }
+
+    #[test]
     fn system_layer_loads_when_present() {
         let repo_root = unique_temp_root("repo");
         let home = unique_temp_root("home");
@@ -1186,6 +1337,7 @@ mod tests {
                 audit_path: None,
                 require_dcg: None,
             }),
+            protected_corpus: None,
         };
 
         let config = load_for_test(
@@ -1235,6 +1387,7 @@ mod tests {
                 audit_path: Some(home.join("custom/audit.jsonl")),
                 require_dcg: None,
             }),
+            protected_corpus: None,
         };
 
         let config = load_for_test(
@@ -1356,6 +1509,7 @@ mod tests {
             allowlist: None,
             spine: None,
             policy: None,
+            protected_corpus: None,
         };
 
         let config = load_for_test(

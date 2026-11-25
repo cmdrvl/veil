@@ -7,6 +7,7 @@ pub mod evaluator;
 pub mod extract;
 pub mod hook;
 pub mod packs;
+pub mod protected_corpus;
 pub mod render;
 pub mod spine;
 pub mod types;

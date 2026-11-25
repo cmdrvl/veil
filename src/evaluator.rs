@@ -344,6 +344,7 @@ mod tests {
 
     use crate::allowlist::DEFAULT_SAFE_PATTERNS;
     use crate::config::{AllowlistConfig, PolicyConfig, SensitivityConfig, SpineConfig};
+    use crate::protected_corpus::CorpusLimits;
     use crate::spine::DeniedFlags;
 
     fn fixture_config() -> Config {
@@ -367,6 +368,7 @@ mod tests {
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
             },
+            protected_corpus: CorpusLimits::default(),
         }
     }
 
@@ -667,6 +669,7 @@ mod tests {
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
             },
+            protected_corpus: CorpusLimits::default(),
         };
 
         let decision = evaluate_access_with_classifier(
@@ -711,6 +714,7 @@ mod tests {
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
             },
+            protected_corpus: CorpusLimits::default(),
         };
 
         let decision = evaluate_access_with_classifier(
@@ -754,6 +758,7 @@ mod tests {
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
             },
+            protected_corpus: CorpusLimits::default(),
         };
 
         let decision =
@@ -784,6 +789,7 @@ mod tests {
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
             },
+            protected_corpus: CorpusLimits::default(),
         };
 
         let input = EvaluationInput::new(
@@ -858,6 +864,7 @@ mod tests {
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
             },
+            protected_corpus: CorpusLimits::default(),
         };
 
         // The alias path is outside the protected directory, but because it is
@@ -927,6 +934,7 @@ mod tests {
                 audit_path: PathBuf::from("/tmp/veil-audit.jsonl"),
                 require_dcg: false,
             },
+            protected_corpus: CorpusLimits::default(),
         };
 
         // The symlink is outside the protected dir, but canonicalization should
