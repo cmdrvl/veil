@@ -1408,6 +1408,12 @@ fn collect_input_redirect_paths(args: &[String]) -> Vec<String> {
     while index < args.len() {
         let arg = &args[index];
 
+        // Every form below starts with `<` or is `0<`: most arguments are neither.
+        if !matches!(arg.as_bytes().first(), Some(b'<' | b'0')) {
+            index += 1;
+            continue;
+        }
+
         if arg.starts_with("<<") {
             index += 1;
             continue;

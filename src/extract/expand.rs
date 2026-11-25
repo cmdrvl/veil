@@ -17,6 +17,7 @@
 //! in text order with no scoping: `(f=x); cat $f` sees `f=x` although a shell
 //! would not. That errs toward judging more, not less.
 
+use std::cell::{Cell, OnceCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -36,11 +37,19 @@ pub struct ShellEnv {
     pub home: Option<String>,
 }
 
+/// How many unresolved words of one command keep the text they were written
+/// with. A reason or an audit record names one word, so the rest only have to
+/// say that they are unresolved; naming all of them would let a long command
+/// of `$x` words cost an allocation each.
+pub(super) const MAX_NAMED_UNRESOLVED: usize = 8;
+
 /// One word after expansion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Word {
     pub text: String,
-    /// The word as it was written, when something in it could not be resolved.
+    /// Set when something in the word could not be resolved: the word as it was
+    /// written for the first [`MAX_NAMED_UNRESOLVED`] of a command, an empty
+    /// string after that.
     pub unresolved: Option<String>,
 }
 
@@ -51,8 +60,14 @@ pub(super) struct Vars {
     /// The loop variables of `for name in words; do ...; done` whose words are
     /// all known: a word that uses one stands for each value in turn.
     loops: BTreeMap<String, Vec<String>>,
-    /// Names whose value cannot be known from the text.
-    unknown: BTreeSet<String>,
+    /// Unresolved words named so far by the current call of [`Vars::words`].
+    named: Cell<usize>,
+    /// The command string the names below are worked out from.
+    command: String,
+    /// Names whose value cannot be known from the text. Worked out the first
+    /// time a name that has a value is asked about: a command that sets no
+    /// variable and loops over nothing never pays for it.
+    unknown: OnceCell<BTreeSet<String>>,
 }
 
 /// What `$name` is looked up in while one word is read: the caller's shell,
@@ -77,8 +92,15 @@ impl Vars {
         Self {
             values: BTreeMap::new(),
             loops: BTreeMap::new(),
-            unknown: unknowable_names(command),
+            named: Cell::new(0),
+            command: command.to_owned(),
+            unknown: OnceCell::new(),
         }
+    }
+
+    /// Every name that cannot be trusted, worked out from the command string.
+    fn unknown(&self) -> &BTreeSet<String> {
+        self.unknown.get_or_init(|| unknowable_names(&self.command))
     }
 
     /// Records `name=value` for the words that follow. `None` means the value
@@ -86,7 +108,7 @@ impl Vars {
     pub(super) fn assign(&mut self, name: &str, value: Option<String>) {
         self.loops.remove(name);
         match value {
-            Some(value) if !self.unknown.contains(name) => {
+            Some(value) if !self.unknown().contains(name) => {
                 self.values.insert(name.to_owned(), value);
             }
             _ => {
@@ -101,7 +123,7 @@ impl Vars {
     pub(super) fn assign_loop(&mut self, name: &str, values: Option<Vec<String>>) {
         self.values.remove(name);
         match values {
-            Some(values) if !self.unknown.contains(name) && values.len() <= MAX_BRACE_WORDS => {
+            Some(values) if !self.unknown().contains(name) && values.len() <= MAX_BRACE_WORDS => {
                 self.loops.insert(name.to_owned(), values);
             }
             _ => {
@@ -113,15 +135,18 @@ impl Vars {
     /// Sets `pairs` for one command only (`f=x sh -c 'cat $f'`), and returns what
     /// [`Vars::restore`] needs to put things back.
     pub(super) fn scoped(&mut self, pairs: &[(String, String)]) -> Vec<(String, Option<String>)> {
+        if pairs.is_empty() {
+            return Vec::new();
+        }
+
+        // the two fields are borrowed apart: `values` changes while `unknown` is read
+        let unknown = self.unknown.get_or_init(|| unknowable_names(&self.command));
+        let values = &mut self.values;
+
         pairs
             .iter()
-            .filter(|(name, _)| !self.unknown.contains(name))
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    self.values.insert(name.clone(), value.clone()),
-                )
-            })
+            .filter(|(name, _)| !unknown.contains(name))
+            .map(|(name, value)| (name.clone(), values.insert(name.clone(), value.clone())))
             .collect()
     }
 
@@ -139,33 +164,41 @@ impl Vars {
     }
 
     fn lookup(&self, name: &str, env: &ShellEnv, binding: &[(&str, &str)]) -> Option<String> {
-        if self.unknown.contains(name) {
-            return None;
-        }
-        if let Some((_, value)) = binding.iter().find(|(bound, _)| *bound == name) {
-            return Some((*value).to_owned());
-        }
-        if let Some(value) = self.values.get(name) {
-            return Some(value.clone());
-        }
+        let known = if let Some((_, value)) = binding.iter().find(|(bound, _)| *bound == name) {
+            Some((*value).to_owned())
+        } else if let Some(value) = self.values.get(name) {
+            Some(value.clone())
+        } else {
+            match name {
+                "HOME" => env.home.clone(),
+                "PWD" => env
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| cwd.to_string_lossy().into_owned()),
+                _ => None,
+            }
+        };
 
-        match name {
-            "HOME" => env.home.clone(),
-            "PWD" => env
-                .cwd
-                .as_ref()
-                .map(|cwd| cwd.to_string_lossy().into_owned()),
-            _ => None,
-        }
+        // A name with no value needs no second opinion on whether to trust it.
+        known.filter(|_| !self.unknown().contains(name))
     }
 
     /// The words `raw` (as [`raw_words`] split them) become: braces expanded,
     /// variables and `~` substituted, quotes removed.
     pub(super) fn words(&self, raw: &[&str], env: &ShellEnv) -> Option<Vec<Word>> {
+        self.named.set(0);
         let mut words = Vec::with_capacity(raw.len());
 
         for &written in raw {
-            if !needs_expansion(written) {
+            if self.is_unresolved_on_its_own(written) {
+                // `$name` that nothing sets, or a lone `$( )` result: the word
+                // reads as itself and cannot be resolved, which is all the
+                // general path below would make of it.
+                words.push(Word {
+                    text: written.to_owned(),
+                    unresolved: Some(self.named_unresolved(written)),
+                });
+            } else if !needs_expansion(written) {
                 // Most words are plain text: nothing to expand or to unquote.
                 words.push(Word {
                     text: written.to_owned(),
@@ -253,7 +286,7 @@ impl Vars {
                 continue;
             }
             if let Some((known, _)) = self.loops.get_key_value(name)
-                && !self.unknown.contains(name)
+                && !self.unknown().contains(name)
                 && !used.contains(&known.as_str())
             {
                 used.push(known.as_str());
@@ -280,11 +313,44 @@ impl Vars {
             return Some(());
         }
 
+        let unresolved = (processed.unresolved || too_many).then(|| self.named_unresolved(written));
         words.push(Word {
             text: processed.text,
-            unresolved: (processed.unresolved || too_many).then(|| written.to_owned()),
+            unresolved,
         });
         Some(())
+    }
+
+    /// What an unresolved word is reported with: the word as written, for the
+    /// first [`MAX_NAMED_UNRESOLVED`] words of a command, and nothing after.
+    fn named_unresolved(&self, written: &str) -> String {
+        let named = self.named.get();
+        if named < MAX_NAMED_UNRESOLVED {
+            self.named.set(named + 1);
+            written.to_owned()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Whether `written` is a lone `$( )` or backtick result, or `$name` for a
+    /// name with no value to give: nothing sets it, it is neither `HOME` nor
+    /// `PWD`, and it is no loop variable. Such a word is its own unresolved
+    /// text, so it needs none of the expansion machinery to say so.
+    fn is_unresolved_on_its_own(&self, written: &str) -> bool {
+        let bytes = written.as_bytes();
+
+        match bytes.first() {
+            Some(&SUBSTITUTION_BYTE) => bytes.len() == 1,
+            Some(b'$') => {
+                let name = &written[1..];
+                is_name(name)
+                    && !matches!(name, "HOME" | "PWD")
+                    && !self.values.contains_key(name)
+                    && !self.loops.contains_key(name)
+            }
+            _ => false,
+        }
     }
 
     /// The value written on the right of `name=`, or `None` when it depends on
@@ -522,7 +588,7 @@ static EXPANDS: [bool; 256] = byte_table(b"{$'\"\\\x01");
 /// backslash, `$` and the substitution marker.
 static STOPS: [bool; 256] = byte_table(b"$'\"\\\x01");
 
-const fn byte_table(bytes: &[u8]) -> [bool; 256] {
+pub(super) const fn byte_table(bytes: &[u8]) -> [bool; 256] {
     let mut table = [false; 256];
     let mut i = 0;
     while i < bytes.len() {
@@ -704,59 +770,74 @@ const SUBSTITUTION_BYTE: u8 = SUBSTITUTION as u8;
 /// as written (quotes and backslashes included). `None` for an unterminated
 /// quote or a trailing backslash, which the shell would reject too.
 pub(super) fn raw_words(text: &str) -> Option<Vec<&str>> {
+    // Every character the loop acts on is ASCII, and no byte of a multi-byte
+    // character is, so it can walk bytes: a word always ends at a blank, which
+    // is a character boundary.
+    let bytes = text.as_bytes();
     let mut words = Vec::new();
-    let mut start = None;
-    let mut quote = Quote::None;
-    let mut chars = text.char_indices().peekable();
+    let mut start: Option<usize> = None;
+    let mut i = 0;
 
-    while let Some((at, ch)) = chars.next() {
-        match quote {
-            Quote::Single => {
-                if ch == '\'' {
-                    quote = Quote::None;
+    while i < bytes.len() {
+        let byte = bytes[i];
+
+        if matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+            if let Some(begin) = start.take() {
+                words.push(&text[begin..i]);
+            }
+            i += 1;
+            continue;
+        }
+
+        start.get_or_insert(i);
+        match byte {
+            b'\'' => {
+                let close = bytes[i + 1..].iter().position(|&b| b == b'\'')?;
+                i += close + 2;
+            }
+            b'"' => {
+                i += 1;
+                loop {
+                    let offset = bytes[i..].iter().position(|&b| b == b'"' || b == b'\\')?;
+                    i += offset;
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    // a backslash takes the character after it
+                    if i + 1 >= bytes.len() {
+                        return None;
+                    }
+                    i += 2;
                 }
             }
-            Quote::Double => match ch {
-                '"' => quote = Quote::None,
-                '\\' => {
-                    chars.next()?;
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return None;
                 }
-                _ => {}
-            },
-            Quote::None => match ch {
-                ' ' | '\t' | '\n' | '\r' => {
-                    if let Some(begin) = start.take() {
-                        words.push(&text[begin..at]);
-                    }
+                i += 2;
+            }
+            // `$'...'`: a backslash escapes a quote inside it
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                i = ansi_c_end(text, i + 1)? + 1;
+            }
+            _ => {
+                i += 1;
+                while i < bytes.len() && !RAW_STOPS[bytes[i] as usize] {
+                    i += 1;
                 }
-                _ => {
-                    start.get_or_insert(at);
-                    match ch {
-                        '\'' => quote = Quote::Single,
-                        '"' => quote = Quote::Double,
-                        '\\' => {
-                            chars.next()?;
-                        }
-                        // `$'...'`: a backslash escapes a quote inside it
-                        '$' if text[at + 1..].starts_with('\'') => {
-                            let end = ansi_c_end(text, at + 1)?;
-                            while chars.next_if(|&(index, _)| index <= end).is_some() {}
-                        }
-                        _ => {}
-                    }
-                }
-            },
+            }
         }
     }
 
-    if quote != Quote::None {
-        return None;
-    }
     if let Some(begin) = start {
         words.push(&text[begin..]);
     }
     Some(words)
 }
+
+/// Bytes that end a plain run of a word in [`raw_words`].
+static RAW_STOPS: [bool; 256] = byte_table(b" \t\n\r'\"\\$");
 
 /// `name=value` pairs when the words only set variables: `a=1 b=2`, or
 /// `export a=1 b`, `declare -x a=1`, `local`, `readonly`, `typeset`. `value` is
@@ -1446,6 +1527,96 @@ mod tests {
             .expect("expands");
 
         assert!(words[1].unresolved.is_some());
+    }
+
+    #[test]
+    fn a_word_that_is_unresolved_on_its_own_is_what_the_general_path_makes_of_it() {
+        let mut vars = Vars::for_command("f=a; for l in x y; do cat $l; done");
+        vars.assign("f", Some("a".to_owned()));
+        vars.assign_loop("l", Some(vec!["x".to_owned(), "y".to_owned()]));
+        let home = ShellEnv {
+            cwd: Some(PathBuf::from("/work")),
+            home: Some("/home/u".to_owned()),
+        };
+
+        let on_its_own = ["$x", "$_u", "$Longer_Name9", &SUBSTITUTION.to_string()];
+        for word in on_its_own {
+            assert!(vars.is_unresolved_on_its_own(word), "{word:?}");
+            let general = vars.process(word, &home, &[]);
+            assert_eq!(general.text, word, "{word:?}");
+            assert!(general.unresolved, "{word:?}");
+            assert!(!general.quoted, "{word:?}");
+        }
+
+        // a name with a value, HOME and PWD, a loop variable, and anything
+        // that is more than `$name` or the lone marker, take the general path
+        for word in [
+            "$f",
+            "$HOME",
+            "$PWD",
+            "$l",
+            "${x}",
+            "$x/y",
+            "\"$x\"",
+            "$",
+            "$1",
+            "$$",
+            "$x.csv",
+            "~",
+            "x",
+            "",
+            &format!("{SUBSTITUTION}/x"),
+            &format!("{SUBSTITUTION}{SUBSTITUTION}"),
+        ] {
+            assert!(!vars.is_unresolved_on_its_own(word), "{word:?}");
+        }
+
+        // and through words(), the shortcut changes nothing a caller sees
+        let words = vars
+            .words(&raw(&format!("cat $x {SUBSTITUTION} $f $HOME")), &home)
+            .expect("expands");
+        let seen: Vec<(&str, Option<&str>)> = words
+            .iter()
+            .map(|word| (word.text.as_str(), word.unresolved.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("cat", None),
+                ("$x", Some("$x")),
+                ("\u{1}", Some("\u{1}")),
+                ("a", None),
+                ("/home/u", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_first_unresolved_words_keep_the_text_they_were_written_with() {
+        let vars = Vars::for_command("cat");
+        let many = MAX_NAMED_UNRESOLVED + 5;
+        let command = format!("cat{}", " \"$x\"".repeat(many));
+        let words = vars.words(&raw(&command), &env()).expect("expands");
+
+        // every one of them is still unresolved: the cap only drops the text
+        assert_eq!(words.len(), many + 1);
+        assert!(words[0].unresolved.is_none());
+        assert!(words[1..].iter().all(|word| word.unresolved.is_some()));
+
+        let named: Vec<&str> = words[1..]
+            .iter()
+            .filter_map(|word| word.unresolved.as_deref())
+            .filter(|text| !text.is_empty())
+            .collect();
+        assert_eq!(named.len(), MAX_NAMED_UNRESOLVED);
+        // the ones named are the first ones, as they were written
+        assert!(named.iter().all(|text| *text == "\"$x\""));
+        assert_eq!(words[1].unresolved.as_deref(), Some("\"$x\""));
+        assert_eq!(words[many].unresolved.as_deref(), Some(""));
+
+        // the count starts again for the next command
+        let again = vars.words(&raw("cat \"$y\""), &env()).expect("expands");
+        assert_eq!(again[1].unresolved.as_deref(), Some("\"$y\""));
     }
 
     #[test]

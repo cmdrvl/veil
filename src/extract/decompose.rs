@@ -46,12 +46,30 @@ pub const SUBSTITUTION: char = '\u{1}';
 /// listed in [`SimpleCommand::unresolved`]: the word is a pipe, not a path.
 pub(super) const PROCESS_SUBSTITUTION: char = '\u{2}';
 
-/// Words that start a compound-command line but are not the command.
-const LEADING_KEYWORDS: &[&str] = &[
-    "!", "{", "}", "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "coproc",
-];
+/// Words that start a compound-command line but are not the command. A
+/// `matches!` rather than a slice: it is asked of the first word of every command.
+fn is_leading_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "!" | "{"
+            | "}"
+            | "if"
+            | "then"
+            | "elif"
+            | "else"
+            | "fi"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "coproc"
+    )
+}
+
 /// Words that make the whole segment a loop or case header, with no command.
-const HEADER_KEYWORDS: &[&str] = &["for", "select", "case", "esac", "in", "function"];
+fn is_header_keyword(word: &str) -> bool {
+    matches!(word, "for" | "select" | "case" | "esac" | "in" | "function")
+}
 
 /// How a simple command was reached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,7 +283,7 @@ pub(super) fn script(
 fn for_header(words: &[Word]) -> Option<(&str, Option<Vec<String>>)> {
     let start = words
         .iter()
-        .position(|word| !LEADING_KEYWORDS.contains(&word.text.as_str()))?;
+        .position(|word| !is_leading_keyword(&word.text))?;
     let header = &words[start..];
 
     if header.first()?.text != "for" || header.get(2)?.text != "in" {
@@ -298,20 +316,30 @@ fn simple_command(
     segment: &Segment,
     origin: Origin,
 ) -> Option<SimpleCommand> {
-    let start = words.iter().position(|word| {
-        !(is_env_assignment(&word.text) || LEADING_KEYWORDS.contains(&word.text.as_str()))
-    })?;
-    if HEADER_KEYWORDS.contains(&words[start].text.as_str()) {
+    let start = words
+        .iter()
+        .position(|word| !(is_env_assignment(&word.text) || is_leading_keyword(&word.text)))?;
+    if is_header_keyword(&words[start].text) {
         return None;
     }
 
-    let words = words.split_off(start);
+    // the words move, text to argv and unresolved text to its own list: nothing
+    // is copied, and a command with no leading assignment keeps its Vec
+    let words = if start == 0 {
+        words
+    } else {
+        words.split_off(start)
+    };
+    let mut argv = Vec::with_capacity(words.len());
+    let mut unresolved = Vec::new();
+    for word in words {
+        argv.push(word.text);
+        unresolved.extend(word.unresolved);
+    }
+
     Some(SimpleCommand {
-        unresolved: words
-            .iter()
-            .filter_map(|word| word.unresolved.clone())
-            .collect(),
-        argv: words.into_iter().map(|word| word.text).collect(),
+        unresolved,
+        argv,
         redirects_in: Vec::new(),
         assigned: Vec::new(),
         origin,
@@ -345,7 +373,18 @@ struct Segment {
 
 impl Segment {
     fn is_blank(&self) -> bool {
-        self.text.trim().is_empty() && self.substitutions.is_empty() && self.heredoc.is_none()
+        // Nearly every segment starts with a visible ASCII byte: say so before
+        // asking `trim` about Unicode white space.
+        let starts_visible = self
+            .text
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_graphic());
+
+        !starts_visible
+            && self.text.trim().is_empty()
+            && self.substitutions.is_empty()
+            && self.heredoc.is_none()
     }
 }
 
@@ -363,6 +402,21 @@ struct PendingHeredoc {
 /// backslash.
 fn scan(text: &str) -> Option<Vec<Segment>> {
     let bytes = text.as_bytes();
+
+    // Text with nothing the scanner acts on (`echo c`, `cat data/x.csv`) is one
+    // segment, unchanged: the state machine below would copy it byte for byte.
+    if !bytes.iter().any(|&byte| SCAN_SPECIAL[byte as usize]) {
+        let segment = Segment {
+            text: text.to_owned(),
+            ..Segment::default()
+        };
+        return Some(if segment.is_blank() {
+            Vec::new()
+        } else {
+            vec![segment]
+        });
+    }
+
     let mut segments: Vec<Segment> = Vec::new();
     let mut current = Segment::default();
     let mut pending: Vec<PendingHeredoc> = Vec::new();
@@ -519,33 +573,23 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
 /// specially, and returns how many it copied. Non-ASCII bytes are never
 /// special, so the copy always ends on a character boundary.
 fn copy_plain_run(text: &str, from: usize, into: &mut String) -> usize {
-    let run = text.as_bytes()[from..]
-        .iter()
-        .take_while(|byte| {
-            !matches!(
-                byte,
-                b'\\'
-                    | b'\''
-                    | b'"'
-                    | b'`'
-                    | b'$'
-                    | b'<'
-                    | b'>'
-                    | b';'
-                    | b'('
-                    | b')'
-                    | b'&'
-                    | b'|'
-                    | b'\n'
-                    | b' '
-                    | b'\t'
-                    | b'#'
-            )
-        })
-        .count();
-    into.push_str(&text[from..from + run]);
-    run
+    // a table and a plain loop: this runs for every run of every command
+    let bytes = text.as_bytes();
+    let mut end = from;
+    while end < bytes.len() && !SCAN_STOPS[bytes[end] as usize] {
+        end += 1;
+    }
+    into.push_str(&text[from..end]);
+    end - from
 }
+
+/// Bytes that end a plain run in [`scan`]: each has an arm of its own, or (a
+/// blank) is told apart because it starts a word.
+static SCAN_STOPS: [bool; 256] = expand::byte_table(b"\\'\"`$<>;()&|\n \t#");
+
+/// Bytes that make [`scan`] do more than copy: [`SCAN_STOPS`] without the blanks,
+/// which it copies too.
+static SCAN_SPECIAL: [bool; 256] = expand::byte_table(b"\\'\"`$<>;()&|\n#");
 
 fn end_segment(
     segments: &mut Vec<Segment>,
@@ -600,12 +644,12 @@ fn scan_double_quoted(text: &str, start: usize, current: &mut Segment) -> Option
             }
             _ => {
                 // Everything else is literal until the next special byte.
-                let run = bytes[i..]
-                    .iter()
-                    .take_while(|byte| !matches!(byte, b'"' | b'\\' | b'`' | b'$'))
-                    .count();
-                current.text.push_str(&text[i..i + run]);
-                i += run;
+                let mut end = i + 1;
+                while end < bytes.len() && !DOUBLE_QUOTE_STOPS[bytes[end] as usize] {
+                    end += 1;
+                }
+                current.text.push_str(&text[i..end]);
+                i = end;
             }
         }
     }
@@ -632,15 +676,26 @@ fn backtick_body(text: &str, start: usize) -> Option<(String, usize)> {
                 i += 1 + next.len_utf8();
             }
             _ => {
-                let ch = text[i..].chars().next()?;
-                body.push(ch);
-                i += ch.len_utf8();
+                // up to the next byte that ends the body or escapes; a byte of a
+                // multi-byte character is neither, so the run ends on a boundary
+                let mut end = i + 1;
+                while end < bytes.len() && !BACKTICK_STOPS[bytes[end] as usize] {
+                    end += 1;
+                }
+                body.push_str(&text[i..end]);
+                i = end;
             }
         }
     }
 
     None
 }
+
+/// Bytes with an arm of their own inside a double-quoted string.
+static DOUBLE_QUOTE_STOPS: [bool; 256] = expand::byte_table(b"\"\\`$");
+
+/// Bytes with an arm of their own inside a backtick body.
+static BACKTICK_STOPS: [bool; 256] = expand::byte_table(b"`\\");
 
 /// The index of the `)` closing a substitution whose body starts at `from`.
 /// Parentheses inside quotes, escapes and nested backticks do not count.
@@ -1487,6 +1542,51 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn scan_of_plain_text_is_what_the_state_machine_makes_of_it() {
+        // Text with nothing special takes a shortcut. A trailing newline sends
+        // the same text through the full scanner without changing its segments
+        // (the empty one after the newline is dropped), so they must agree.
+        for text in [
+            "",
+            " ",
+            "\t \t",
+            "\r",
+            "\u{a0}",
+            " \u{2003} ",
+            "echo",
+            "echo c",
+            "  echo   c  ",
+            "cat data/clients/holdings.csv",
+            "cat café/naïve.csv 日本語",
+            "a\rb",
+            "k=v cmd --flag=x -n 3 @host:path 50% ~/x",
+        ] {
+            let quick = scan(text).expect("plain text scans");
+            let full = scan(&format!("{text}\n")).expect("plain text with a newline scans");
+
+            let shape = |segments: &[Segment]| {
+                segments
+                    .iter()
+                    .map(|segment| {
+                        (
+                            segment.text.clone(),
+                            segment.stdin_piped,
+                            segment.heredoc.clone(),
+                            segment.substitutions.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(shape(&quick), shape(&full), "{text:?}");
+        }
+
+        // and what is special still goes through the scanner
+        assert_eq!(scan("echo a; echo b").expect("scans").len(), 2);
+        assert_eq!(scan("echo $(x)").expect("scans")[0].substitutions, ["x"]);
+        assert_eq!(scan("# a comment").expect("scans").len(), 0);
     }
 
     #[test]
