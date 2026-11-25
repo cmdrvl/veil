@@ -112,6 +112,14 @@ authorized_tools = [
     "verify", "assess", "benchmark", "airlock",
 ]
 
+[spine.denied_flags]
+# Raw-value flags that turn an authorized spine tool into a reader
+# (`shape --explicit x.csv` prints raw values). An invocation that uses one,
+# as `--flag` or `--flag=value`, is denied on protected paths. Defaults shown.
+default = ["--explicit", "--raw", "--dump", "--show-values"]
+# A tool-named key adds flags for that tool only; it never drops the default.
+# profile = ["--values"]
+
 [policy]
 # Require a healthy dcg companion guard for operator commands (default: false)
 require_dcg = false

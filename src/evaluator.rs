@@ -10,7 +10,9 @@ use crate::packs::PackRegistry;
 use crate::spine::SpineInvocation;
 use crate::types::{Decision, DecisionAction, SensitivityResult, SensitivitySeverity, ToolKind};
 
-const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. Run `veil operator` to discover the authorized spine tools available in this repo, then choose the right metadata-safe path for this file. If no listed tool fits, write a local script that extracts only metadata (e.g., sheet names, column headers, row counts, field names) and prints a structured summary without loading file contents into context.";
+const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. Run `veil operator` to discover the authorized spine tools available in this repo, then choose the right metadata-safe path for this file. Do not extract the contents any other way; if no listed tool fits, stop and ask the operator.";
+
+const RAW_FLAG_REMEDIATION: &str = "Raw-value flag blocked. Re-run the spine tool without it so its output stays metadata-only, or run `veil operator` to discover the authorized spine tools and the metadata-safe path for this file. Do not look for another way to see the raw values; if no metadata-safe path fits, stop and ask the operator.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvaluationInput {
@@ -110,6 +112,21 @@ where
     };
 
     if let Some(sensitivity) = classification.as_ref() {
+        // A raw-value flag turns an authorized spine tool into a reader, so it
+        // is checked before the metadata-only and authorized-spine fast paths.
+        if let Some((tool, flag)) = denied_raw_flag(input) {
+            return resolve_policy(
+                &config.policy.default,
+                Some(sensitivity),
+                raw_flag_reason(
+                    tool,
+                    flag,
+                    &format!("a path matched by {}", sensitivity.pack),
+                ),
+                RAW_FLAG_REMEDIATION,
+            );
+        }
+
         if input.exposure != PathExposure::ReadsContents {
             return allow_with_context(
                 format!(
@@ -142,10 +159,20 @@ where
                 "direct read of a path matched by {} is blocked by policy default",
                 sensitivity.pack
             ),
+            DIRECT_READ_REMEDIATION,
         );
     }
 
     if directory_sensitive {
+        if let Some((tool, flag)) = denied_raw_flag(input) {
+            return resolve_policy(
+                &config.policy.default,
+                None,
+                raw_flag_reason(tool, flag, "a protected-directory path"),
+                RAW_FLAG_REMEDIATION,
+            );
+        }
+
         if input.exposure != PathExposure::ReadsContents {
             return allow_with_context(
                 "metadata-only access is allowed inside a protected directory".to_owned(),
@@ -171,6 +198,7 @@ where
             &config.policy.default,
             None,
             "direct read inside a protected directory is blocked by policy default".to_owned(),
+            DIRECT_READ_REMEDIATION,
         );
     }
 
@@ -224,16 +252,34 @@ fn is_protected_path(path: &Path, protected_patterns: &[String]) -> bool {
 
 fn is_authorized_spine_invocation(input: &EvaluationInput) -> bool {
     input.tool == ToolKind::Bash
-        && input
-            .spine_invocation
-            .as_ref()
-            .is_some_and(|invocation| invocation.target_path == input.path)
+        && input.spine_invocation.as_ref().is_some_and(|invocation| {
+            invocation.denied_flag.is_none() && invocation.target_path == input.path
+        })
+}
+
+/// The spine tool and raw-value flag of a Bash invocation that uses a denied
+/// flag. Such an invocation is never authorized to touch protected content.
+fn denied_raw_flag(input: &EvaluationInput) -> Option<(&str, &str)> {
+    if input.tool != ToolKind::Bash {
+        return None;
+    }
+
+    let invocation = input.spine_invocation.as_ref()?;
+    let flag = invocation.denied_flag.as_deref()?;
+    Some((invocation.tool_name.as_str(), flag))
+}
+
+fn raw_flag_reason(tool: &str, flag: &str, target: &str) -> String {
+    format!(
+        "spine tool {tool} was invoked with raw-value flag {flag}, which escalates its output from metadata to protected content, so it is not authorized for {target}"
+    )
 }
 
 fn resolve_policy(
     policy_mode: &PolicyMode,
     sensitivity: Option<&SensitivityResult>,
     reason: String,
+    remediation: &str,
 ) -> Decision {
     let confidence = sensitivity.map(|result| result.confidence);
 
@@ -243,21 +289,21 @@ fn resolve_policy(
             reason: Some(reason),
             severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
-            remediation: Some(DIRECT_READ_REMEDIATION.to_owned()),
+            remediation: Some(remediation.to_owned()),
         },
         PolicyMode::Warn => Decision {
             action: DecisionAction::Allow,
             reason: Some(format!("policy default warn: {reason}")),
             severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
-            remediation: Some(DIRECT_READ_REMEDIATION.to_owned()),
+            remediation: Some(remediation.to_owned()),
         },
         PolicyMode::Log => Decision {
             action: DecisionAction::Allow,
             reason: Some(format!("policy default log: {reason}")),
             severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
-            remediation: Some(DIRECT_READ_REMEDIATION.to_owned()),
+            remediation: Some(remediation.to_owned()),
         },
     }
 }
@@ -298,6 +344,7 @@ mod tests {
 
     use crate::allowlist::DEFAULT_SAFE_PATTERNS;
     use crate::config::{AllowlistConfig, PolicyConfig, SensitivityConfig, SpineConfig};
+    use crate::spine::DeniedFlags;
 
     fn fixture_config() -> Config {
         Config {
@@ -312,6 +359,7 @@ mod tests {
             },
             spine: SpineConfig {
                 authorized_tools: vec!["shape".to_owned(), "profile".to_owned()],
+                denied_flags: DeniedFlags::default(),
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,
@@ -391,12 +439,131 @@ mod tests {
         );
     }
 
+    fn spine_input(
+        path: &str,
+        exposure: PathExposure,
+        denied_flag: Option<&str>,
+    ) -> EvaluationInput {
+        EvaluationInput::new(ToolKind::Bash, path, exposure).with_spine_invocation(
+            SpineInvocation {
+                tool_name: "shape".to_owned(),
+                target_path: PathBuf::from(path),
+                denied_flag: denied_flag.map(str::to_owned),
+            },
+        )
+    }
+
+    #[test]
+    fn denied_raw_flag_is_denied_on_sensitive_and_protected_paths_for_any_exposure() {
+        for path in [".env", "protected/x.csv"] {
+            // Hook mode feeds bare spine invocations through as `None` exposure,
+            // so the flag must be caught before the metadata-only fast path.
+            for exposure in [PathExposure::None, PathExposure::ReadsContents] {
+                let decision = evaluate_access(
+                    &spine_input(path, exposure, Some("--explicit")),
+                    &fixture_config(),
+                    &PackRegistry::with_built_ins(),
+                );
+
+                assert_eq!(decision.action, DecisionAction::Deny, "{path} {exposure:?}");
+                let reason = decision.reason.as_deref().unwrap_or_default();
+                assert!(reason.contains("--explicit"), "{reason}");
+                assert!(reason.contains("shape"), "{reason}");
+                assert!(
+                    reason.contains("escalates its output from metadata to protected content"),
+                    "{reason}"
+                );
+                assert_eq!(decision.remediation.as_deref(), Some(RAW_FLAG_REMEDIATION));
+            }
+        }
+    }
+
+    #[test]
+    fn spine_invocation_without_a_denied_flag_keeps_its_authorization() {
+        for exposure in [PathExposure::None, PathExposure::ReadsContents] {
+            for path in [".env", "protected/x.csv"] {
+                let decision = evaluate_access(
+                    &spine_input(path, exposure, None),
+                    &fixture_config(),
+                    &PackRegistry::with_built_ins(),
+                );
+
+                assert_eq!(
+                    decision.action,
+                    DecisionAction::Allow,
+                    "{path} {exposure:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn denied_raw_flag_on_a_non_sensitive_path_is_not_blocked() {
+        let decision = evaluate_access(
+            &spine_input("notes/plain.txt", PathExposure::None, Some("--explicit")),
+            &fixture_config(),
+            &PackRegistry::with_built_ins(),
+        );
+
+        assert_eq!(decision.action, DecisionAction::Allow);
+    }
+
+    #[test]
+    fn denied_raw_flag_follows_the_policy_mode_like_a_direct_read() {
+        for (mode, expected_action, prefix) in [
+            (PolicyMode::Deny, DecisionAction::Deny, ""),
+            (
+                PolicyMode::Warn,
+                DecisionAction::Allow,
+                "policy default warn: ",
+            ),
+            (
+                PolicyMode::Log,
+                DecisionAction::Allow,
+                "policy default log: ",
+            ),
+        ] {
+            let mut config = fixture_config();
+            config.policy.default = mode;
+
+            let decision = evaluate_access(
+                &spine_input("protected/x.csv", PathExposure::None, Some("--raw")),
+                &config,
+                &PackRegistry::with_built_ins(),
+            );
+
+            assert_eq!(decision.action, expected_action);
+            assert!(
+                decision
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with(prefix) && reason.contains("--raw"))
+            );
+            assert_eq!(decision.remediation.as_deref(), Some(RAW_FLAG_REMEDIATION));
+        }
+    }
+
+    #[test]
+    fn remediation_text_never_tells_agents_to_write_ad_hoc_scripts() {
+        for remediation in [DIRECT_READ_REMEDIATION, RAW_FLAG_REMEDIATION] {
+            let lowered = remediation.to_lowercase();
+            for banned in ["script", "write a ", "write your own", "extract only"] {
+                assert!(
+                    !lowered.contains(banned),
+                    "remediation must not suggest `{banned}`: {remediation}"
+                );
+            }
+            assert!(remediation.contains("`veil operator`"), "{remediation}");
+        }
+    }
+
     #[test]
     fn sensitive_spine_invocations_are_allowed() {
         let input = EvaluationInput::new(ToolKind::Bash, ".env", PathExposure::ReadsContents)
             .with_spine_invocation(SpineInvocation {
                 tool_name: "shape".to_owned(),
                 target_path: PathBuf::from(".env"),
+                denied_flag: None,
             });
 
         let decision = evaluate_access(&input, &fixture_config(), &PackRegistry::with_built_ins());
@@ -492,6 +659,7 @@ mod tests {
             },
             spine: SpineConfig {
                 authorized_tools: vec!["shape".to_owned()],
+                denied_flags: DeniedFlags::default(),
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,
@@ -535,6 +703,7 @@ mod tests {
             },
             spine: SpineConfig {
                 authorized_tools: vec!["shape".to_owned()],
+                denied_flags: DeniedFlags::default(),
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,
@@ -577,6 +746,7 @@ mod tests {
             },
             spine: SpineConfig {
                 authorized_tools: vec!["shape".to_owned()],
+                denied_flags: DeniedFlags::default(),
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,
@@ -606,6 +776,7 @@ mod tests {
             },
             spine: SpineConfig {
                 authorized_tools: vec!["shape".to_owned()],
+                denied_flags: DeniedFlags::default(),
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,
@@ -623,6 +794,7 @@ mod tests {
         .with_spine_invocation(SpineInvocation {
             tool_name: "shape".to_owned(),
             target_path: PathBuf::from("data/clients/holdings.csv"),
+            denied_flag: None,
         });
 
         let decision = evaluate_access_with_classifier(&input, &config, |directory_sensitive| {
@@ -678,6 +850,7 @@ mod tests {
             },
             spine: SpineConfig {
                 authorized_tools: vec!["shape".to_owned()],
+                denied_flags: DeniedFlags::default(),
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,
@@ -746,6 +919,7 @@ mod tests {
             },
             spine: SpineConfig {
                 authorized_tools: vec!["shape".to_owned()],
+                denied_flags: DeniedFlags::default(),
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,

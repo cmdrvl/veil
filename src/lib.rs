@@ -179,7 +179,12 @@ fn detect_spine(hook_input: &HookInput, config: &config::Config) -> Option<spine
     }
 
     let command = command_from_raw_args(&hook_input.raw_args)?;
-    detect_spine_invocation(&command, &config.spine.authorized_tools, &hook_input.cwd)
+    detect_spine_invocation(
+        &command,
+        &config.spine.authorized_tools,
+        &config.spine.denied_flags,
+        &hook_input.cwd,
+    )
 }
 
 fn select_decision(outcomes: &[CandidateOutcome]) -> Decision {
@@ -370,6 +375,64 @@ mod tests {
                 .expect("audit path should be recorded as a string"),
         );
         assert!(recorded_path.ends_with(Path::new("protected").join("secret.bin")));
+    }
+
+    #[test]
+    fn run_with_io_denies_spine_raw_value_flags_and_audits_the_denial() {
+        let repo_root = unique_temp_dir("hook-raw-flag");
+        let audit_path = configure_repo(&repo_root, &["protected/**"]);
+        fs::create_dir_all(repo_root.join("protected")).expect("protected dir should exist");
+        fs::write(repo_root.join("protected").join("secret.bin"), "top secret")
+            .expect("fixture file should be written");
+
+        for command in [
+            "shape --explicit protected/secret.bin",
+            "profile protected/secret.bin --explicit",
+            "shape --dump=all protected/secret.bin",
+        ] {
+            let input = format!(
+                r#"{{
+                    "session_id":"raw-flag-session",
+                    "cwd":"{}",
+                    "hook_event_name":"PreToolUse",
+                    "tool_name":"Bash",
+                    "tool_input":{{"command":"{command}"}}
+                }}"#,
+                repo_root.display()
+            );
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            run_with_io(input.as_bytes(), &mut stdout, &mut stderr)
+                .expect("hook pipeline should succeed");
+
+            let stdout = String::from_utf8(stdout).expect("stdout should be UTF-8");
+            assert!(
+                stdout.contains("\"permissionDecision\":\"deny\""),
+                "`{command}` must be denied, got {stdout}"
+            );
+            assert!(
+                stdout.contains("escalates its output from metadata to protected content"),
+                "`{command}`: {stdout}"
+            );
+            let stderr = String::from_utf8(stderr).expect("stderr should be UTF-8");
+            assert!(stderr.contains("Raw-value flag blocked"), "{stderr}");
+            assert!(!stderr.to_lowercase().contains("script"), "{stderr}");
+        }
+
+        let records = read_audit_records(&audit_path);
+        assert_eq!(records.len(), 3);
+        for record in &records {
+            assert_eq!(record["tool"], "Bash");
+            assert_eq!(record["decision"], "deny");
+            assert_eq!(record["session_id"], "raw-flag-session");
+            assert!(
+                record["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("raw-value flag")),
+                "audit reason should name the raw-value flag: {record}"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -10,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::allowlist::DEFAULT_SAFE_PATTERNS;
+use crate::spine::DeniedFlags;
 
 const DEFAULT_AUTHORIZED_TOOLS: &[&str] = &[
     "shape",
@@ -38,6 +40,9 @@ const DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES: &[&str] = &[
     "notices",
 ];
 
+/// Key in `[spine.denied_flags]` that sets the list applied to every tool.
+const DENIED_FLAGS_DEFAULT_KEY: &str = "default";
+
 const CMDRVL_ROOT_DIR: &str = ".cmdrvl";
 const VEIL_CONFIG_RELATIVE: &[&str] = &["config", "veil", "config.toml"];
 const VEIL_AUDIT_RELATIVE: &[&str] = &["logs", "veil", "audit.jsonl"];
@@ -65,6 +70,7 @@ pub struct AllowlistConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpineConfig {
     pub authorized_tools: Vec<String>,
+    pub denied_flags: DeniedFlags,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +179,7 @@ impl Config {
                     .iter()
                     .map(|tool| (*tool).to_owned())
                     .collect(),
+                denied_flags: DeniedFlags::default(),
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,
@@ -197,10 +204,18 @@ impl Config {
             self.allowlist.safe_patterns = safe_patterns;
         }
 
-        if let Some(spine) = partial.spine
-            && let Some(authorized_tools) = spine.authorized_tools
-        {
-            self.spine.authorized_tools = authorized_tools;
+        if let Some(spine) = partial.spine {
+            if let Some(authorized_tools) = spine.authorized_tools {
+                self.spine.authorized_tools = authorized_tools;
+            }
+
+            for (key, flags) in spine.denied_flags.unwrap_or_default() {
+                if key == DENIED_FLAGS_DEFAULT_KEY {
+                    self.spine.denied_flags.default = flags;
+                } else {
+                    self.spine.denied_flags.per_tool.insert(key, flags);
+                }
+            }
         }
 
         if let Some(policy) = partial.policy {
@@ -291,6 +306,7 @@ impl PartialConfig {
             }),
             spine: authorized_tools.map(|items| PartialSpineConfig {
                 authorized_tools: Some(items),
+                denied_flags: None,
             }),
             policy: if default_mode.is_some() || audit_log.is_some() || audit_path.is_some() {
                 Some(PartialPolicyConfig {
@@ -322,6 +338,9 @@ struct PartialAllowlistConfig {
 #[serde(deny_unknown_fields)]
 struct PartialSpineConfig {
     authorized_tools: Option<Vec<String>>,
+    /// `[spine.denied_flags]`: the `default` key replaces the default deny list;
+    /// every other key names a tool and adds flags denied for that tool only.
+    denied_flags: Option<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -341,6 +360,8 @@ fn load_optional_config(
 ) -> io::Result<Option<PartialConfig>> {
     match fs::read_to_string(path) {
         Ok(contents) => toml::from_str::<PartialConfig>(&contents)
+            .map_err(|error| error.to_string())
+            .and_then(|config| validate_partial(&config).map(|()| config))
             .map(|config| Some(expand_partial_paths(config, home)))
             .map_err(|error| {
                 io::Error::new(
@@ -351,6 +372,35 @@ fn load_optional_config(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Rejects `[spine.denied_flags]` entries that could never match an argument,
+/// so a typo like `explicit` (missing dashes) fails loudly instead of leaving
+/// the flag silently allowed.
+fn validate_partial(config: &PartialConfig) -> Result<(), String> {
+    let Some(denied_flags) = config
+        .spine
+        .as_ref()
+        .and_then(|spine| spine.denied_flags.as_ref())
+    else {
+        return Ok(());
+    };
+
+    for (key, flags) in denied_flags {
+        for flag in flags {
+            let well_formed = flag.len() > 1
+                && flag.starts_with('-')
+                && !flag.contains('=')
+                && !flag.chars().any(char::is_whitespace);
+            if !well_formed {
+                return Err(format!(
+                    "spine.denied_flags.{key} entry `{flag}` must be a flag such as `--explicit` (leading dash, no `=` or whitespace)"
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn expand_partial_paths(mut config: PartialConfig, home: Option<&Path>) -> PartialConfig {
@@ -1034,6 +1084,92 @@ mod tests {
     }
 
     #[test]
+    fn denied_flags_default_to_the_raw_value_flags() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let config = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            None,
+            None,
+            PartialConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.spine.denied_flags.default,
+            vec!["--explicit", "--raw", "--dump", "--show-values"]
+        );
+        assert!(config.spine.denied_flags.per_tool.is_empty());
+    }
+
+    #[test]
+    fn denied_flags_table_sets_default_and_per_tool_additions_with_layer_override() {
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+
+        let config = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            Some(
+                r#"
+                [spine.denied_flags]
+                default = ["--explicit"]
+                shape = ["--columns"]
+                profile = ["--values"]
+                "#,
+            ),
+            Some(
+                r#"
+                [spine.denied_flags]
+                shape = ["--head"]
+                "#,
+            ),
+            PartialConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(config.spine.denied_flags.default, vec!["--explicit"]);
+        assert_eq!(
+            config.spine.denied_flags.per_tool.get("shape"),
+            Some(&vec!["--head".to_owned()]),
+            "project layer replaces the user layer's list for the same tool"
+        );
+        assert_eq!(
+            config.spine.denied_flags.per_tool.get("profile"),
+            Some(&vec!["--values".to_owned()]),
+            "tools the project layer does not mention keep the user layer's list"
+        );
+    }
+
+    #[test]
+    fn denied_flags_entries_that_could_never_match_are_rejected_at_load() {
+        for bad in ["explicit", "-", "--ex plicit", "--explicit=true", ""] {
+            let repo_root = unique_temp_root("repo");
+            let home = unique_temp_root("home");
+
+            let error = load_for_test(
+                &repo_root,
+                &home,
+                None,
+                None,
+                Some(&format!("[spine.denied_flags]\ndefault = [\"{bad}\"]\n")),
+                PartialConfig::default(),
+            )
+            .expect_err("a flag entry that cannot match must fail loudly");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "entry `{bad}`");
+            assert!(
+                error.to_string().contains("spine.denied_flags.default"),
+                "entry `{bad}`: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn environment_overrides_project_for_protected_paths_and_policy() {
         let repo_root = unique_temp_root("repo");
         let home = unique_temp_root("home");
@@ -1091,6 +1227,7 @@ mod tests {
             allowlist: None,
             spine: Some(PartialSpineConfig {
                 authorized_tools: Some(vec!["env-tool".to_owned()]),
+                denied_flags: None,
             }),
             policy: Some(PartialPolicyConfig {
                 default: Some(PolicyMode::Warn),
@@ -1319,8 +1456,12 @@ mod tests {
             "airlock",
         ] {
             let command = format!("{tool} {protected_arg}");
-            let detected =
-                detect_spine_invocation(&command, &config.spine.authorized_tools, &repo_root);
+            let detected = detect_spine_invocation(
+                &command,
+                &config.spine.authorized_tools,
+                &config.spine.denied_flags,
+                &repo_root,
+            );
             assert!(
                 detected.is_some(),
                 "default config should authorize `{tool}`"
@@ -1349,8 +1490,13 @@ mod tests {
             format!("verifyx {protected_arg}"),
         ] {
             assert!(
-                detect_spine_invocation(&command, &config.spine.authorized_tools, &repo_root)
-                    .is_none(),
+                detect_spine_invocation(
+                    &command,
+                    &config.spine.authorized_tools,
+                    &config.spine.denied_flags,
+                    &repo_root
+                )
+                .is_none(),
                 "`{command}` must not be treated as an authorized spine invocation"
             );
         }

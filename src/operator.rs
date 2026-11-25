@@ -488,6 +488,10 @@ fn config_json(config: &Config) -> Value {
         },
         "spine": {
             "authorized_tools": config.spine.authorized_tools,
+            "denied_flags": {
+                "default": config.spine.denied_flags.default,
+                "per_tool": config.spine.denied_flags.per_tool,
+            },
         },
         "policy": {
             "default": policy_mode_name(&config.policy.default),
@@ -530,6 +534,12 @@ fn render_config_human(config: &Config) -> String {
         "authorized_tools",
         &config.spine.authorized_tools,
     );
+    let _ = writeln!(output, "  denied_flags:");
+    let denied_flags = &config.spine.denied_flags;
+    let _ = writeln!(output, "    default: {}", denied_flags.default.join(" "));
+    for (tool, flags) in &denied_flags.per_tool {
+        let _ = writeln!(output, "    {tool}: {}", flags.join(" "));
+    }
 
     output.trim_end().to_owned()
 }
@@ -1794,6 +1804,39 @@ mod tests {
         assert_eq!(value["policy"]["default"], "warn");
         assert_eq!(value["policy"]["audit_log"], false);
         assert_eq!(value["policy"]["audit_path"], "/tmp/veil-audit.jsonl");
+        assert_eq!(
+            value["spine"]["denied_flags"]["default"],
+            serde_json::json!(["--explicit", "--raw", "--dump", "--show-values"])
+        );
+        assert_eq!(
+            value["spine"]["denied_flags"]["per_tool"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn config_output_shows_configured_denied_flags_in_json_and_human_forms() {
+        let repo_root = unique_temp_dir("config-denied-flags");
+        write_file(
+            &repo_root.join(".veil.toml"),
+            r#"
+            [spine.denied_flags]
+            default = ["--explicit"]
+            shape = ["--columns"]
+            "#,
+        );
+
+        let json = render_config_for_repo(&repo_root, true).expect("config JSON should render");
+        let value: Value = serde_json::from_str(&json).expect("config JSON output should parse");
+        assert_eq!(
+            value["spine"]["denied_flags"],
+            serde_json::json!({"default": ["--explicit"], "per_tool": {"shape": ["--columns"]}})
+        );
+
+        let human = render_config_for_repo(&repo_root, false).expect("config should render");
+        assert!(human.contains("denied_flags:"), "{human}");
+        assert!(human.contains("default: --explicit"), "{human}");
+        assert!(human.contains("shape: --columns"), "{human}");
     }
 
     #[test]

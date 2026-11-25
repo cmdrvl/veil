@@ -1,16 +1,70 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Flags that escalate an authorized spine tool from metadata-safe output to raw
+/// protected values. `shape --explicit x.csv` is an authorized tool producing
+/// raw content, so these are denied unless an operator reconfigures them.
+pub const DEFAULT_DENIED_FLAGS: &[&str] = &["--explicit", "--raw", "--dump", "--show-values"];
+
+/// Flag policy table for authorized spine tools: a default deny list plus
+/// per-tool additions. A per-tool list extends the default for that tool; it
+/// never replaces it, so a tool entry cannot silently weaken the baseline.
+/// Hook mode enforces it today; the Track B broker reuses it unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeniedFlags {
+    pub default: Vec<String>,
+    pub per_tool: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for DeniedFlags {
+    fn default() -> Self {
+        Self {
+            default: DEFAULT_DENIED_FLAGS
+                .iter()
+                .map(|flag| (*flag).to_owned())
+                .collect(),
+            per_tool: BTreeMap::new(),
+        }
+    }
+}
+
+impl DeniedFlags {
+    /// Returns the first configured flag that `args` uses for `tool`, matching
+    /// both `--flag` and `--flag=value`. Every argument is scanned, including
+    /// ones after `--` or a redirection, so position cannot hide a flag.
+    pub fn find<'a>(&'a self, tool: &str, args: &[String]) -> Option<&'a str> {
+        let tool_flags = self.per_tool.get(tool).map(Vec::as_slice).unwrap_or(&[]);
+
+        self.default
+            .iter()
+            .chain(tool_flags)
+            .map(String::as_str)
+            .find(|flag| args.iter().any(|arg| arg_uses_flag(arg, flag)))
+    }
+}
+
+fn arg_uses_flag(arg: &str, flag: &str) -> bool {
+    arg == flag
+        || arg
+            .strip_prefix(flag)
+            .is_some_and(|rest| rest.starts_with('='))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpineInvocation {
     pub tool_name: String,
     pub target_path: PathBuf,
+    /// The denied raw-value flag this invocation uses, if any. An invocation
+    /// with a denied flag is never authorized to read protected content.
+    pub denied_flag: Option<String>,
 }
 
 pub fn detect_spine_invocation(
     command: &str,
     authorized_tools: &[String],
+    denied_flags: &DeniedFlags,
     cwd: &Path,
 ) -> Option<SpineInvocation> {
     let tokens = shlex::split(command)?;
@@ -19,10 +73,12 @@ pub fn detect_spine_invocation(
 
     let tool_name = authorized_tool_name(program, authorized_tools)?;
     let target_path = extract_target_path(args, cwd)?;
+    let denied_flag = denied_flags.find(&tool_name, args).map(str::to_owned);
 
     Some(SpineInvocation {
         tool_name,
         target_path,
+        denied_flag,
     })
 }
 
@@ -116,59 +172,149 @@ mod tests {
         vec!["shape".to_owned(), "profile".to_owned()]
     }
 
+    fn detect(command: &str) -> Option<SpineInvocation> {
+        detect_spine_invocation(
+            command,
+            &authorized_tools(),
+            &DeniedFlags::default(),
+            workspace(),
+        )
+    }
+
+    fn denied_flag(command: &str) -> Option<String> {
+        detect(command)
+            .expect("command should be detected as a spine invocation")
+            .denied_flag
+    }
+
     #[test]
     fn matches_a_basic_spine_invocation() {
-        let invocation =
-            detect_spine_invocation("shape sensitive.csv", &authorized_tools(), workspace());
-
         assert_eq!(
-            invocation,
+            detect("shape sensitive.csv"),
             Some(SpineInvocation {
                 tool_name: "shape".to_owned(),
                 target_path: PathBuf::from("/workspace/veil/sensitive.csv"),
+                denied_flag: None,
             })
         );
     }
 
     #[test]
     fn matches_a_full_path_spine_invocation() {
-        let invocation = detect_spine_invocation(
-            "/usr/local/bin/shape sensitive.csv",
-            &authorized_tools(),
-            workspace(),
-        );
-
         assert_eq!(
-            invocation,
+            detect("/usr/local/bin/shape sensitive.csv"),
             Some(SpineInvocation {
                 tool_name: "shape".to_owned(),
                 target_path: PathBuf::from("/workspace/veil/sensitive.csv"),
+                denied_flag: None,
             })
         );
     }
 
     #[test]
     fn matches_a_piped_spine_invocation() {
-        let invocation = detect_spine_invocation(
-            "profile filings/report.xml | jq .summary",
-            &authorized_tools(),
-            workspace(),
-        );
-
         assert_eq!(
-            invocation,
+            detect("profile filings/report.xml | jq .summary"),
             Some(SpineInvocation {
                 tool_name: "profile".to_owned(),
                 target_path: PathBuf::from("/workspace/veil/filings/report.xml"),
+                denied_flag: None,
             })
         );
     }
 
     #[test]
     fn rejects_non_spine_commands() {
-        let invocation =
-            detect_spine_invocation("cat sensitive.csv", &authorized_tools(), workspace());
+        assert_eq!(detect("cat sensitive.csv"), None);
+    }
 
-        assert_eq!(invocation, None);
+    #[test]
+    fn default_denied_flags_are_reported_in_flag_and_flag_equals_forms() {
+        for flag in ["--explicit", "--raw", "--dump", "--show-values"] {
+            assert_eq!(
+                denied_flag(&format!("shape {flag} sensitive.csv")).as_deref(),
+                Some(flag),
+                "`shape {flag} <path>`"
+            );
+            assert_eq!(
+                denied_flag(&format!("profile {flag}=true sensitive.csv")).as_deref(),
+                Some(flag),
+                "`profile {flag}=true <path>`"
+            );
+        }
+    }
+
+    #[test]
+    fn denied_flags_are_found_anywhere_in_the_invocation() {
+        for command in [
+            "shape sensitive.csv --explicit",
+            "shape sensitive.csv --json --explicit=1",
+            "shape -- sensitive.csv --explicit",
+            "shape sensitive.csv > out.txt --explicit",
+            "shape '--explicit' sensitive.csv",
+            "shape --expl\"\"icit sensitive.csv",
+            "/usr/local/bin/shape --explicit sensitive.csv | jq .",
+        ] {
+            assert_eq!(
+                denied_flag(command).as_deref(),
+                Some("--explicit"),
+                "`{command}`"
+            );
+        }
+    }
+
+    #[test]
+    fn similar_looking_arguments_are_not_denied_flags() {
+        for command in [
+            "shape sensitive.csv --json",
+            "shape sensitive.csv --explicitly",
+            "shape sensitive.csv --no-explicit",
+            "shape explicit.csv",
+            "shape sensitive.csv | jq --raw-output .rows",
+            "shape sensitive.csv | grep --explicit",
+        ] {
+            assert_eq!(denied_flag(command), None, "`{command}`");
+        }
+    }
+
+    #[test]
+    fn per_tool_flags_extend_the_default_for_that_tool_only() {
+        let mut denied = DeniedFlags::default();
+        denied
+            .per_tool
+            .insert("profile".to_owned(), vec!["--values".to_owned()]);
+        let detect_with = |command: &str| {
+            detect_spine_invocation(command, &authorized_tools(), &denied, workspace())
+                .unwrap()
+                .denied_flag
+        };
+
+        assert_eq!(
+            detect_with("profile --values sensitive.csv").as_deref(),
+            Some("--values")
+        );
+        assert_eq!(detect_with("shape --values sensitive.csv"), None);
+        assert_eq!(
+            detect_with("profile --explicit sensitive.csv").as_deref(),
+            Some("--explicit"),
+            "a per-tool entry must not drop the default deny list"
+        );
+    }
+
+    #[test]
+    fn replacing_the_default_list_changes_what_is_denied() {
+        let denied = DeniedFlags {
+            default: vec!["--only-this".to_owned()],
+            per_tool: BTreeMap::new(),
+        };
+        let invocation = detect_spine_invocation(
+            "shape --explicit sensitive.csv",
+            &authorized_tools(),
+            &denied,
+            workspace(),
+        )
+        .unwrap();
+
+        assert_eq!(invocation.denied_flag, None);
     }
 }
