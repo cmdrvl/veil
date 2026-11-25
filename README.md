@@ -109,6 +109,7 @@ protected = [
 authorized_tools = [
     "shape", "rvl", "vacuum", "hashbytes",
     "fingerprint", "profile", "canon", "lock", "pack",
+    "verify", "assess", "benchmark", "airlock",
 ]
 
 [allowlist]

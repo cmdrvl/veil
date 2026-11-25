@@ -21,6 +21,10 @@ const DEFAULT_AUTHORIZED_TOOLS: &[&str] = &[
     "canon",
     "lock",
     "pack",
+    "verify",
+    "assess",
+    "benchmark",
+    "airlock",
 ];
 
 const DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES: &[&str] = &[
@@ -1235,5 +1239,88 @@ mod tests {
             config.sensitivity.protected,
             expected_with_cmdrvl_profile(&home, &["env-only/**"])
         );
+    }
+
+    #[test]
+    fn default_policy_authorizes_all_thirteen_spine_tools_and_still_blocks_raw_reads() {
+        use crate::evaluator::{EvaluationInput, evaluate_access};
+        use crate::extract::PathExposure;
+        use crate::packs::PackRegistry;
+        use crate::spine::detect_spine_invocation;
+        use crate::types::{DecisionAction, ToolKind};
+
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+        let config = load_for_test(
+            &repo_root,
+            &home,
+            None,
+            None,
+            None,
+            PartialConfig::default(),
+        )
+        .unwrap();
+        let registry = PackRegistry::with_built_ins();
+        let protected = home.join(".cmdrvl/secrets/holdings.csv");
+        let protected_arg = protected.display().to_string();
+
+        for tool in [
+            "shape",
+            "rvl",
+            "vacuum",
+            "hashbytes",
+            "fingerprint",
+            "profile",
+            "canon",
+            "lock",
+            "pack",
+            "verify",
+            "assess",
+            "benchmark",
+            "airlock",
+        ] {
+            let command = format!("{tool} {protected_arg}");
+            let detected =
+                detect_spine_invocation(&command, &config.spine.authorized_tools, &repo_root);
+            assert!(detected.is_some(), "default config should authorize `{tool}`");
+            let invocation = detected.unwrap();
+            let input = EvaluationInput::new(
+                ToolKind::Bash,
+                invocation.target_path.clone(),
+                PathExposure::ReadsContents,
+            )
+            .with_spine_invocation(invocation);
+            let decision = evaluate_access(&input, &config, &registry);
+            assert_eq!(
+                decision.action,
+                DecisionAction::Allow,
+                "`{tool}` must be allowed on a protected path: {:?}",
+                decision.reason
+            );
+        }
+
+        // Planted negatives: raw readers and unlisted tools are not authorized.
+        for command in [
+            format!("cat {protected_arg}"),
+            format!("head {protected_arg}"),
+            format!("not-a-spine-tool {protected_arg}"),
+            format!("verifyx {protected_arg}"),
+        ] {
+            assert!(
+                detect_spine_invocation(&command, &config.spine.authorized_tools, &repo_root)
+                    .is_none(),
+                "`{command}` must not be treated as an authorized spine invocation"
+            );
+        }
+
+        for tool in [ToolKind::Read, ToolKind::Grep, ToolKind::Bash] {
+            let input = EvaluationInput::new(tool, protected.clone(), PathExposure::ReadsContents);
+            let decision = evaluate_access(&input, &config, &registry);
+            assert_eq!(
+                decision.action,
+                DecisionAction::Deny,
+                "raw {tool:?} of a protected path must stay blocked"
+            );
+        }
     }
 }
