@@ -51,6 +51,7 @@ fn repo(label: &str) -> Repo {
     ));
     fs::create_dir_all(root.join("data/clients")).expect("data dir");
     fs::create_dir_all(root.join("src")).expect("src dir");
+    fs::create_dir_all(root.join("outside")).expect("outside dir");
     fs::write(
         root.join("data/clients/holdings.csv"),
         "name,ssn\nada,078-05-1120\n",
@@ -223,6 +224,49 @@ fn every_bypass_the_bead_names_is_denied() {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("is blocked by policy default")),
             "`{command}`: {:?}",
+            verdict.reason
+        );
+    }
+}
+
+#[test]
+fn bash_tracks_directory_changes_and_subshell_boundaries() {
+    let repo = repo("cwd-tracking");
+
+    for command in [
+        "cd data && cat clients/holdings.csv",
+        "pushd data; head -n 1 clients/holdings.csv",
+        "env -C data cat clients/holdings.csv",
+        "env --chdir=data cat clients/holdings.csv",
+        "uv run --directory data cat clients/holdings.csv",
+        "uv run -C data cat clients/holdings.csv",
+        "git -C data show HEAD:clients/holdings.csv",
+        "make -C data -f clients/holdings.csv",
+        "make --directory=data --file=clients/holdings.csv",
+        "echo $(cd data; cat clients/holdings.csv)",
+        "cd $UNKNOWN; cat clients/holdings.csv",
+    ] {
+        let verdict = bash(&repo, command);
+        assert!(
+            verdict.denied(),
+            "expected deny for `{command}`, got {} ({:?})",
+            verdict.action,
+            verdict.reason
+        );
+    }
+
+    for command in [
+        "cd outside && rg token",
+        "pushd outside; rg token",
+        "env -C outside rg token",
+        "uv run --directory outside rg token",
+        "(cd data); cat clients/holdings.csv",
+        "cd data | cat clients/holdings.csv",
+    ] {
+        let verdict = bash(&repo, command);
+        assert!(
+            !verdict.denied(),
+            "expected allow for `{command}`, got {:?}",
             verdict.reason
         );
     }

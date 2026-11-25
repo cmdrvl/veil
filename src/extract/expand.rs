@@ -4,7 +4,8 @@
 //! `f=data/clients.csv; cat $f` reads a protected file through a word the
 //! decomposer used to leave as `$f`. This module keeps the assignments of one
 //! command string, substitutes `$name` and `${name}` from them, resolves `$HOME`,
-//! `$PWD` and a leading `~` from the hook's own environment, and expands brace
+//! tracked `$PWD` for each command, a leading `~` from the hook's environment,
+//! and expands brace
 //! lists (`data/{a,b}.csv`, `{1..3}`). A word that still depends on something
 //! veil cannot know (a variable it was never told, `$(...)`, a list that would
 //! expand to more than [`MAX_BRACE_WORDS`] words) comes back with the text it was
@@ -885,8 +886,8 @@ pub(super) fn exports_to_environment(raw: &[&str]) -> bool {
 /// Names whose value veil cannot know from reading the command once: assigned
 /// more than once (a branch or a loop may have run either; a `for name in` is
 /// one assignment), appended to with `+=`, set by `read`, `select`, `mapfile`,
-/// `readarray`, `getopts`, `printf -v` or a `for` with no list, or `PWD` and
-/// `OLDPWD` once the command changes directory.
+/// `readarray`, `getopts`, `printf -v` or a `for` with no list, or `OLDPWD` once
+/// the command changes directory. `PWD` comes from the tracked command cwd.
 fn unknowable_names(command: &str) -> BTreeSet<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unknown = BTreeSet::new();
@@ -955,7 +956,6 @@ fn builtins_set_names(
                 "select" => 1,
                 "read" | "mapfile" | "readarray" | "getopts" => usize::MAX,
                 "cd" | "pushd" | "popd" => {
-                    unknown.insert("PWD".to_owned());
                     unknown.insert("OLDPWD".to_owned());
                     0
                 }

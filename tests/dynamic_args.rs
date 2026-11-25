@@ -272,14 +272,10 @@ fn home_and_pwd_are_resolved_from_the_hook_environment() {
         assert_allowed(&repo, command);
     }
 
-    // After a `cd` veil does not know where `$PWD` points.
-    for command in [
-        "cd data && cat $PWD/clients/holdings.csv",
-        "cd src; cat $PWD/main.rs",
-    ] {
-        let reason = assert_denied(&repo, command);
-        assert!(reason.contains("cannot resolve"), "{command}: {reason}");
-    }
+    // `$PWD` follows a literal directory change, so the resolved path keeps the
+    // same protection decision as its literal spelling.
+    assert_denied(&repo, "cd data && cat $PWD/clients/holdings.csv");
+    assert_allowed(&repo, "cd src; cat $PWD/main.rs");
 }
 
 #[test]

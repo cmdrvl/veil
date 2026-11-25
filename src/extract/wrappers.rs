@@ -13,6 +13,9 @@
 //! `deno` are not installed here or were not run, so those tables are from
 //! their documentation and unchecked.
 
+use std::fs;
+use std::path::Path;
+
 use super::command_name;
 use super::decompose::{MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, emit, script};
 
@@ -274,9 +277,13 @@ enum Step {
     Done,
     /// Drop this many leading words; what is left is the command. `dynamic`
     /// when the wrapper adds arguments this module cannot see.
-    Skip { count: usize, dynamic: bool },
+    Skip {
+        count: usize,
+        dynamic: bool,
+        directory: Option<String>,
+    },
     /// Replace the command with these words.
-    Words(Vec<String>),
+    Words(Vec<String>, Option<String>),
     /// The wrapper runs this string as a shell script.
     Script(String),
     /// `find` with `-exec`: the commands it runs, one per root and block.
@@ -292,6 +299,16 @@ pub(super) fn expand(
     run: &mut Run,
     out: &mut Vec<SimpleCommand>,
 ) {
+    let cwd = run.env.cwd.clone();
+    let cwd_unresolved = run.cwd_unresolved;
+    run.env.cwd = command.cwd.clone();
+    run.cwd_unresolved = command.cwd_unresolved;
+    expand_inner(command, depth, run, out);
+    run.env.cwd = cwd;
+    run.cwd_unresolved = cwd_unresolved;
+}
+
+fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut Vec<SimpleCommand>) {
     let mut command = command;
     let mut start = 0;
     let mut hops = 0;
@@ -316,18 +333,38 @@ pub(super) fn expand(
         }
 
         match step(words) {
-            Step::Done => break,
-            Step::Skip { count, dynamic } => {
+            Step::Done => {
+                let directories = native_directory_targets(words);
+                for directory in directories {
+                    set_directory(&mut command, &directory);
+                }
+                break;
+            }
+            Step::Skip {
+                count,
+                dynamic,
+                directory,
+            } => {
                 start += count;
                 command.origin = Origin::Wrapper;
                 if dynamic {
                     command.unresolved.push(STDIN_ARGUMENTS.to_owned());
                 }
+                if let Some(directory) = directory {
+                    set_directory(&mut command, &directory);
+                    run.env.cwd = command.cwd.clone();
+                    run.cwd_unresolved = command.cwd_unresolved;
+                }
             }
-            Step::Words(replacement) => {
+            Step::Words(replacement, directory) => {
                 command.argv = replacement;
                 start = 0;
                 command.origin = Origin::Wrapper;
+                if let Some(directory) = directory {
+                    set_directory(&mut command, &directory);
+                    run.env.cwd = command.cwd.clone();
+                    run.cwd_unresolved = command.cwd_unresolved;
+                }
             }
             Step::Script(text) => {
                 script(&text, Origin::Wrapper, depth + 1, run, out);
@@ -340,6 +377,8 @@ pub(super) fn expand(
                     // unresolved for the command it runs.
                     let inner = SimpleCommand {
                         argv,
+                        cwd: command.cwd.clone(),
+                        cwd_unresolved: command.cwd_unresolved,
                         redirects_in: Vec::new(),
                         unresolved: command.unresolved.clone(),
                         assigned: Vec::new(),
@@ -481,11 +520,11 @@ fn step(words: &[String]) -> Step {
             }
         }
         "find" => find_step(words),
-        "uvx" => skip(1, &UV, args, false),
+        "uvx" => skip_with_directory(1, &UV, args, false, &["-C", "--directory"]),
         "uv" => match args.first().map(String::as_str) {
-            Some("run") => skip(2, &UV, &args[1..], false),
+            Some("run") => skip_with_directory(2, &UV, &args[1..], false, &["-C", "--directory"]),
             Some("tool") if args.get(1).map(String::as_str) == Some("run") => {
-                skip(3, &UV, &args[2..], false)
+                skip_with_directory(3, &UV, &args[2..], false, &["-C", "--directory"])
             }
             _ => Step::Done,
         },
@@ -519,24 +558,51 @@ fn skip(prefix: usize, options: &Options, rest: &[String], dynamic: bool) -> Ste
     finish(prefix, skipped.end, rest.len(), dynamic)
 }
 
+fn skip_with_directory(
+    prefix: usize,
+    options: &Options,
+    rest: &[String],
+    dynamic: bool,
+    directory_options: &[&str],
+) -> Step {
+    let skipped = skip_options(rest, options);
+    let directory = skipped.value_of(directory_options).map(str::to_owned);
+    finish_with_directory(prefix, skipped.end, rest.len(), dynamic, directory)
+}
+
 /// `Skip` over `prefix + options` words, or `Done` when nothing would be left
 /// to run.
 fn finish(prefix: usize, options_end: usize, available: usize, dynamic: bool) -> Step {
+    finish_with_directory(prefix, options_end, available, dynamic, None)
+}
+
+fn finish_with_directory(
+    prefix: usize,
+    options_end: usize,
+    available: usize,
+    dynamic: bool,
+    directory: Option<String>,
+) -> Step {
     if options_end >= available {
         return Step::Done;
     }
     Step::Skip {
         count: prefix + options_end,
         dynamic,
+        directory,
     }
 }
 
 /// `env [options] [NAME=value]... command`. `-S` carries words to run.
 fn env_step(args: &[String]) -> Step {
     let mut i = 0;
+    let mut directory = None;
 
     loop {
         let skipped = skip_options(&args[i..], &ENV);
+        if let Some(value) = skipped.value_of(&["-C", "--chdir"]) {
+            directory = Some(value.to_owned());
+        }
         if let Some(text) = skipped.value_of(&["-S", "--split-string"])
             && let Some(mut words) = shlex::split(text)
         {
@@ -544,7 +610,7 @@ fn env_step(args: &[String]) -> Step {
             return if words.is_empty() {
                 Step::Done
             } else {
-                Step::Words(words)
+                Step::Words(words, directory)
             };
         }
         i += skipped.end;
@@ -561,7 +627,110 @@ fn env_step(args: &[String]) -> Step {
         }
     }
 
-    finish(1, i, args.len(), false)
+    finish_with_directory(1, i, args.len(), false, directory)
+}
+
+fn set_directory(command: &mut SimpleCommand, target: &str) {
+    let dynamic = command
+        .unresolved
+        .iter()
+        .any(|unresolved| unresolved == target)
+        || target.contains(['*', '?', '[', '\u{1}']);
+    if dynamic {
+        command.cwd_unresolved = true;
+        return;
+    }
+
+    let target = Path::new(target);
+    let candidate = if target.is_absolute() {
+        target.to_path_buf()
+    } else if command.cwd_unresolved {
+        return;
+    } else if let Some(cwd) = &command.cwd {
+        cwd.join(target)
+    } else {
+        command.cwd_unresolved = true;
+        return;
+    };
+
+    match fs::canonicalize(&candidate) {
+        Ok(path) if path.is_dir() => {
+            command.cwd = Some(path);
+            command.cwd_unresolved = false;
+        }
+        _ => command.cwd_unresolved = true,
+    }
+}
+
+/// `git -C` and `make -C` change the directory used by their own file paths.
+/// They stay as commands; only the base for resolving those paths changes.
+fn native_directory_targets(words: &[String]) -> Vec<String> {
+    let Some(program) = words.first().map(|word| command_name(word)) else {
+        return Vec::new();
+    };
+    let args = &words[1..];
+    let mut targets = Vec::new();
+
+    match program {
+        "git" => {
+            let mut i = 0;
+            while i < args.len() {
+                let arg = args[i].as_str();
+                if arg == "-C" {
+                    if let Some(target) = args.get(i + 1) {
+                        targets.push(target.clone());
+                    }
+                    i += 2;
+                } else if let Some(target) = arg.strip_prefix("-C")
+                    && !target.is_empty()
+                {
+                    targets.push(target.to_owned());
+                    i += 1;
+                } else if matches!(
+                    arg,
+                    "-c" | "--git-dir"
+                        | "--work-tree"
+                        | "--namespace"
+                        | "--super-prefix"
+                        | "--exec-path"
+                        | "--config-env"
+                ) {
+                    i += 2;
+                } else if !arg.starts_with('-') {
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        "make" => {
+            let mut i = 0;
+            while i < args.len() {
+                let arg = args[i].as_str();
+                if arg == "-C" || arg == "--directory" {
+                    if let Some(target) = args.get(i + 1) {
+                        targets.push(target.clone());
+                    }
+                    i += 2;
+                } else if let Some(target) = arg.strip_prefix("--directory=") {
+                    targets.push(target.to_owned());
+                    i += 1;
+                } else if let Some(target) = arg.strip_prefix("-C")
+                    && !target.is_empty()
+                {
+                    targets.push(target.to_owned());
+                    i += 1;
+                } else if !arg.starts_with('-') {
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        _ => return Vec::new(),
+    }
+
+    targets
 }
 
 /// `find [options] roots... [expression]` with `-exec`, `-execdir`, `-ok` or
@@ -636,7 +805,7 @@ fn is_expression_start(word: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::decompose::{Origin, decompose};
+    use super::super::decompose::{Origin, ShellEnv, decompose, decompose_in};
     use super::*;
 
     /// The argv of every command `command` would run.
@@ -666,6 +835,34 @@ mod tests {
         assert_runs("/usr/bin/env cat x", &["cat x"]);
         assert_runs("env", &["env"]);
         assert_runs("env A=1", &["env A=1"]);
+    }
+
+    #[test]
+    fn directory_flags_set_the_working_directory_for_commands() {
+        let cwd = std::env::current_dir().expect("working directory");
+        let env = ShellEnv {
+            cwd: Some(cwd.clone()),
+            home: None,
+        };
+        let source = std::fs::canonicalize(cwd.join("src")).expect("src directory");
+
+        for command in [
+            "env -C src cat main.rs",
+            "env --chdir=src cat main.rs",
+            "uv run --directory src cat main.rs",
+            "uv run -C src cat main.rs",
+            "uvx -C src cat main.rs",
+            "git -C src show HEAD:main.rs",
+            "make -C src -f Makefile",
+            "make --directory=src --file=Makefile",
+        ] {
+            let commands = decompose_in(command, &env);
+            assert_eq!(
+                commands.last().expect("wrapped command").cwd.as_deref(),
+                Some(source.as_path()),
+                "{command}: {commands:?}"
+            );
+        }
     }
 
     #[test]

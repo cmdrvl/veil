@@ -112,6 +112,8 @@ pub struct CommandExtraction {
     /// variable it was not told the value of, a `$( )` result, or what `xargs`
     /// reads from standard input ([`STDIN_ARGUMENTS`]). As written (bd-2mi).
     pub unresolved: Vec<String>,
+    /// The command's working directory depends on a path veil could not resolve.
+    pub cwd_unresolved: bool,
     /// The command could not be analysed at all: unbalanced quotes, or more
     /// segments or nesting than veil follows (bd-2mi).
     pub opaque: bool,
@@ -156,6 +158,7 @@ impl CommandExtraction {
             argv_exposure: PathExposure::None,
             argv_scans_directories: false,
             unresolved: Vec::new(),
+            cwd_unresolved: false,
             opaque: false,
             dynamic_strict: false,
             assigned_paths: Vec::new(),
@@ -166,7 +169,7 @@ impl CommandExtraction {
     /// Some argument depends on something veil could not resolve, or the whole
     /// command could not be analysed.
     pub fn has_dynamic_args(&self) -> bool {
-        !self.unresolved.is_empty() || self.opaque
+        !self.unresolved.is_empty() || self.cwd_unresolved || self.opaque
     }
 }
 
@@ -181,7 +184,7 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
 
     decompose_in(command, &env)
         .iter()
-        .map(|simple| command_extraction(simple, cwd))
+        .map(|simple| command_extraction(simple, simple.cwd.as_deref().unwrap_or(cwd)))
         .collect()
 }
 
@@ -200,6 +203,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             argv_exposure: PathExposure::None,
             argv_scans_directories: false,
             unresolved: Vec::new(),
+            cwd_unresolved: command.cwd_unresolved,
             opaque: true,
             dynamic_strict: true,
             assigned_paths,
@@ -270,8 +274,9 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         argv_exposure,
         argv_scans_directories,
         unresolved,
+        cwd_unresolved: command.cwd_unresolved,
         opaque: false,
-        dynamic_strict: is_dynamic_strict(program),
+        dynamic_strict: is_dynamic_strict(program) || command.cwd_unresolved,
         assigned_paths,
         egress: egress::is_egress(program, args),
     }

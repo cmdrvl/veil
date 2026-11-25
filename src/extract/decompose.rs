@@ -21,9 +21,13 @@
 //! cannot hide a reader after them from the first 64 segments, but it does hide
 //! one past them, which is why the stance treats an opaque command as unknown.
 
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use super::expand::{self, Vars, Word};
 use super::wrappers;
-use super::{collect_input_redirect_paths, is_env_assignment};
+use super::{collect_input_redirect_paths, is_env_assignment, is_redirection_word};
 
 pub use super::expand::ShellEnv;
 
@@ -98,6 +102,10 @@ impl Origin {
 pub struct SimpleCommand {
     /// The program and its arguments. Redirections stay in it, as written.
     pub argv: Vec<String>,
+    /// The working directory veil resolved for this command, when known.
+    pub cwd: Option<PathBuf>,
+    /// Its working directory depends on a path veil could not resolve.
+    pub cwd_unresolved: bool,
     /// Files this command reads through `<`.
     pub redirects_in: Vec<String>,
     /// Words that depend on something this module could not resolve: a variable
@@ -123,6 +131,8 @@ impl SimpleCommand {
     pub fn opaque() -> Self {
         Self {
             argv: Vec::new(),
+            cwd: None,
+            cwd_unresolved: false,
             redirects_in: Vec::new(),
             unresolved: Vec::new(),
             assigned: Vec::new(),
@@ -139,7 +149,7 @@ impl SimpleCommand {
     /// Some word depends on something this module could not resolve, or the
     /// whole command could not be analysed.
     pub fn has_dynamic_args(&self) -> bool {
-        !self.unresolved.is_empty() || self.is_opaque()
+        !self.unresolved.is_empty() || self.cwd_unresolved || self.is_opaque()
     }
 }
 
@@ -150,7 +160,8 @@ pub(super) struct Run {
     segments: usize,
     pub(super) truncated: bool,
     pub(super) failed: bool,
-    env: ShellEnv,
+    pub(super) env: ShellEnv,
+    pub(super) cwd_unresolved: bool,
     vars: Vars,
     assigned: Vec<String>,
 }
@@ -207,6 +218,20 @@ pub(super) fn script(
     run: &mut Run,
     out: &mut Vec<SimpleCommand>,
 ) {
+    let cwd = run.env.cwd.clone();
+    let cwd_unresolved = run.cwd_unresolved;
+    script_body(text, origin, depth, run, out);
+    run.env.cwd = cwd;
+    run.cwd_unresolved = cwd_unresolved;
+}
+
+fn script_body(
+    text: &str,
+    origin: Origin,
+    depth: usize,
+    run: &mut Run,
+    out: &mut Vec<SimpleCommand>,
+) {
     if depth > MAX_DEPTH {
         run.truncated = true;
         return;
@@ -216,10 +241,21 @@ pub(super) fn script(
         return;
     };
 
+    let mut root_directory = CwdState {
+        path: run.env.cwd.clone(),
+        unresolved: run.cwd_unresolved,
+    };
+    let mut scoped_directories = HashMap::new();
+    let mut conditional_depth = 0usize;
+
     for segment in segments {
         if !run.take_segment() {
             return;
         }
+        let mut directory = segment_directory(&segment, &root_directory, &mut scoped_directories);
+        run.env.cwd = directory.path.clone();
+        run.cwd_unresolved = directory.unresolved;
+
         for body in &segment.substitutions {
             script(body, Origin::Subshell, depth + 1, run, out);
         }
@@ -256,6 +292,16 @@ pub(super) fn script(
             }
         };
 
+        match words.first().map(|word| word.text.as_str()) {
+            Some("if" | "while" | "until" | "for" | "select" | "case") => {
+                conditional_depth += 1;
+            }
+            Some("fi" | "done" | "esac") => {
+                conditional_depth = conditional_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+
         // `for f in a b c; do cat $f; done`: until `done`, `$f` is each of the
         // words in turn, and every one of them is judged.
         if let Some((name, values)) = for_header(&words) {
@@ -267,14 +313,179 @@ pub(super) fn script(
         // what runs, so the script it runs sees it; the words of the command
         // itself were expanded without it.
         let prefix = prefix_assignments(&words);
-        let Some(command) = simple_command(words, &segment, origin) else {
+        let Some(command) = simple_command(words, &segment, origin, &directory) else {
             continue;
         };
+        let next_directory = shell_directory_after(&command, &directory, run.env.home.as_deref())
+            .map(|mut next| {
+                if segment.conditional || conditional_depth > 0 {
+                    next.unresolved = true;
+                }
+                next
+            });
         run.assigned
             .extend(prefix.iter().map(|(_, value)| value.clone()));
         let saved = run.vars.scoped(&prefix);
         wrappers::expand(command, depth, run, out);
         run.vars.restore(saved);
+
+        if let Some(next_directory) = next_directory
+            && !segment.isolated
+        {
+            directory = next_directory;
+            if let Some(scope) = segment.cwd_scopes.as_ref().and_then(|scopes| scopes.last()) {
+                scoped_directories.insert(*scope, directory);
+            } else {
+                root_directory = directory;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CwdState {
+    path: Option<PathBuf>,
+    unresolved: bool,
+}
+
+fn segment_directory(
+    segment: &Segment,
+    root: &CwdState,
+    scoped: &mut HashMap<usize, CwdState>,
+) -> CwdState {
+    let Some(scopes) = &segment.cwd_scopes else {
+        return root.clone();
+    };
+
+    let mut directory = root.clone();
+    for scope in scopes {
+        directory = scoped
+            .entry(*scope)
+            .or_insert_with(|| directory.clone())
+            .clone();
+    }
+    directory
+}
+
+fn shell_directory_after(
+    command: &SimpleCommand,
+    current: &CwdState,
+    home: Option<&str>,
+) -> Option<CwdState> {
+    let program = command.argv.first().map(|word| super::command_name(word))?;
+    if !matches!(program, "cd" | "pushd" | "popd") {
+        return None;
+    }
+
+    let mut args = command
+        .argv
+        .get(1..)?
+        .iter()
+        .filter(|word| !is_redirection_word(word))
+        .map(String::as_str)
+        .peekable();
+    let mut end_options = false;
+    let mut no_change = false;
+    let mut target = None;
+
+    while let Some(arg) = args.next() {
+        if !end_options && arg == "--" {
+            end_options = true;
+            continue;
+        }
+        if !end_options && program == "cd" && matches!(arg, "-L" | "-P") {
+            continue;
+        }
+        if !end_options && program == "pushd" && arg == "-n" {
+            no_change = true;
+            continue;
+        }
+        if !end_options && arg.starts_with('-') && arg != "-" {
+            return Some(CwdState {
+                path: current.path.clone(),
+                unresolved: true,
+            });
+        }
+        target = Some(arg);
+        if args.next().is_some() {
+            return Some(CwdState {
+                path: current.path.clone(),
+                unresolved: true,
+            });
+        }
+        break;
+    }
+
+    if no_change || program == "popd" {
+        return Some(CwdState {
+            path: current.path.clone(),
+            unresolved: true,
+        });
+    }
+
+    let target = match (program, target) {
+        ("cd", None) => match home {
+            Some(home) => home,
+            None => {
+                return Some(CwdState {
+                    path: current.path.clone(),
+                    unresolved: true,
+                });
+            }
+        },
+        (_, None) => {
+            return Some(CwdState {
+                path: current.path.clone(),
+                unresolved: true,
+            });
+        }
+        (_, Some("-")) => {
+            return Some(CwdState {
+                path: current.path.clone(),
+                unresolved: true,
+            });
+        }
+        (_, Some(target)) => target,
+    };
+
+    let dynamic_target = command
+        .unresolved
+        .iter()
+        .any(|unresolved| unresolved == target)
+        || target.contains(['*', '?', '[', SUBSTITUTION]);
+    if dynamic_target {
+        return Some(CwdState {
+            path: current.path.clone(),
+            unresolved: true,
+        });
+    }
+
+    let target = Path::new(target);
+    let candidate = if target.is_absolute() {
+        target.to_path_buf()
+    } else if current.unresolved {
+        return Some(CwdState {
+            path: current.path.clone(),
+            unresolved: true,
+        });
+    } else if let Some(current_path) = &current.path {
+        current_path.join(target)
+    } else {
+        return Some(CwdState {
+            path: None,
+            unresolved: true,
+        });
+    };
+
+    match fs::canonicalize(&candidate) {
+        Ok(path) if path.is_dir() => Some(CwdState {
+            path: Some(path),
+            unresolved: false,
+        }),
+        _ => Some(CwdState {
+            path: current.path.clone(),
+            unresolved: true,
+        }),
     }
 }
 
@@ -315,6 +526,7 @@ fn simple_command(
     mut words: Vec<Word>,
     segment: &Segment,
     origin: Origin,
+    cwd: &CwdState,
 ) -> Option<SimpleCommand> {
     let start = words
         .iter()
@@ -340,6 +552,8 @@ fn simple_command(
     Some(SimpleCommand {
         unresolved,
         argv,
+        cwd: cwd.path.clone(),
+        cwd_unresolved: cwd.unresolved,
         redirects_in: Vec::new(),
         assigned: Vec::new(),
         origin,
@@ -365,6 +579,12 @@ struct Segment {
     /// [`SUBSTITUTION`], here-document operators removed.
     text: String,
     stdin_piped: bool,
+    /// Parenthesized subshell scopes containing this segment, outermost first.
+    cwd_scopes: Option<Vec<usize>>,
+    /// Pipelines and background commands do not change the caller's directory.
+    isolated: bool,
+    /// This segment only runs if the preceding `&&` or `||` condition matches.
+    conditional: bool,
     heredoc: Option<String>,
     /// Bodies of `$( )`, backticks and `<( )` found in `text`, and in an
     /// expanding here-document body.
@@ -421,6 +641,8 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
     let mut current = Segment::default();
     let mut pending: Vec<PendingHeredoc> = Vec::new();
     let mut piped = false;
+    let mut cwd_scopes = Vec::new();
+    let mut next_scope = 0usize;
     let mut word_start = true;
     let mut i = 0;
 
@@ -507,13 +729,54 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                     i += 1;
                 }
             }
-            b';' | b'(' | b')' => {
-                end_segment(&mut segments, &mut current, &mut piped, false);
+            b';' => {
+                end_segment(
+                    &mut segments,
+                    &mut current,
+                    &mut piped,
+                    false,
+                    &cwd_scopes,
+                    false,
+                );
+                i += 1;
+                word_start = true;
+            }
+            b'(' => {
+                end_segment(
+                    &mut segments,
+                    &mut current,
+                    &mut piped,
+                    false,
+                    &cwd_scopes,
+                    false,
+                );
+                cwd_scopes.push(next_scope);
+                next_scope += 1;
+                i += 1;
+                word_start = true;
+            }
+            b')' => {
+                end_segment(
+                    &mut segments,
+                    &mut current,
+                    &mut piped,
+                    false,
+                    &cwd_scopes,
+                    false,
+                );
+                cwd_scopes.pop();
                 i += 1;
                 word_start = true;
             }
             b'\n' => {
-                end_segment(&mut segments, &mut current, &mut piped, false);
+                end_segment(
+                    &mut segments,
+                    &mut current,
+                    &mut piped,
+                    false,
+                    &cwd_scopes,
+                    false,
+                );
                 i = read_heredoc_bodies(text, i + 1, &mut pending, &mut segments);
                 word_start = true;
             }
@@ -526,7 +789,15 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                     i += 1;
                     word_start = false;
                 } else {
-                    end_segment(&mut segments, &mut current, &mut piped, false);
+                    end_segment(
+                        &mut segments,
+                        &mut current,
+                        &mut piped,
+                        false,
+                        &cwd_scopes,
+                        next != Some(b'&'),
+                    );
+                    current.conditional = next == Some(b'&');
                     i += if next == Some(b'&') { 2 } else { 1 };
                     word_start = true;
                 }
@@ -540,11 +811,26 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                     i += 1;
                     word_start = false;
                 } else if next == Some(b'|') {
-                    end_segment(&mut segments, &mut current, &mut piped, false);
+                    end_segment(
+                        &mut segments,
+                        &mut current,
+                        &mut piped,
+                        false,
+                        &cwd_scopes,
+                        false,
+                    );
+                    current.conditional = true;
                     i += 2;
                     word_start = true;
                 } else {
-                    end_segment(&mut segments, &mut current, &mut piped, true);
+                    end_segment(
+                        &mut segments,
+                        &mut current,
+                        &mut piped,
+                        true,
+                        &cwd_scopes,
+                        false,
+                    );
                     i += if next == Some(b'&') { 2 } else { 1 };
                     word_start = true;
                 }
@@ -564,7 +850,14 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
         }
     }
 
-    end_segment(&mut segments, &mut current, &mut piped, false);
+    end_segment(
+        &mut segments,
+        &mut current,
+        &mut piped,
+        false,
+        &cwd_scopes,
+        false,
+    );
     segments.retain(|segment| !segment.is_blank());
     Some(segments)
 }
@@ -596,9 +889,13 @@ fn end_segment(
     current: &mut Segment,
     piped: &mut bool,
     next_piped: bool,
+    cwd_scopes: &[usize],
+    background: bool,
 ) {
     let mut finished = std::mem::take(current);
     finished.stdin_piped = *piped;
+    finished.cwd_scopes = (!cwd_scopes.is_empty()).then(|| cwd_scopes.to_vec());
+    finished.isolated = *piped || next_piped || background;
     segments.push(finished);
     *piped = next_piped;
 }
@@ -1394,20 +1691,56 @@ mod tests {
     }
 
     #[test]
-    fn pwd_is_not_trusted_after_a_cd() {
+    fn pwd_tracks_literal_directory_changes() {
+        let cwd = std::env::current_dir().expect("working directory");
         let env = ShellEnv {
-            cwd: Some("/work/repo".into()),
+            cwd: Some(cwd.clone()),
+            home: None,
+        };
+        let source = std::fs::canonicalize(cwd.join("src")).expect("src directory");
+
+        let commands = decompose_in("cd src; cat $PWD/main.rs", &env);
+        assert_eq!(
+            commands[1].argv[1],
+            source.join("main.rs").to_string_lossy()
+        );
+        assert_eq!(commands[1].cwd.as_deref(), Some(source.as_path()));
+        assert!(!commands[1].has_dynamic_args());
+    }
+
+    #[test]
+    fn cwd_is_scoped_to_parenthesized_groups_and_pipeline_members() {
+        let cwd = std::env::current_dir().expect("working directory");
+        let env = ShellEnv {
+            cwd: Some(cwd.clone()),
+            home: None,
+        };
+        let source = std::fs::canonicalize(cwd.join("src")).expect("src directory");
+
+        let grouped = decompose_in("(cd src; cat main.rs); cat Cargo.toml", &env);
+        assert_eq!(grouped[1].cwd.as_deref(), Some(source.as_path()));
+        assert_eq!(grouped[2].cwd.as_deref(), Some(cwd.as_path()));
+
+        let pipeline = decompose_in("cd src | cat main.rs; cat Cargo.toml", &env);
+        assert_eq!(pipeline[1].cwd.as_deref(), Some(cwd.as_path()));
+        assert_eq!(pipeline[2].cwd.as_deref(), Some(cwd.as_path()));
+
+        let substitution = decompose_in("echo $(cd src; cat main.rs); cat Cargo.toml", &env);
+        assert_eq!(substitution[2].cwd.as_deref(), Some(cwd.as_path()));
+        assert_eq!(substitution[3].cwd.as_deref(), Some(cwd.as_path()));
+    }
+
+    #[test]
+    fn unresolved_directory_changes_mark_following_commands_dynamic() {
+        let cwd = std::env::current_dir().expect("working directory");
+        let env = ShellEnv {
+            cwd: Some(cwd),
             home: None,
         };
 
-        assert_eq!(
-            decompose_in("cat $PWD/x", &env)[0].argv,
-            words("cat /work/repo/x")
-        );
-        assert_eq!(
-            decompose_in("cd data; cat $PWD/x", &env)[1].unresolved,
-            vec!["$PWD/x".to_owned()]
-        );
+        let commands = decompose_in("cd $UNKNOWN; cat file", &env);
+        assert!(commands[1].cwd_unresolved);
+        assert!(commands[1].has_dynamic_args());
     }
 
     #[test]
