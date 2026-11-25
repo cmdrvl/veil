@@ -603,10 +603,68 @@ form of "your data never entered the model", and it is a demo, not a policy.
 ### Non-goals restated
 
 Write/Edit guarding and PostToolUse output filtering remain out of scope.
-Outbound *message body* policy stays with the calling wrapper / KOVREX.
+Outbound *message body* policy stays with the calling wrapper / external disclosure service.
 Endpoint Security and kernel extensions are out of scope.
 
 ### Tracking
 
-Beads under epic bd-30b. Existing backlog bypass beads (bd-28k, bd-r93,
-bd-3pm, bd-hf9) are superseded by Track A items 1, 6 and 8.
+Beads under epic `bd-30b`. Existing backlog bypass beads (`bd-28k`, `bd-r93`,
+`bd-3pm`, `bd-hf9`) are superseded by Track A items 1, 6 and 8.
+
+---
+
+## System Integration & Agent-Ergonomic Synthesis — 2026-11-24
+
+Within the unified CMD+RVL architecture (`cmdrvl/docs/SYSTEM_ARCHITECTURE.md`),
+`veil` is not a standalone Claude hook — it is the **Ingress Half of Orthogonal
+Plane A (the Boundary & Exposure Lattice `public < derived < protected`)**.
+
+### Architectural invariants added for v1
+
+1. **Hook-mode raw-dump flag guard + safe remediation (`bd-en1`, P0):**
+   Enforce `[spine.denied_flags]` (`--explicit`, `--raw`, `--dump`, `--show-values`)
+   immediately in hook mode (`src/spine.rs` + `src/evaluator.rs`) and reuse the
+   exact same flag table in the Track B broker (`bd-27o`). Rewrite
+   `DIRECT_READ_REMEDIATION` so `veil` never instructs an agent to write an
+   ad-hoc bypass script; instead emit structured recovery pointing to
+   `veil operator --json` or `veil exec <tool> <path>` when sandboxed.
+2. **Shared `boundary-detectors` crate (`bd-jg9`, P1):**
+   Extract one pure-Rust (`#![forbid(unsafe_code)]`, deterministic, zero-ML)
+   detector crate consumed by both `veil` (content sniff `bd-35u`, broker stdout
+   scan `bd-27o`) and `airlock` (`al-34s`, `al-cuh`). Includes Aho-Corasick
+   literals, regex/Luhn/entropy packs, bounded recursive base64/hex
+   decode-and-rescan, magic-byte sniffing, and the one-way rolling shingle Bloom
+   filter.
+3. **Interactive-agent default for `veil sandbox --egress airlock` (`bd-3g5`, P1):**
+   Default `--egress-mode` to `policy-proxy` for interactive coding harnesses
+   (`claude`, `codex`, `gemini`, Cursor) so Turn 1 never 403s for a missing
+   pre-assembled manifest; expose `--egress-mode strict-manifest` for
+   deterministic batch pipelines and `evidence-protocol` runtimes. Export
+   `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, and `GEMINI_BASE_URL` pointing to
+   the localhost gate.
+4. **Protected-corpus one-way shingle Bloom filter (`bd-d97`, P1):**
+   At `veil sandbox --egress airlock` startup (outside the sandbox), build a
+   one-way rolling-hash Bloom filter over `[sensitivity] protected` files
+   (excluding common repo boilerplate; zero raw bytes stored) and hand only the
+   filter to `airlock gate --protected-bloom` so proprietary holdings, deal
+   prose, and client records are caught on the wire even without regex patterns.
+5. **Warehouse/DB twin integration (`bd-2ex`):**
+   Extend `veil sandbox --twin` beyond local file overlays to pair directly with
+   `cmdrvl/twinning`: inject local synthetic Postgres/Snowflake endpoints
+   (`DATABASE_URL`, `PGHOST`, `PGPORT`, `SNOWFLAKE_*`) while sandbox network
+   rules block real production warehouse egress.
+6. **Fractal agent posture projection (`control.v0` / `cmdrvl orient`):**
+   `veil --robot-triage`, `veil doctor health --json`, and `veil attest` expose
+   the uniform `boundary` posture object (`enforcement`, `twin_mode`,
+   `egress_mode`, `violations`, `derived_registry_hash`) consumed by
+   `cmdrvl orient --json` and `control.v0` packets so a cold agent learns its
+   exact clearance in one call (~500 tokens).
+7. **Runtime & scope discipline:**
+   - Keep `veil` hook mode **100% synchronous** (zero async runtime, `<1ms`
+     cold start). Broker (`bd-27o`) may use tiny sync threads or `asupersync`.
+   - Prioritize unprivileged OS backends for v1 (**macOS Seatbelt** + **Linux
+     Landlock ABI 4+**); treat root `netns`/`veth` and `pf` anchors as optional
+     hardening recipes.
+   - Keep `docs/jev_sidecar_plan.md` strictly quarantined as offline research,
+     out of `veil` v1.
+
