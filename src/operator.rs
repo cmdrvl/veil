@@ -2925,9 +2925,11 @@ mod tests {
         for command in manifest["commands"].as_array().expect("commands array") {
             let name = command["name"].as_str().expect("command name");
             let declared = command["guard_preflight_required"] == true;
+            // `sandbox` compiles a profile and runs nothing, so main.rs exempts it
+            // (command_requires_guard_preflight) and the manifest says `false`.
             let exempt = matches!(
                 name,
-                "doctor" | "capabilities" | "robot-docs" | "install" | "uninstall"
+                "doctor" | "capabilities" | "robot-docs" | "sandbox" | "install" | "uninstall"
             );
             assert_eq!(
                 declared, !exempt,
