@@ -95,7 +95,7 @@ dependencies = [
 [[package]]
 name = "boundary-detectors"
 version = "0.1.0"
-source = "git+https://github.com/cmdrvl/boundary-detectors?rev=71ed73194548a30fd3f0c0277789343cfa2ff9d9#71ed73194548a30fd3f0c0277789343cfa2ff9d9"
+source = "git+https://github.com/cmdrvl/boundary-detectors?rev=56cf4c6a4dbd1112f0ef27f2d04c0f46bb7bb298#56cf4c6a4dbd1112f0ef27f2d04c0f46bb7bb298"
 dependencies = [
  "base64",
  "blake3",
