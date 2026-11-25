@@ -201,6 +201,14 @@ fn every_egress_tool_is_denied_for_a_protected_path_and_allowed_for_a_clean_one(
 }
 
 #[test]
+fn an_unregistered_send_wrapper_still_gets_literal_path_protection() {
+    let repo = repo("send-wrapper");
+
+    assert_denied(&repo, &format!("resend send --attachment {HOLDINGS}"));
+    assert_allowed(&repo, &format!("resend send --attachment {CLEAN}"));
+}
+
+#[test]
 fn a_path_named_inside_a_longer_word_is_still_a_path() {
     let repo = repo("embedded");
 
