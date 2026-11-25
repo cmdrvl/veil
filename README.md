@@ -415,6 +415,36 @@ release build on the machine it was measured on, and a command that names two
 files takes about 80 µs; with 10,000 patterns the index build brings the 64-file
 command to about 4.5 ms.
 
+### Audit Log
+
+With `audit_log = true` veil appends one line of JSON per path it judged to
+`audit_path` (`~/.cmdrvl/logs/veil/audit.jsonl` by default). A command veil
+recognises as a reader (`cat`, `head`, `grep`...) records the file it read, allowed
+or denied; a path named by any other command is recorded when it is protected.
+A redirection and its attached target (`2>/dev/null`, `>out.txt`, `2>&1`) are never
+recorded as paths, however they are glued to the word before them
+(`cat x.csv>out.txt` reads `x.csv`).
+
+- **Schema.** Every record carries `"schema_version": "veil.audit.v1"`. Records
+  written before it have no such key and fewer fields; anything that reads the log
+  should treat a record without it as legacy.
+- **Whole lines.** A record is written with a single `write`, so hooks running at
+  once cannot write into each other's lines. A log from an older veil can hold
+  lines where that happened.
+- **Reading.** `veil audit` lists the newest entries and skips lines that are not
+  audit entries, saying how many (`skipped_lines` in `--json`). `veil audit
+  --validate` counts every line as `current`, `legacy` (readable, no
+  `veil.audit.v1`) or `unparseable`, and lists the first 20 unparseable line
+  numbers; `--json` prints the same as a document. It reports and exits 0: read
+  `unparseable` to decide. It takes no `--class`.
+- **Rotation.** When the log reaches 10 MiB the next write moves it to
+  `audit.jsonl.1`, each older file up one place, and keeps five. **The oldest is
+  deleted.** `audit.jsonl.lock` next to the log serialises that between hooks. A
+  failed rotation does not lose the record being written; the hook says so on
+  stderr with the rest of its audit errors. The size and the five are fixed, and
+  `veil audit` reads only the current file, so entries just before a rotation are in
+  `audit.jsonl.1`.
+
 ### Configuration
 
 ```toml

@@ -63,6 +63,12 @@ pub struct AuditArgs {
         help = "Only entries of one class: `egress` (a command that sends a protected path), or a reason_class"
     )]
     pub class: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "class",
+        help = "Count the audit log's lines by kind (current, legacy, unparseable) and list the unparseable ones"
+    )]
+    pub validate: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
@@ -281,6 +287,7 @@ mod tests {
                 OperatorCommand::Audit(AuditArgs {
                     json: false,
                     class: None,
+                    validate: false,
                 }),
             ),
             (
@@ -350,7 +357,24 @@ mod tests {
             Dispatch::Operator(OperatorCommand::Audit(AuditArgs {
                 json: true,
                 class: None,
+                validate: false,
             }))
+        );
+    }
+
+    #[test]
+    fn audit_validate_is_a_report_of_its_own_and_takes_no_class() {
+        assert_eq!(
+            parse(&["veil", "audit", "--validate", "--json"]),
+            Dispatch::Operator(OperatorCommand::Audit(AuditArgs {
+                json: true,
+                class: None,
+                validate: true,
+            }))
+        );
+        assert!(
+            Cli::try_parse_from(["veil", "audit", "--validate", "--class", "egress"]).is_err(),
+            "validation counts the whole log; a class filter has nothing to select"
         );
     }
 
@@ -361,6 +385,7 @@ mod tests {
             Dispatch::Operator(OperatorCommand::Audit(AuditArgs {
                 json: true,
                 class: Some("egress".to_owned()),
+                validate: false,
             }))
         );
         for class in [
@@ -375,6 +400,7 @@ mod tests {
                 Dispatch::Operator(OperatorCommand::Audit(AuditArgs {
                     json: false,
                     class: Some(class.to_owned()),
+                    validate: false,
                 }))
             );
         }

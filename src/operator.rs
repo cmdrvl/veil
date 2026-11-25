@@ -10,6 +10,7 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 use veil::allowlist::SafePathMatcher;
+use veil::audit;
 use veil::config::{self, Config, PolicyMode};
 use veil::evaluator::{EvaluationInput, evaluate_access};
 use veil::extract::{PathExposure, extract_read_or_grep_paths};
@@ -142,6 +143,9 @@ pub fn run_config(args: &ConfigArgs) -> Result<String, Box<dyn std::error::Error
 pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
     let config = config::load_config(&repo_root)?;
+    if args.validate {
+        return render_audit_validation(&config.policy.audit_path, args.json);
+    }
     render_audit_for_path(
         &config.policy.audit_path,
         args.json,
@@ -248,19 +252,25 @@ fn render_audit_for_path(
     class: Option<&str>,
     limit: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let entries = read_recent_audit_entries(audit_path, class, limit)?;
+    let AuditWindow { entries, skipped } = read_recent_audit_entries(audit_path, class, limit)?;
 
     if json_output {
         let mut value = json!({
             "path": audit_path.display().to_string(),
             "entries": entries,
         });
-        if let (Some(class), Some(object)) = (class, value.as_object_mut()) {
-            object.insert("class".to_owned(), json!(class));
+        if let Some(object) = value.as_object_mut() {
+            if let Some(class) = class {
+                object.insert("class".to_owned(), json!(class));
+            }
+            // only when there are some, so a healthy log's document is unchanged
+            if skipped > 0 {
+                object.insert("skipped_lines".to_owned(), json!(skipped));
+            }
         }
         Ok(serde_json::to_string_pretty(&value)?)
     } else {
-        Ok(render_audit_human(audit_path, class, &entries))
+        Ok(render_audit_human(audit_path, class, &entries, skipped))
     }
 }
 
@@ -688,52 +698,131 @@ fn entry_has_class(entry: &Value, class: &str) -> bool {
         || string_field(entry, "reason_class") == Some(class)
 }
 
+/// What `veil audit` read: the newest entries, and how many lines it could not
+/// read and so left out.
+struct AuditWindow {
+    entries: Vec<Value>,
+    skipped: usize,
+}
+
 /// The last `limit` entries of the audit log, or of its entries of `class`: the
 /// filter comes first, so an old attempt is not pushed out of the window by
 /// newer records of another class.
+///
+/// A line that is not an audit entry is counted and left out, not an error: one
+/// damaged line used to make the whole log unreadable. `veil audit --validate`
+/// says which lines they are.
 fn read_recent_audit_entries(
     path: &Path,
     class: Option<&str>,
     limit: usize,
-) -> io::Result<Vec<Value>> {
+) -> io::Result<AuditWindow> {
+    let mut window = AuditWindow {
+        entries: Vec::new(),
+        skipped: 0,
+    };
     if limit == 0 || !path.exists() {
-        return Ok(Vec::new());
+        return Ok(window);
     }
 
     let file = fs::File::open(path)?;
     let mut recent = VecDeque::with_capacity(limit);
 
-    for (line_number, line) in BufReader::new(file).lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
+    for line in BufReader::new(file).split(b'\n') {
+        let fields = match audit::parse_line(&line?) {
+            audit::Line::Blank => continue,
+            audit::Line::Unparseable => {
+                window.skipped += 1;
+                continue;
+            }
+            audit::Line::Entry { fields, .. } => fields,
+        };
 
-        let value = serde_json::from_str::<Value>(&line).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid audit JSONL at {} line {}: {error}",
-                    path.display(),
-                    line_number + 1
-                ),
-            )
-        })?;
-
-        if class.is_some_and(|class| !entry_has_class(&value, class)) {
+        if class.is_some_and(|class| !entry_has_class(&fields, class)) {
             continue;
         }
 
         if recent.len() == limit {
             recent.pop_front();
         }
-        recent.push_back(value);
+        recent.push_back(fields);
     }
 
-    Ok(recent.into_iter().collect())
+    window.entries = recent.into_iter().collect();
+    Ok(window)
 }
 
-fn render_audit_human(path: &Path, class: Option<&str>, entries: &[Value]) -> String {
+/// `veil audit --validate`: every line of the log sorted into current, legacy
+/// and unparseable.
+fn render_audit_validation(
+    audit_path: &Path,
+    json_output: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let exists = audit_path.exists();
+    let report = if exists {
+        audit::validate(BufReader::new(fs::File::open(audit_path)?))?
+    } else {
+        audit::Validation::default()
+    };
+
+    if json_output {
+        return Ok(serde_json::to_string_pretty(&json!({
+            "path": audit_path.display().to_string(),
+            "exists": exists,
+            "schema_version": audit::SCHEMA_VERSION,
+            "lines": report.lines,
+            "blank": report.blank,
+            "current": report.current,
+            "legacy": report.legacy,
+            "unparseable": report.unparseable,
+            "unparseable_lines": report.unparseable_lines,
+        }))?);
+    }
+
+    let mut output = String::new();
+    let _ = writeln!(output, "Audit validation");
+    let _ = writeln!(output, "  path: {}", audit_path.display());
+    if !exists {
+        output.push_str("  (no audit log at this path)\n");
+        return Ok(output.trim_end().to_owned());
+    }
+    let _ = writeln!(output, "  lines: {} ({} blank)", report.lines, report.blank);
+    let _ = writeln!(
+        output,
+        "  current ({}): {}",
+        audit::SCHEMA_VERSION,
+        report.current
+    );
+    let _ = writeln!(
+        output,
+        "  legacy (readable, no {}): {}",
+        audit::SCHEMA_VERSION,
+        report.legacy
+    );
+    let _ = writeln!(output, "  unparseable: {}", report.unparseable);
+    if !report.unparseable_lines.is_empty() {
+        let listed: Vec<String> = report
+            .unparseable_lines
+            .iter()
+            .map(usize::to_string)
+            .collect();
+        let more = report.unparseable - report.unparseable_lines.len();
+        let _ = write!(output, "  unparseable at line: {}", listed.join(", "));
+        if more > 0 {
+            let _ = write!(output, " (and {more} more)");
+        }
+        output.push('\n');
+    }
+
+    Ok(output.trim_end().to_owned())
+}
+
+fn render_audit_human(
+    path: &Path,
+    class: Option<&str>,
+    entries: &[Value],
+    skipped: usize,
+) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "Audit");
     let _ = writeln!(output, "  path: {}", path.display());
@@ -741,6 +830,12 @@ fn render_audit_human(path: &Path, class: Option<&str>, entries: &[Value]) -> St
         let _ = writeln!(output, "  class: {class}");
     }
     let _ = writeln!(output, "  entries: {}", entries.len());
+    if skipped > 0 {
+        let _ = writeln!(
+            output,
+            "  skipped: {skipped} lines that are not audit entries (`veil audit --validate` lists them)"
+        );
+    }
 
     if entries.is_empty() {
         output.push_str("  recent:\n    - (none)\n");
@@ -2174,8 +2269,95 @@ mod tests {
         assert_eq!(value["path"], audit_path.display().to_string());
         assert_eq!(value["entries"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["entries"][0]["tool"], "Read");
-        // no filter, no `class` key
+        // no filter, no `class` key; a healthy log skips nothing and says nothing
         assert!(value.get("class").is_none());
+        assert!(value.get("skipped_lines").is_none());
+    }
+
+    /// A good entry, two halves of one record that two hooks wrote at once, and
+    /// another good entry.
+    fn damaged_audit_fixture(name: &str) -> PathBuf {
+        let audit_path = unique_temp_dir(name).join("audit.jsonl");
+        write_file(
+            &audit_path,
+            concat!(
+                "{\"ts\":\"1\",\"tool\":\"Read\",\"path\":\"data/a.csv\",\"decision\":\"deny\"}\n",
+                "{\"confidence\":null,\"decision\":\"allow{\"\"confid\n",
+                ",\"ts\":\"1775603272\"}\n",
+                "{\"ts\":\"2\",\"tool\":\"Bash\",\"path\":\"data/b.csv\",\"decision\":\"deny\"}\n",
+            ),
+        );
+        audit_path
+    }
+
+    #[test]
+    fn audit_lists_the_entries_it_can_read_and_counts_the_lines_it_cannot() {
+        let audit_path = damaged_audit_fixture("audit-damaged");
+
+        let human = render_audit_for_path(&audit_path, false, None, 20)
+            .expect("a damaged line is not an error");
+        assert!(human.contains("entries: 2"), "{human}");
+        assert!(human.contains("skipped: 2 lines"), "{human}");
+        assert!(human.contains("veil audit --validate"), "{human}");
+        assert!(human.contains("data/a.csv"), "{human}");
+        assert!(human.contains("data/b.csv"), "{human}");
+
+        let json = render_audit_for_path(&audit_path, true, None, 20).expect("json");
+        let value: Value = serde_json::from_str(&json).expect("audit JSON should parse");
+        assert_eq!(value["entries"].as_array().map(Vec::len), Some(2));
+        assert_eq!(value["skipped_lines"], 2);
+    }
+
+    #[test]
+    fn audit_validate_counts_every_kind_of_line_in_json_and_text() {
+        let audit_path = unique_temp_dir("audit-validate").join("audit.jsonl");
+        write_file(
+            &audit_path,
+            concat!(
+                "{\"schema_version\":\"veil.audit.v1\",\"ts\":\"1\",\"tool\":\"Read\",\"path\":\"a\",\"decision\":\"allow\"}\n",
+                "{\"ts\":\"2\",\"tool\":\"Read\",\"path\":\"b\",\"decision\":\"allow\"}\n",
+                "not json\n",
+                "\n",
+            ),
+        );
+
+        let json = render_audit_validation(&audit_path, true).expect("validation");
+        let value: Value = serde_json::from_str(&json).expect("validation JSON should parse");
+        assert_eq!(value["exists"], true);
+        assert_eq!(value["schema_version"], "veil.audit.v1");
+        assert_eq!(value["lines"], 4);
+        assert_eq!(value["blank"], 1);
+        assert_eq!(value["current"], 1);
+        assert_eq!(value["legacy"], 1);
+        assert_eq!(value["unparseable"], 1);
+        assert_eq!(value["unparseable_lines"], json!([3]));
+
+        let text = render_audit_validation(&audit_path, false).expect("validation");
+        assert!(text.contains("lines: 4 (1 blank)"), "{text}");
+        assert!(text.contains("current (veil.audit.v1): 1"), "{text}");
+        assert!(
+            text.contains("legacy (readable, no veil.audit.v1): 1"),
+            "{text}"
+        );
+        assert!(text.contains("unparseable: 1"), "{text}");
+        assert!(text.contains("unparseable at line: 3"), "{text}");
+    }
+
+    #[test]
+    fn audit_validate_says_when_there_is_no_log_and_how_many_lines_it_leaves_unlisted() {
+        let missing = unique_temp_dir("audit-validate-missing").join("audit.jsonl");
+        let text = render_audit_validation(&missing, false).expect("validation");
+        assert!(text.contains("no audit log at this path"), "{text}");
+        let json = render_audit_validation(&missing, true).expect("validation");
+        let value: Value = serde_json::from_str(&json).expect("validation JSON should parse");
+        assert_eq!(value["exists"], false);
+        assert_eq!(value["lines"], 0);
+
+        let long = unique_temp_dir("audit-validate-long").join("audit.jsonl");
+        write_file(&long, &"garbage\n".repeat(45));
+        let text = render_audit_validation(&long, false).expect("validation");
+        assert!(text.contains("unparseable: 45"), "{text}");
+        assert!(text.contains("(and 25 more)"), "{text}");
     }
 
     /// Three egress denials, interleaved with other records, the newest of them
