@@ -201,9 +201,12 @@ mod tests {
         assert!(rules.allowed[0].read_file && rules.allowed[0].read_dir);
         let users = filesystem_root.join("Users");
         let canonical_users = fs::canonicalize(&users).expect("canonical Users");
-        assert!(rules.excluded.contains(&users));
-        assert!(rules.excluded.contains(&canonical_users));
-        assert_eq!(rules.excluded.len(), 2);
+        let expected_excluded: Vec<_> = [users, canonical_users]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(rules.excluded, expected_excluded);
         assert!(
             rules
                 .warnings
