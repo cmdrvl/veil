@@ -122,10 +122,13 @@ fn severity_label(severity: &SensitivitySeverity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Clearance, InformationLabel};
 
     fn allow_decision() -> Decision {
         Decision {
             action: DecisionAction::Allow,
+            label: InformationLabel::Public,
+            clearance: Clearance::Derived,
             reason: None,
             severity: None,
             confidence: None,
@@ -136,6 +139,8 @@ mod tests {
     fn deny_decision() -> Decision {
         Decision {
             action: DecisionAction::Deny,
+            label: InformationLabel::Protected,
+            clearance: Clearance::Derived,
             reason: Some("matched by core.filesystem".to_owned()),
             severity: Some(SensitivitySeverity::Critical),
             confidence: Some(0.99),

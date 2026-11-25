@@ -483,13 +483,26 @@ small lattice `public < derived < protected`, and every process as running at a
   policy; the broker's content-hash registry records provenance for broker
   outputs, not labels for arbitrary files an agent creates.
 
+The `InformationLabel` lattice and `Clearance` ordering are implemented in
+`src/types.rs`; each evaluator `Decision` exposes its label, clearance, and
+policy verdict as one `AccessAssessment`. Reason annotations use that same
+label type. The implication above is the deny-mode security invariant: `warn`
+and `log` policy modes are advisory and may allow a protected label through,
+and explicit fail-open paths for parser, classifier, or timeout errors do not
+establish confinement.
+
 This is a cut-down decentralized label model. It replaces three ad hoc
 notions (protected globs, safe globs, spine allowlist) with one invariant and
 gives the property tests something to check: **enforcement dominance**, i.e.
 every protected-read decision the hook denies is also denied by the compiled
-sandbox policy, and every broker output labelled `public` or `derived` is
-readable inside the sandbox. Egress denials and unsupported path mappings are
-not covered by that property.
+sandbox policy. The `proptest` feature checks label-join laws, safe-glob
+precedence, monotonicity after adding protected patterns, simple-command
+decomposition idempotence, and denial representation in both compiled read
+profiles with 512 fixed-seed cases in CI. These checks exercise compiled plans;
+the separate sandbox integration test applies a Landlock plan to a real kernel.
+Broker-output readability remains a property for the broker implementation
+(bd-27o), which is not yet present. Egress denials and unsupported path
+mappings are not covered by these properties.
 
 ### Track A — hook hardening (0.5): honest, measured, generated claims
 

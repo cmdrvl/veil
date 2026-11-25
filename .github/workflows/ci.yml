@@ -34,6 +34,12 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Run fixed-seed label and enforcement properties
+        env:
+          PROPTEST_CASES: 512
+          PROPTEST_RNG_SEED: "314159265"
+        run: cargo test --features proptest
+
       - name: Install ast-grep
         run: npm install --global @ast-grep/cli
 

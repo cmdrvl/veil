@@ -8,7 +8,10 @@ use crate::config::{Config, DynamicArgsMode, PolicyMode};
 use crate::extract::PathExposure;
 use crate::packs::PackRegistry;
 use crate::spine::SpineInvocation;
-use crate::types::{Decision, DecisionAction, SensitivityResult, SensitivitySeverity, ToolKind};
+use crate::types::{
+    AccessAssessment, Clearance, Decision, DecisionAction, InformationLabel, SensitivityResult,
+    SensitivitySeverity, ToolKind,
+};
 
 const DIRECT_READ_REMEDIATION: &str = "Direct read blocked. Run `veil operator` to discover the authorized spine tools available in this repo, then choose the right metadata-safe path for this file. Do not extract the contents any other way; if no listed tool fits, stop and ask the operator.";
 
@@ -343,7 +346,8 @@ where
 /// a sensitive pack carries `protected` (docs/plan.md, "Formal model").
 fn argv_path_reason(command: &str, subject: &str) -> String {
     format!(
-        "`{command}` names {subject} (label: protected) and is not an authorized spine tool, so it is blocked by policy default"
+        "`{command}` names {subject} {} and is not an authorized spine tool, so it is blocked by policy default",
+        InformationLabel::Protected.annotation(),
     )
 }
 
@@ -372,8 +376,11 @@ pub(crate) fn is_blocked_device_path(path: &Path) -> bool {
 }
 
 fn deny_device_path() -> Decision {
+    let access = AccessAssessment::from_clearance(InformationLabel::Protected, Clearance::Derived);
     Decision {
-        action: DecisionAction::Deny,
+        action: access.verdict,
+        label: access.label,
+        clearance: access.clearance,
         reason: Some(
             "access to device/fd paths is blocked to prevent file descriptor exfiltration"
                 .to_owned(),
@@ -440,7 +447,8 @@ fn directory_scope_with(
         (DirectoryScan::Unverified { max_entries }, Some(command)) => (
             format!(
                 "`{command}` names a directory that holds more than {max_entries} entries, so veil \
-                 cannot show that it holds no protected paths (label: protected); blocked by policy default"
+                 cannot show that it holds no protected paths {}; blocked by policy default",
+                InformationLabel::Protected.annotation(),
             ),
             ARGV_PATH_REMEDIATION,
         ),
@@ -482,30 +490,32 @@ pub(crate) fn dynamic_args_decision(
     let cause = match why {
         DynamicReason::Strict => format!(
             "`{program}` is given {what}, which veil cannot resolve to a path, so veil cannot \
-             show that it reads nothing protected (label: protected)"
+             show that it reads nothing protected"
         ),
         DynamicReason::ProtectedDirectory => format!(
             "`{program}` is given {what}, which veil cannot resolve to a path, and it runs \
              inside a protected directory, so veil cannot show that it stays clear of \
-             protected data (label: protected)"
+             protected data"
         ),
         DynamicReason::ProtectedValue => format!(
             "`{program}` is given {what}, which veil cannot resolve to a path, and this \
              command sets a variable to a protected path, so veil cannot show that it stays \
-             clear of protected data (label: protected)"
+             clear of protected data"
         ),
         DynamicReason::Unanalysable => {
             "veil cannot analyse this command (unbalanced quotes, or more commands or levels \
-             of nesting than it follows), so it cannot show that it reads nothing protected \
-             (label: protected)"
+             of nesting than it follows), so it cannot show that it reads nothing protected"
                 .to_owned()
         }
     };
+    let cause = format!("{cause} {}", InformationLabel::Protected.annotation());
 
     match config.policy.dynamic_args {
         DynamicArgsMode::Allow => None,
         DynamicArgsMode::Warn => Some(Decision {
             action: DecisionAction::Allow,
+            label: InformationLabel::Protected,
+            clearance: Clearance::Derived,
             reason: Some(format!("[policy] dynamic_args = warn: {cause}")),
             severity: None,
             confidence: None,
@@ -552,10 +562,13 @@ pub(crate) fn resolve_policy(
     remediation: &str,
 ) -> Decision {
     let confidence = sensitivity.map(|result| result.confidence);
+    let access = AccessAssessment::from_clearance(InformationLabel::Protected, Clearance::Derived);
 
     match policy_mode {
         PolicyMode::Deny => Decision {
-            action: DecisionAction::Deny,
+            action: access.verdict,
+            label: access.label,
+            clearance: access.clearance,
             reason: Some(reason),
             severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
@@ -563,6 +576,8 @@ pub(crate) fn resolve_policy(
         },
         PolicyMode::Warn => Decision {
             action: DecisionAction::Allow,
+            label: access.label,
+            clearance: access.clearance,
             reason: Some(format!("policy default warn: {reason}")),
             severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
@@ -570,6 +585,8 @@ pub(crate) fn resolve_policy(
         },
         PolicyMode::Log => Decision {
             action: DecisionAction::Allow,
+            label: access.label,
+            clearance: access.clearance,
             reason: Some(format!("policy default log: {reason}")),
             severity: sensitivity.map(|result| result.severity.clone()),
             confidence,
@@ -581,6 +598,8 @@ pub(crate) fn resolve_policy(
 fn allow_silent() -> Decision {
     Decision {
         action: DecisionAction::Allow,
+        label: InformationLabel::Public,
+        clearance: Clearance::Derived,
         reason: None,
         severity: None,
         confidence: None,
@@ -591,6 +610,8 @@ fn allow_silent() -> Decision {
 fn allow_with_context(reason: String, confidence: Option<f32>) -> Decision {
     Decision {
         action: DecisionAction::Allow,
+        label: InformationLabel::Derived,
+        clearance: Clearance::Derived,
         reason: Some(reason),
         severity: None,
         confidence,
@@ -601,6 +622,8 @@ fn allow_with_context(reason: String, confidence: Option<f32>) -> Decision {
 fn fail_open(reason: String) -> Decision {
     Decision {
         action: DecisionAction::Allow,
+        label: InformationLabel::Protected,
+        clearance: Clearance::Derived,
         reason: Some(reason),
         severity: None,
         confidence: None,
@@ -1167,7 +1190,10 @@ mod tests {
         // The key is that canonicalize was called, preventing non-canonical
         // path tricks.
         assert!(
-            decision.action == DecisionAction::Allow || decision.action == DecisionAction::Deny,
+            matches!(
+                decision.action,
+                DecisionAction::Allow | DecisionAction::Deny
+            ),
             "decision should be deterministic after canonicalization"
         );
 

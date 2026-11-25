@@ -35,7 +35,7 @@ use packs::PackRegistry;
 use render::{RenderedDecision, render_decision};
 use serde_json::Value;
 use spine::detect_spine_argv;
-use types::{Decision, DecisionAction, HookInput, ToolKind};
+use types::{Decision, DecisionAction, HookInput, InformationLabel, ToolKind};
 
 #[derive(Clone, Debug)]
 struct CandidateOutcome {
@@ -258,10 +258,11 @@ fn evaluate_mcp(
                 &config.policy.default,
                 None,
                 format!(
-                    "`{}` was given arguments nested deeper than {} levels or holding more than {} strings, so veil cannot show that none of them names a protected path (label: protected); blocked by policy default",
+                    "`{}` was given arguments nested deeper than {} levels or holding more than {} strings, so veil cannot show that none of them names a protected path {}; blocked by policy default",
                     hook_input.tool_name,
                     mcp::MAX_DEPTH,
                     mcp::MAX_STRINGS,
+                    InformationLabel::Protected.annotation(),
                 ),
                 MCP_OVERSIZE_REMEDIATION,
             ),
@@ -478,13 +479,16 @@ fn unread_script_outcome(
             &config.policy.default,
             None,
             format!(
-                "`{program}` runs `{name}`, which {why}, so veil cannot read it to show that it reads nothing protected, and the directory it runs in holds a protected path (label: protected); blocked by policy default"
+                "`{program}` runs `{name}`, which {why}, so veil cannot read it to show that it reads nothing protected, and the directory it runs in holds a protected path {}; blocked by policy default",
+                InformationLabel::Protected.annotation(),
             ),
             SCRIPT_UNREAD_REMEDIATION,
         )
     } else {
         Decision {
             action: DecisionAction::Allow,
+            label: InformationLabel::Public,
+            clearance: types::Clearance::Derived,
             reason: Some(format!(
                 "`{program}` runs `{name}`, which {why}; nothing protected is within reach of the directory it runs in, so it is allowed"
             )),
@@ -582,7 +586,7 @@ fn dynamic_outcome(
         .unwrap_or_default();
     let (label, what) = match command.unresolved.first() {
         _ if command.opaque => (UNANALYSABLE_LABEL.to_owned(), String::new()),
-        Some(word) if word == STDIN_ARGUMENTS => (
+        Some(word) if word.as_str().eq(STDIN_ARGUMENTS) => (
             "<arguments read from standard input>".to_owned(),
             "the names it reads from standard input".to_owned(),
         ),
@@ -674,6 +678,8 @@ fn select_decision(outcomes: &[CandidateOutcome]) -> Decision {
 fn allow_silent_decision() -> Decision {
     Decision {
         action: DecisionAction::Allow,
+        label: InformationLabel::Public,
+        clearance: types::Clearance::Derived,
         reason: None,
         severity: None,
         confidence: None,
