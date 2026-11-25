@@ -15,7 +15,7 @@ name = "veil"
 path = "src/main.rs"
 
 [dependencies]
-boundary-detectors = { git = "https://github.com/cmdrvl/boundary-detectors", rev = "0d4dd36fc07836dc67becf0647322c5ddd7dc6e8" }
+boundary-detectors = { git = "https://github.com/cmdrvl/boundary-detectors", rev = "71ed73194548a30fd3f0c0277789343cfa2ff9d9" }
 clap = { version = "4.5.39", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
