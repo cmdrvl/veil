@@ -59,6 +59,10 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
         cli::OperatorCommand::Scan(args) => {
             path_decision_command(args.json, || operator::run_scan(&args))
         }
+        cli::OperatorCommand::Sandbox(args) => {
+            println!("{}", operator::run_sandbox(&args)?);
+            Ok(0)
+        }
         cli::OperatorCommand::Packs(args) => {
             println!("{}", operator::run_packs(&args)?);
             Ok(0)
@@ -135,6 +139,7 @@ fn command_requires_guard_preflight(command: &cli::OperatorCommand) -> bool {
         cli::OperatorCommand::Doctor(_)
             | cli::OperatorCommand::Capabilities(_)
             | cli::OperatorCommand::RobotDocs(_)
+            | cli::OperatorCommand::Sandbox(_)
             | cli::OperatorCommand::Install
             | cli::OperatorCommand::Uninstall
     )

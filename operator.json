@@ -3,7 +3,7 @@
   "name": "veil",
   "tool_version": "0.4.2",
   "contract_version": "1.0.0",
-  "description": "Data exfiltration guard for AI coding agents. Bare `veil` is hook mode: it reads one Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload on stdin and prints that protocol's allow/deny decision. Subcommands are read-only discovery and diagnostics, plus `install`/`uninstall` for the managed Claude hook entries.",
+  "description": "Data exfiltration guard for AI coding agents. Bare `veil` is hook mode: it reads one Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload on stdin and prints that protocol's allow/deny decision. Subcommands include read-only discovery, diagnostics and Seatbelt policy compilation, plus `install`/`uninstall` for the managed Claude hook entries.",
   "repository": "https://github.com/cmdrvl/veil",
   "license": "MIT",
   "agent_guide": "veil robot-docs guide",
@@ -20,6 +20,8 @@
       "veil test <PATH> [--json]",
       "veil explain <PATH> [--json]",
       "veil scan <DIR> [--json]",
+      "veil sandbox --print-profile",
+      "veil sandbox --dry-run",
       "veil packs [--json]",
       "veil config [--json]",
       "veil audit [--json] [--class <class> | --validate]",
@@ -86,6 +88,17 @@
       "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit scan results as JSON" }],
       "read_only": true,
       "guard_preflight_required": true
+    },
+    {
+      "name": "sandbox",
+      "description": "Compile the merged config's protected paths into a macOS Seatbelt profile. This command prints review material only; it does not launch sandbox-exec or apply confinement.",
+      "options": [
+        { "name": "print_profile", "flag": "--print-profile", "type": "flag", "description": "Print the generated Seatbelt profile to stdout; compiler warnings go to stderr" },
+        { "name": "dry_run", "flag": "--dry-run", "type": "flag", "description": "Compile and report rule coverage and limitations without printing the profile or applying confinement" }
+      ],
+      "read_only": false,
+      "guard_preflight_required": false,
+      "notes": "Loading merged config may migrate a legacy user config. Relative protected patterns are rooted at the current project directory. Glob matches are a filesystem snapshot; newly matching paths require recompilation. Hook-only built-in path classifiers and pre-existing hardlink aliases are not covered by this profile. It does not restrict network access or revoke read-capable file descriptors opened before confinement."
     },
     {
       "name": "packs",

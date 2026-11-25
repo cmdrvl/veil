@@ -19,7 +19,7 @@ use veil::types::{Decision, DecisionAction, SensitivityResult, ToolKind};
 
 use crate::cli::{
     AuditArgs, CapabilitiesArgs, ConfigArgs, DirCommandArgs, DoctorAction, DoctorArgs,
-    DoctorCapabilitiesArgs, JsonOutputArgs, PathCommandArgs, RobotDocsArgs,
+    DoctorCapabilitiesArgs, JsonOutputArgs, PathCommandArgs, RobotDocsArgs, SandboxArgs,
 };
 use crate::hooks;
 
@@ -227,6 +227,37 @@ pub fn run_explain(args: &PathCommandArgs) -> Result<String, Box<dyn std::error:
 pub fn run_scan(args: &DirCommandArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
     render_scan_for_repo(&repo_root, &args.dir, args.json)
+}
+
+/// Compile the merged project policy into a reviewable macOS Seatbelt profile.
+/// This command prints policy text or a coverage summary; it does not launch
+/// `sandbox-exec` and does not claim that a process was confined.
+pub fn run_sandbox(args: &SandboxArgs) -> Result<String, Box<dyn std::error::Error>> {
+    if args.print_profile == args.dry_run {
+        return Err("choose exactly one of --print-profile or --dry-run".into());
+    }
+
+    let repo_root = env::current_dir()?;
+    let config = config::load_config(&repo_root)?;
+    let compiled = veil::sandbox::seatbelt::compile(&config, &repo_root)?;
+
+    if args.print_profile {
+        for warning in &compiled.warnings {
+            eprintln!("warning: {warning}");
+        }
+        return Ok(compiled.profile);
+    }
+
+    let mut output = format!(
+        "Seatbelt policy compiled for {}\nPath deny rules: {}\nProfile bytes: {}\nEnforcement applied: no (dry run only)\n",
+        repo_root.display(),
+        compiled.path_rules,
+        compiled.profile.len()
+    );
+    for warning in compiled.warnings {
+        writeln!(output, "Warning: {warning}")?;
+    }
+    Ok(output)
 }
 
 pub fn run_packs(args: &JsonOutputArgs) -> Result<String, Box<dyn std::error::Error>> {

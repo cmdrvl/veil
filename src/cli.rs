@@ -128,6 +128,14 @@ pub struct DirCommandArgs {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct SandboxArgs {
+    #[arg(long, conflicts_with = "dry_run")]
+    pub print_profile: bool,
+    #[arg(long, conflicts_with = "print_profile")]
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct JsonOutputArgs {
     #[arg(long, help = "Emit machine-readable JSON")]
     pub json: bool,
@@ -147,6 +155,8 @@ pub enum OperatorCommand {
     Explain(PathCommandArgs),
     #[command(about = "Scan a directory tree and classify each file path")]
     Scan(DirCommandArgs),
+    #[command(about = "Compile an opt-in macOS Seatbelt policy")]
+    Sandbox(SandboxArgs),
     #[command(about = "List built-in sensitivity packs")]
     Packs(JsonOutputArgs),
     #[command(about = "Show the merged active configuration")]
@@ -260,6 +270,24 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_compiler_modes_select_expected_variant() {
+        assert_eq!(
+            parse(&["veil", "sandbox", "--print-profile"]),
+            Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
+                print_profile: true,
+                dry_run: false,
+            }))
+        );
+        assert_eq!(
+            parse(&["veil", "sandbox", "--dry-run"]),
+            Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
+                print_profile: false,
+                dry_run: true,
+            }))
+        );
+    }
+
+    #[test]
     fn flag_only_subcommands_select_expected_variants() {
         for (name, command) in [
             (
@@ -324,6 +352,7 @@ mod tests {
             "test",
             "explain",
             "scan",
+            "sandbox",
             "packs",
             "config",
             "audit",

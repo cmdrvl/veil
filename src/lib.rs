@@ -10,6 +10,7 @@ mod mcp;
 pub mod packs;
 pub mod protected_corpus;
 pub mod render;
+pub mod sandbox;
 pub mod spine;
 pub mod types;
 
