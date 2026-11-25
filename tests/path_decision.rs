@@ -238,7 +238,7 @@ fn explain_adds_the_match_that_decided_it() {
         json!({
             "kind": "pack",
             "pack": "data.tabular",
-            "protected_pattern": "data/**",
+            "protected_pattern": format!("{}/data/**", repo.root.display()),
             "allowlist_pattern": null,
             "severity": "high",
             "confidence": 0.95,
