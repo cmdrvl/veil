@@ -50,8 +50,12 @@ struct CandidateOutcome {
 }
 
 /// What an egress denial tells the agent besides the reason: the path is on its
-/// way off the machine, so a copy or an encoding of it is no way around the rule.
-const EGRESS_REMEDIATION: &str = "Egress blocked: this command would send a protected path off this machine. Do not send the protected file itself, or a copy, archive or encoding of it. Run `veil operator` to discover the authorized spine tools and derive a metadata-safe artifact instead; `airlock` attests which derived artifacts later cross the model boundary. If the data really must leave, stop and ask the operator to do the transfer outside this session.";
+/// way off the machine, so a copy or an encoding of it is no way around the rule,
+/// and there are two ways to get the information somewhere: a derived artifact
+/// attested by `airlock`, or a send that goes out under the send-path policy
+/// (the calling wrapper or the send-policy / disclosure service the README
+/// names under "Boundary With Outbound Screening").
+const EGRESS_REMEDIATION: &str = "Egress blocked: this command would send a protected path off this machine. Do not send the protected file itself, or a copy, archive or encoding of it. For information that will cross a model boundary: run `veil operator` to discover the authorized spine tools, derive a metadata-safe artifact, and have `airlock` attest it. For anything sent to a person or a service: it goes out under the send-path policy (the calling wrapper, or the send-policy / disclosure service, that checks the recipient, authorization and approval), not from this session; stop and ask the operator to do the transfer under that policy.";
 
 /// Marks the denial of a command that sends what it is given (`curl`, `scp`,
 /// `aws`, a mail client...) as an egress attempt: its remediation says so and

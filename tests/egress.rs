@@ -351,7 +351,15 @@ fn the_egress_denial_says_the_file_is_leaving_and_other_denials_do_not() {
         "{}",
         sent.stderr
     );
+    // both ways out are named: a derived artifact (airlock), and a send that
+    // goes under the send-path policy rather than from this session
     assert!(sent.stderr.contains("airlock"), "{}", sent.stderr);
+    assert!(sent.stderr.contains("send-path policy"), "{}", sent.stderr);
+    assert!(
+        sent.stderr.contains("not from this session"),
+        "{}",
+        sent.stderr
+    );
     // the reason still names the command and the label, as for any argv path
     let reason = sent.reason.expect("a denial carries a reason");
     assert!(reason.contains("`scp` names"), "{reason}");
@@ -359,6 +367,7 @@ fn the_egress_denial_says_the_file_is_leaving_and_other_denials_do_not() {
 
     let read = assert_denied(&repo, &format!("cat {HOLDINGS}"));
     assert!(!read.stderr.contains("Egress blocked"), "{}", read.stderr);
+    assert!(!read.stderr.contains("send-path policy"), "{}", read.stderr);
     let named = assert_denied(&repo, &format!("awk 1 {HOLDINGS}"));
     assert!(!named.stderr.contains("Egress blocked"), "{}", named.stderr);
 }

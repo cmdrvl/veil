@@ -171,7 +171,12 @@ A command that sends what it is given somewhere else is the **egress class**:
 `az`, `gh`, `nc`, `socat`, mail clients (`mail`, `mutt`, `sendmail`, `swaks`),
 `osascript` driving Mail and `open -a Mail`. Naming a protected path to one of
 them is denied like any other path, but the remediation says the file is leaving
-the machine and that a copy, archive or encoding of it changes nothing, and the
+the machine and that a copy, archive or encoding of it changes nothing. It names
+the two ways the information can go: a derived artifact that `airlock` attests,
+for anything that crosses a model boundary, and the send-path policy (the calling
+wrapper or the send-policy / disclosure service described under [Boundary With
+Outbound Screening](#boundary-with-outbound-screening)) for anything sent to a
+person or a service, which the operator runs outside the agent's session. The
 audit record carries `class: egress` as well as its `reason_class`.
 `veil audit --class egress` lists those attempts, newest last; it answers "did
 anything try to leave". `--class` also takes a `reason_class` (`direct_read`,
