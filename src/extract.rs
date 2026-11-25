@@ -300,6 +300,9 @@ struct SearchSpec {
     pattern_file_long: &'static [&'static str],
 }
 
+/// `grep` may be GNU grep, BSD grep or, as on this machine, ugrep, so this
+/// lists only the options that take a value in all three. `--context` is left
+/// out because BSD grep's value is optional.
 const GREP_SPEC: SearchSpec = SearchSpec {
     short_with_value: &['e', 'f', 'm', 'A', 'B', 'C', 'd', 'D'],
     long_with_value: &[
@@ -308,7 +311,6 @@ const GREP_SPEC: SearchSpec = SearchSpec {
         "max-count",
         "after-context",
         "before-context",
-        "context",
         "directories",
         "devices",
         "include",
@@ -318,7 +320,6 @@ const GREP_SPEC: SearchSpec = SearchSpec {
         "include-dir",
         "label",
         "binary-files",
-        "group-separator",
     ],
     recursive_by_default: false,
     recursive_short: &['r', 'R'],
@@ -338,32 +339,63 @@ const GREP_SPEC: SearchSpec = SearchSpec {
     pattern_file_long: &["file"],
 };
 
+/// Value-taking options of ugrep 7.8, from its `--help`.
 const UGREP_SPEC: SearchSpec = SearchSpec {
-    short_with_value: &['e', 'f', 'm', 'A', 'B', 'C', 'd', 'D', 'g', 't', 'J'],
+    short_with_value: &[
+        'e', 'f', 'm', 'A', 'B', 'C', 'd', 'D', 'g', 'J', 'K', 'M', 'N', 'O', 't',
+    ],
     long_with_value: &[
-        "regexp",
-        "file",
-        "max-count",
         "after-context",
         "before-context",
-        "context",
-        "directories",
-        "devices",
-        "include",
-        "exclude",
-        "exclude-from",
-        "exclude-dir",
-        "include-dir",
-        "label",
         "binary-files",
-        "group-separator",
+        "colors",
+        "colours",
+        "config",
+        "context-separator",
+        "context",
+        "delay",
+        "depth",
+        "devices",
+        "directories",
+        "encoding",
+        "exclude-dir",
+        "exclude-from",
+        "exclude-fs",
+        "exclude",
+        "file-extension",
+        "file-magic",
+        "file-type",
+        "file",
+        "filter",
+        "format",
+        "from",
         "glob",
         "iglob",
-        "file-type",
+        "include-dir",
+        "include-from",
+        "include-fs",
+        "include",
         "jobs",
-        "max-depth",
+        "label",
+        "max-count",
+        "max-files",
+        "max-line",
+        "max-size",
+        "min-count",
+        "min-line",
+        "min-size",
+        "neg-regexp",
+        "range",
+        "regexp",
+        "replace",
+        "zmax",
+        "and",
+        "andnot",
+        "not",
     ],
     digits_recurse: true,
+    pattern_short: &['e', 'f', 'N'],
+    pattern_long: &["regexp", "file", "neg-regexp", "and", "andnot", "not"],
     ..GREP_SPEC
 };
 
@@ -406,6 +438,8 @@ const RG_SPEC: SearchSpec = SearchSpec {
         "hostname-bin",
         "dfa-size-limit",
         "regex-size-limit",
+        "hyperlink-format",
+        "generate",
     ],
     recursive_by_default: true,
     recursive_short: &[],
@@ -539,8 +573,13 @@ fn search_command_paths(program: &str, args: &[String]) -> Option<SearchPaths> {
                 None => (long, None),
             };
             metadata_only |= spec.metadata_long.contains(&name);
-            recursive |= spec.recursive_long.contains(&name);
-            has_pattern_option |= spec.pattern_long.contains(&name);
+            // GNU-style parsers accept an unambiguous abbreviation of a long
+            // option (`--recurs`). Missing one that recurses or carries the
+            // pattern would hide a search or a path, so these two match by
+            // prefix; the other tables match exactly because a miss there
+            // only adds a path.
+            recursive |= abbreviates_any(spec.recursive_long, name);
+            has_pattern_option |= abbreviates_any(spec.pattern_long, name);
 
             let value = match inline_value {
                 None if spec.long_with_value.contains(&name) => {
@@ -618,6 +657,14 @@ fn search_command_paths(program: &str, args: &[String]) -> Option<SearchPaths> {
     };
 
     Some(SearchPaths { paths, exposure })
+}
+
+/// Whether `name` is one of `names` or an abbreviation of one (three or more
+/// characters, as a parser would need to tell options apart).
+fn abbreviates_any(names: &[&str], name: &str) -> bool {
+    names
+        .iter()
+        .any(|candidate| *candidate == name || (name.len() >= 3 && candidate.starts_with(name)))
 }
 
 fn looks_like_redirection(operand: &str) -> bool {
@@ -1972,6 +2019,37 @@ mod tests {
         assert_search("ag -G '\\.csv$' ssn data", Reads, &["data"]);
         assert_search("ack -A 2 ssn data", Reads, &["data"]);
         assert_search("ug -g '*.csv' -r ssn data", Reads, &["data"]);
+    }
+
+    #[test]
+    fn abbreviated_long_options_still_recurse_and_still_carry_the_pattern() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_search("grep --recurs ssn", Reads, &["."]);
+        assert_search("grep --rec ssn", Reads, &["."]);
+        assert_search("grep -r --reg=ssn data", Reads, &["data"]);
+        assert_search("grep -r --regex ssn data", Reads, &["ssn", "data"]);
+    }
+
+    #[test]
+    fn ugrep_value_options_are_not_mistaken_for_the_pattern_or_the_paths() {
+        use PathExposure::ReadsContents as Reads;
+
+        assert_search("ugrep -N skip -e ssn -r data", Reads, &["data"]);
+        // `--and` may or may not replace the positional pattern, so `bar` is
+        // kept as a harmless extra path rather than risk dropping a real one.
+        assert_search("ug --and foo -r bar data", Reads, &["bar", "data"]);
+        assert_search("ug -O rs,toml -r ssn data", Reads, &["data"]);
+        assert_search("ug --file-type=rust -r ssn data", Reads, &["data"]);
+        assert_search(
+            "ug --max-files 3 --min-size 1k -r ssn data",
+            Reads,
+            &["data"],
+        );
+        // `grep` is ugrep on some machines, so ugrep-only options do not hide a path.
+        assert_search("grep -N skip -e ssn -r data", Reads, &["skip", "data"]);
+        // BSD grep's --context value is optional, so it never swallows an operand.
+        assert_search("grep --context -r ssn data", Reads, &["data"]);
     }
 
     #[test]
