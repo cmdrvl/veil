@@ -2051,43 +2051,146 @@ mod tests {
         assert_eq!(scan("# a comment").expect("scans").len(), 0);
     }
 
-    #[test]
-    fn four_kib_of_command_decomposes_in_under_a_millisecond() {
-        // Worst cases at about 4 KiB that the segment cap allows: one long
-        // segment full of quotes and substitutions, and 30 segments that each
-        // carry a nested one (30 x 2 = 60 of the 64 segments).
-        let long_segment = format!("echo {}", "\"a b $(echo c) 'd'\" `e` $f ".repeat(4096 / 27));
+    /// One long segment of quoted words and variables, with nothing nested.
+    fn words_of(bytes: usize) -> String {
+        format!("echo {}", "\"a b $f\" 'd e' $g ".repeat(bytes / 18))
+    }
+
+    /// One long segment that nests a substitution every few bytes: past 4 KiB
+    /// that is far more than the 64 segments the cap allows.
+    fn substitutions_of(bytes: usize) -> String {
+        format!(
+            "echo {}",
+            "\"a b $(echo c) 'd'\" `e` $f ".repeat(bytes / 27)
+        )
+    }
+
+    /// `count` segments that each carry a nested one (30 x 2 = 60 of the 64
+    /// segments the cap allows, at about 4 KiB).
+    fn many_segments_of(count: usize) -> String {
         let padding = "p".repeat(90);
-        let many_segments = (0..30)
+        (0..count)
             .map(|n| format!("cat \"data/{n:03}/{padding}.csv\" $(echo {n}) 'x'"))
             .collect::<Vec<_>>()
-            .join("; ");
-        for command in [&long_segment, &many_segments] {
-            assert!(command.len() >= 3500, "{} bytes", command.len());
-        }
-        assert!(decompose(&many_segments).iter().all(|c| !c.is_opaque()));
+            .join("; ")
+    }
 
-        // Timing is the minimum over many runs, the usual way to keep a
-        // scheduler hiccup from failing a microbenchmark.
-        for command in [&long_segment, &many_segments] {
-            let best = (0..50)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    std::hint::black_box(decompose(std::hint::black_box(command)));
-                    started.elapsed()
-                })
-                .min()
-                .expect("at least one run");
+    /// A pass over the bytes that does the least work worth timing. It slows
+    /// down with the machine as `decompose` does, so a time measured in
+    /// passes does not depend on how fast or how busy the machine is.
+    fn one_byte_pass(text: &str) -> u64 {
+        text.bytes().fold(0u64, |sum, byte| {
+            std::hint::black_box(sum.wrapping_mul(31).wrapping_add(u64::from(byte)))
+        })
+    }
+
+    /// The best time of each workload over `rounds` rounds, the workloads
+    /// taking turns inside every round: a busy stretch slows all of them, and
+    /// a hiccup that hits one run is not the best run.
+    fn best_times(rounds: usize, workloads: &mut [&mut dyn FnMut()]) -> Vec<f64> {
+        let mut best = vec![f64::MAX; workloads.len()];
+        for _ in 0..rounds {
+            for (work, best) in workloads.iter_mut().zip(best.iter_mut()) {
+                let started = std::time::Instant::now();
+                work();
+                *best = best.min(started.elapsed().as_secs_f64());
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn decomposing_a_command_is_cheap_and_grows_with_its_length() {
+        // Not a time limit in milliseconds: that failed on a busy CI runner and
+        // on a loaded laptop while a quiet machine had a margin of two. Both
+        // checks compare work done in one process, side by side.
+        for (name, small, large, past_the_cap) in [
+            // no cap on the length of one segment: 32 times the small one, so
+            // that even a mild quadratic term has room to show
+            ("one long segment", words_of(512), words_of(16384), false),
+            (
+                "many nested segments",
+                many_segments_of(4),
+                many_segments_of(30),
+                false,
+            ),
+            (
+                "nesting past the cap",
+                substitutions_of(512),
+                substitutions_of(4096),
+                true,
+            ),
+        ] {
+            assert!(
+                (400..800).contains(&small.len()) && large.len() >= 3500,
+                "{name}: {} and {} bytes",
+                small.len(),
+                large.len()
+            );
+            // what each shape is meant to be: analysed, or cut off at the cap
+            // (whose work is bounded, so it can only grow more slowly)
+            assert_eq!(
+                decompose(&large).iter().any(|c| c.is_opaque()),
+                past_the_cap,
+                "{name}"
+            );
+            assert!(decompose(&small).iter().all(|c| !c.is_opaque()), "{name}");
+
+            let [small_time, large_time, pass_time] = best_times(
+                300,
+                &mut [
+                    &mut || {
+                        std::hint::black_box(decompose(std::hint::black_box(&small)));
+                    },
+                    &mut || {
+                        std::hint::black_box(decompose(std::hint::black_box(&large)));
+                    },
+                    &mut || {
+                        std::hint::black_box(one_byte_pass(std::hint::black_box(&large)));
+                    },
+                ],
+            )[..] else {
+                unreachable!("three workloads");
+            };
+
+            // Linear: N times the bytes costs about N times as much, so the
+            // cost of a byte stays about the same. Measured 0.8 to 0.9 (a
+            // fixed cost per call weighs more on the small command), idle and
+            // with 24 busy processes on 16 cores; a scan that is quadratic in
+            // the length would show about N (8 to 32 here). 1.5 is what the
+            // mildest quadratic term tried (a rescan of the segment's text
+            // once per token, 1.7) does not get under.
+            const MOST_THE_COST_OF_A_BYTE_MAY_GROW: f64 = 1.5;
+            let per_byte_growth =
+                (large_time / large.len() as f64) / (small_time / small.len() as f64);
+            // Cheap: decomposing costs this many passes over the same bytes.
+            // Measured 9 to 21 in a debug build, idle and with 32 busy
+            // processes alike, and 12 to 23 in a release build (where the pass
+            // gets faster by more than decomposing does); a bound of about
+            // twice the worst of each, so that a constant factor that triples
+            // fails and scheduling noise does not.
+            const MOST_BYTE_PASSES_DECOMPOSE_MAY_COST: f64 =
+                if cfg!(debug_assertions) { 40.0 } else { 46.0 };
+            let passes = large_time / pass_time;
 
             // Visible with `cargo test -- --nocapture`.
             eprintln!(
-                "decompose of {} bytes: best of 50 runs = {best:?}",
-                command.len()
+                "{name}: {} B in {:.0} us, {} B in {:.0} us; cost per byte grows {per_byte_growth:.2}x; decompose = {passes:.0} byte passes",
+                small.len(),
+                small_time * 1e6,
+                large.len(),
+                large_time * 1e6,
             );
             assert!(
-                best < std::time::Duration::from_millis(1),
-                "{} bytes took {best:?}",
-                command.len()
+                per_byte_growth < MOST_THE_COST_OF_A_BYTE_MAY_GROW,
+                "{name}: the cost of a byte grew {per_byte_growth:.2}x from {} to {} bytes",
+                small.len(),
+                large.len()
+            );
+            assert!(
+                passes < MOST_BYTE_PASSES_DECOMPOSE_MAY_COST,
+                "{name}: decomposing {} bytes took {passes:.0} byte passes",
+                large.len()
             );
         }
     }
