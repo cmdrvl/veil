@@ -36,7 +36,7 @@ use super::{
     ArgvPath, ArgvResolver, CommandExtraction, InterpreterKind, Origin, PathExposure, SUBSTITUTION,
     ScriptSource, ShellEnv, SimpleCommand, command_extraction, command_name, decompose_in,
     extract_interpreter_script_paths, ignorable_system_path, interpreter_kind, is_plain_name,
-    lexical_path, normalize_candidates, path_shaped, strip_redirection_words,
+    lexical_path, normalize_candidates, path_shaped, sed, strip_redirection_words,
 };
 
 /// The largest script veil reads, in bytes.
@@ -83,6 +83,10 @@ pub(super) fn inspect(
     scripts: &mut Scripts,
     out: &mut Vec<CommandExtraction>,
 ) {
+    for run in sed_scripts(command, cwd) {
+        inspect_sed(&run, cwd, depth, scripts, out);
+    }
+
     let Some(run) = find_script(command, cwd) else {
         return;
     };
@@ -96,7 +100,7 @@ pub(super) fn inspect(
 
     match contents {
         Contents::Nothing => {}
-        Contents::Unread(why) => out.push(extraction(&run, source(Some(why)))),
+        Contents::Unread(why) => out.push(extraction(&run.program, &run.name, source(Some(why)))),
         Contents::Text(text) if run.kind == InterpreterKind::Shell => {
             shell_commands(&text, &source(None), cwd, env, depth, scripts, out);
         }
@@ -105,7 +109,7 @@ pub(super) fn inspect(
             let candidates =
                 normalize_candidates(extract_interpreter_script_paths(run.kind, &text), cwd);
             let argv_paths = path_words(run.kind, &text, &candidates, cwd);
-            let mut found = extraction(&run, source);
+            let mut found = extraction(&run.program, &run.name, source);
 
             if !candidates.is_empty() {
                 found.exposure = PathExposure::ReadsContents;
@@ -162,12 +166,133 @@ fn shell_commands(
     }
 }
 
+/// A sed script file a command runs: `sed -f read.sed`, or `./read.sed` with
+/// `#!/usr/bin/sed -f` on its first line (bd-xu0).
+struct SedRun {
+    /// The program as typed.
+    program: String,
+    /// The script file as typed.
+    name: String,
+    path: PathBuf,
+}
+
+/// The sed script files `command` runs: every `-f` and `--file` of a `sed`, the
+/// file `-f -` has redirected in, or a file run by name whose first line names
+/// sed. Empty for any other command.
+fn sed_scripts(command: &SimpleCommand, cwd: &Path) -> Vec<SedRun> {
+    let Some((program, args)) = command.argv.split_first() else {
+        return Vec::new();
+    };
+
+    if sed::is_sed(command_name(program)) {
+        let operands = sed::script_file_operands(args);
+        let mut names = operands.named;
+        if operands.stdin {
+            names.extend(command.redirects_in.iter().cloned());
+        }
+
+        return names
+            .into_iter()
+            .filter(|name| usable(name))
+            .map(|name| SedRun {
+                program: program.clone(),
+                path: locate(&name, cwd),
+                name,
+            })
+            .collect();
+    }
+
+    if program.contains('/') && usable(program) {
+        let path = locate(program, cwd);
+
+        if shebang_program(&path).is_some_and(|name| sed::is_sed(&name)) {
+            return vec![SedRun {
+                program: program.clone(),
+                name: program.clone(),
+                path,
+            }];
+        }
+    }
+    Vec::new()
+}
+
+/// What a sed script file names, as the commands a script on the command line
+/// would be judged: `r` and `R` are direct reads, `w`, `W` and the `w` flag are
+/// named paths. A file veil cannot parse, or one that runs a command (`e`), is as
+/// opaque as a word it cannot resolve, and the dynamic-argument stance decides.
+fn inspect_sed(
+    run: &SedRun,
+    cwd: &Path,
+    depth: usize,
+    scripts: &mut Scripts,
+    out: &mut Vec<CommandExtraction>,
+) {
+    // a sed script is a plain file: only Python runs a directory
+    let (path, contents) = read_script(&run.path, InterpreterKind::Shell, depth, scripts);
+    let source = |unread: Option<String>| ScriptSource {
+        name: run.name.clone(),
+        path: fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
+        run_in: cwd.to_path_buf(),
+        unread,
+    };
+
+    match contents {
+        Contents::Nothing => {}
+        Contents::Unread(why) => out.push(extraction(&run.program, &run.name, source(Some(why)))),
+        Contents::Text(text) => {
+            let named = sed::file_script_files(&text);
+            let mut found = extraction(&run.program, &run.name, source(None));
+
+            found.candidates = normalize_candidates(named.reads, cwd);
+            if !found.candidates.is_empty() {
+                found.exposure = PathExposure::ReadsContents;
+            }
+            found.argv_paths = named_paths(&named.writes, cwd);
+            found.argv_exposure = PathExposure::ReadsContents;
+            if named.refused.is_some() {
+                // Said in the reason as the script file: its text is not shown.
+                found
+                    .unresolved
+                    .push(format!("the sed script in {}", run.name));
+                found.dynamic_strict = true;
+            }
+            out.push(found);
+        }
+    }
+}
+
+/// Paths a script names that are paths whether or not a file is there, resolved
+/// like the words of a command: the first [`FILESYSTEM_BUDGET`] against the
+/// filesystem, the rest as text.
+fn named_paths(names: &[String], cwd: &Path) -> Vec<ArgvPath> {
+    let mut found: Vec<ArgvPath> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut resolver = ArgvResolver::new(cwd);
+
+    for (index, name) in names.iter().enumerate() {
+        let resolved = index < FILESYSTEM_BUDGET;
+        let path = if resolved {
+            resolver.resolve(name, false)
+        } else {
+            lexical_path(name, cwd)
+        };
+        let Some(path) = path else {
+            continue;
+        };
+
+        if !ignorable_system_path(&path) && seen.insert(path.clone()) {
+            found.push(ArgvPath { path, resolved });
+        }
+    }
+    found
+}
+
 /// An extraction that names the script and nothing else; the caller fills in
 /// what was found in it.
-fn extraction(run: &Run, source: ScriptSource) -> CommandExtraction {
+fn extraction(program: &str, name: &str, source: ScriptSource) -> CommandExtraction {
     CommandExtraction {
         origin: Origin::Script,
-        argv: vec![run.program.clone(), run.name.clone()],
+        argv: vec![program.to_owned(), name.to_owned()],
         exposure: PathExposure::None,
         candidates: Vec::new(),
         argv_paths: Vec::new(),
@@ -444,6 +569,13 @@ fn script_operand<'a>(kind: InterpreterKind, name: &str, args: &'a [String]) -> 
 /// The interpreter named on the first line of a file run by name, when it is one
 /// veil reads: `#!/usr/bin/env python3`, `#!/bin/bash`.
 fn shebang_kind(path: &Path) -> Option<InterpreterKind> {
+    interpreter_kind(&shebang_program(path)?)
+}
+
+/// The program named on the first line of a file run by name, `env` looked
+/// through: `python3` for `#!/usr/bin/env -S python3 -u`, `sed` for
+/// `#!/usr/bin/sed -f`.
+fn shebang_program(path: &Path) -> Option<String> {
     if !fs::metadata(path).ok()?.is_file() {
         return None;
     }
@@ -463,7 +595,7 @@ fn shebang_kind(path: &Path) -> Option<InterpreterKind> {
         program = command_name(named);
     }
 
-    interpreter_kind(program)
+    Some(program.to_owned())
 }
 
 // ---- reading it -------------------------------------------------------------
@@ -1395,6 +1527,19 @@ mod tests {
         assert_eq!(shebang_kind(&write("f", "print(1)\n")), None);
         assert_eq!(shebang_kind(&dir), None);
         assert_eq!(shebang_kind(&dir.join("missing")), None);
+
+        // sed is no interpreter veil reads as code, but a sed script file is
+        // read as sed (bd-xu0), so the program the line names is what is asked
+        assert_eq!(
+            shebang_program(&write("g", "#!/usr/bin/sed -f\nr .env\n")).as_deref(),
+            Some("sed")
+        );
+        assert_eq!(
+            shebang_program(&write("h", "#!/usr/bin/env -S sed -nf\n")).as_deref(),
+            Some("sed")
+        );
+        assert_eq!(shebang_kind(&write("i", "#!/usr/bin/sed -f\n")), None);
+        assert_eq!(shebang_program(&write("j", "r .env\n")), None);
     }
 
     #[test]

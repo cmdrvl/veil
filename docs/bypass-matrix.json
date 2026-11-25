@@ -31,6 +31,26 @@
         "text": "r .env\n"
       },
       {
+        "path": "scripts/write.sed",
+        "text": "w .env\n"
+      },
+      {
+        "path": "scripts/exec.sed",
+        "text": "e cat .env\n"
+      },
+      {
+        "path": "scripts/broken.sed",
+        "text": "k\n"
+      },
+      {
+        "path": "scripts/plain.sed",
+        "text": "s/a/b/\n5p\n"
+      },
+      {
+        "path": "scripts/shebang.sed",
+        "text": "#!/usr/bin/sed -f\nr .env\n"
+      },
+      {
         "path": "copy.csv",
         "text": "name,ssn\nada,078-05-1120\n"
       },
@@ -582,14 +602,224 @@
       "class": "Other readers and tools",
       "from": "found since",
       "hook_only": {
-        "cause": "the script file is not protected and veil does not read sed script files",
-        "decision": "allow",
-        "leaks": "contents"
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
       },
       "id": "sed-file-script",
       "sandbox": "blocked (design, not run)",
       "tool_input": {
         "command": "sed -f scripts/read.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "sed-file-script-w",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -f scripts/write.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "dynamic_path_unresolvable"
+      },
+      "id": "sed-file-script-e",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -f scripts/exec.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "dynamic_path_unresolvable"
+      },
+      "id": "sed-file-script-unparseable",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -f scripts/broken.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-file-script-in-place",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -i -f scripts/read.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-file-long-option",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed --file=scripts/read.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-file-second-script",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -f scripts/plain.sed -f scripts/read.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-file-heredoc",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -f - notes.md <<'EOF'\nr .env\nEOF"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-file-stdin-redirect",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "sed -f - notes.md < scripts/read.sed"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "dynamic_path_unresolvable"
+      },
+      "id": "sed-file-piped-script",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "cat scripts/read.sed | sed -f - notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "sed-file-shebang",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "./scripts/shebang.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "cause": "the script file does not exist when veil looks, and veil does not judge text written to an unprotected file",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "sed-file-written-same-line",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "printf 'r .env\\n' > tmp.sed; sed -f tmp.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "cause": "the script file does not exist when veil looks: the same limit for every interpreter (bd-1bk)",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "script-python-written-same-line",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "printf 'print(open(\".env\").read())\\n' > tmp.py; python3 tmp.py"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "sed-control-script-file",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "sed -f scripts/plain.sed notes.md"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "sed-control-in-place-script-file",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "sed -i -f scripts/plain.sed notes.md"
       },
       "tool_name": "Bash"
     },

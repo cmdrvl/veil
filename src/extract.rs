@@ -218,6 +218,32 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
     commands
 }
 
+/// What standard input is for a command that reads its script from it
+/// (`sed -f -`): the text of a here-document or here-string, a file redirected
+/// in, or something veil cannot see, such as a pipe.
+fn script_stdin<'a>(command: &'a SimpleCommand, args: &'a [String]) -> sed::Stdin<'a> {
+    if let Some(body) = &command.heredoc_body {
+        return sed::Stdin::Text(body);
+    }
+
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        if word == "<<<" {
+            if let Some(text) = words.next() {
+                return sed::Stdin::Text(text);
+            }
+        } else if let Some(text) = word.strip_prefix("<<<") {
+            return sed::Stdin::Text(text);
+        }
+    }
+
+    if command.redirects_in.is_empty() {
+        sed::Stdin::Unknown
+    } else {
+        sed::Stdin::File
+    }
+}
+
 fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction {
     let assigned_paths = assigned_paths(&command.assigned, cwd);
 
@@ -265,8 +291,10 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
 
     // The files a sed script reads (`r`, `R`) are read like a `cat`'s; the ones
     // it writes (`w`, `W`, the `w` flag of `s`) are named paths, judged with the
-    // other words of the command (bd-pm8).
-    let sed_script = sed::is_sed(command_name(program)).then(|| sed::script_files(args));
+    // other words of the command (bd-pm8). A script file (`-f read.sed`) is read
+    // by `script.rs`; a `-f -` is read from here, where standard input is.
+    let sed_script = sed::is_sed(command_name(program))
+        .then(|| sed::script_files(args, script_stdin(command, args)));
     if let Some(script) = &sed_script {
         paths.extend(script.reads.iter().cloned());
     }

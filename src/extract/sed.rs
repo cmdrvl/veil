@@ -37,35 +37,101 @@ pub(super) struct ScriptFiles {
     pub refused: Option<String>,
 }
 
-/// The files named by the script(s) in `args`, the words after `sed`.
-pub(super) fn script_files(args: &[String]) -> ScriptFiles {
+/// What standard input is, for a script given as `-f -` (or `-f /dev/stdin`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Stdin<'a> {
+    /// A here-document or here-string: the script is this text.
+    Text(&'a str),
+    /// A file redirected in (`< read.sed`): the caller reads it, as it reads
+    /// any other script file.
+    File,
+    /// A pipe, or nothing veil can see: the script is not text veil has.
+    Unknown,
+}
+
+/// The files named by the script(s) on the command line `args`, the words after
+/// `sed`: the first operand, every `-e`, and a `-f -` read from `stdin`. A
+/// script file named by `-f` is not read here; [`script_file_operands`] names it
+/// and [`file_script_files`] reads what the caller found in it.
+pub(super) fn script_files(args: &[String], stdin: Stdin<'_>) -> ScriptFiles {
     // `sed --version 2>&1`, `sed p notes.txt > out`: a redirection is the
     // shell's, not an operand, and must not be taken for the script.
-    let args: Vec<String> = super::strip_redirection_words(args)
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let args = without_redirections(args);
     let mut files = ScriptFiles::default();
     // Each way of reading the command line: whether it is GNU's, and its scripts.
     let mut readings: Vec<(bool, Vec<String>)> = Vec::new();
+    // A reading whose script is a file and nothing else (`sed -i -f x.sed f` in
+    // the GNU reading, where `x.sed` is the file) has no text to fail to parse:
+    // another reading that does fail must not refuse the command.
+    let mut file_only = false;
+    let mut stdin_unseen = false;
 
     // Which word is the script depends on whether `-i` takes the next word as
     // its suffix (BSD) or only an attached one (GNU).
     for gnu in [true, false] {
-        let scripts = scripts_in(&args, !gnu);
-        if !scripts.is_empty() && !readings.iter().any(|(_, known)| *known == scripts) {
+        let mut scripts: Vec<String> = Vec::new();
+        let mut has_file = false;
+
+        for piece in command_line(&args, !gnu) {
+            match piece {
+                Piece::Expression(text) => scripts.push(text),
+                Piece::File(name) => {
+                    has_file = true;
+                    if is_stdin(&name) {
+                        match stdin {
+                            Stdin::Text(text) => scripts.push(text.to_owned()),
+                            Stdin::File => {}
+                            Stdin::Unknown => stdin_unseen = true,
+                        }
+                    }
+                }
+            }
+        }
+
+        if scripts.is_empty() {
+            file_only |= has_file;
+        } else if !readings.iter().any(|(_, known)| *known == scripts) {
             readings.push((gnu, scripts));
         }
     }
 
-    let Some((_, first)) = readings.first() else {
-        return files;
+    let shown = match readings.first() {
+        Some((_, first)) => first.join(" ; "),
+        None => String::from("-f - (a script read from standard input)"),
     };
-    let shown = first.join(" ; ");
+    let (parsed, runs) = judge(&readings, &mut files);
+    let unparsed = !readings.is_empty() && !parsed && !file_only;
+
+    if unparsed || runs || stdin_unseen {
+        files.refused = Some(shown);
+    }
+    files
+}
+
+/// The files named by the text of a script file (`sed -f read.sed`), as the
+/// script on the command line would be. The file is read under both readings,
+/// since which sed runs it is not known.
+pub(super) fn file_script_files(text: &str) -> ScriptFiles {
+    let mut files = ScriptFiles::default();
+    let readings = [
+        (true, vec![text.to_owned()]),
+        (false, vec![text.to_owned()]),
+    ];
+    let (parsed, runs) = judge(&readings, &mut files);
+
+    if !parsed || runs {
+        files.refused = Some(String::from("a script file"));
+    }
+    files
+}
+
+/// Reads each script under every dialect and merges the names into `files`:
+/// whether any reading parsed, and whether any runs a command.
+fn judge(readings: &[(bool, Vec<String>)], files: &mut ScriptFiles) -> (bool, bool) {
     let mut parsed = false;
     let mut runs = false;
 
-    for (gnu, scripts) in &readings {
+    for (gnu, scripts) in readings {
         // sed joins the pieces with newlines, so `-e 'a\' -e text` is one command.
         let text = scripts.join("\n");
 
@@ -78,11 +144,47 @@ pub(super) fn script_files(args: &[String]) -> ScriptFiles {
             }
         }
     }
+    (parsed, runs)
+}
 
-    if !parsed || runs {
-        files.refused = Some(shown);
+/// The script files a `sed` command line names.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct ScriptFileOperands {
+    /// `-f FILE`, `-nf FILE`, `--file=FILE`: files to open, in either reading of
+    /// which word `-i` takes.
+    pub named: Vec<String>,
+    /// `-f -` or `-f /dev/stdin`: the script is on standard input.
+    pub stdin: bool,
+}
+
+pub(super) fn script_file_operands(args: &[String]) -> ScriptFileOperands {
+    let args = without_redirections(args);
+    let mut operands = ScriptFileOperands::default();
+
+    for gnu in [true, false] {
+        for piece in command_line(&args, !gnu) {
+            let Piece::File(name) = piece else {
+                continue;
+            };
+            if is_stdin(&name) {
+                operands.stdin = true;
+            } else if !operands.named.contains(&name) {
+                operands.named.push(name);
+            }
+        }
     }
-    files
+    operands
+}
+
+fn without_redirections(args: &[String]) -> Vec<String> {
+    super::strip_redirection_words(args)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn is_stdin(name: &str) -> bool {
+    matches!(name, "-" | "/dev/stdin")
 }
 
 fn merge(into: &mut Vec<String>, names: Vec<String>) {
@@ -144,12 +246,20 @@ fn long_option(name: &str) -> Long {
     }
 }
 
-/// The script text on the command line: every `-e` and `--expression` value, or,
-/// with neither `-e` nor `-f`, the first operand. `-f` makes the script a file
-/// whose name the argv rule already judges and whose contents are not read here.
-fn scripts_in(args: &[String], suffix_takes_word: bool) -> Vec<String> {
-    let mut scripts: Vec<String> = Vec::new();
-    let mut script_file = false;
+/// One source of script on a command line, in the order sed reads them.
+#[derive(Debug, Eq, PartialEq)]
+enum Piece {
+    /// The text itself: a first operand, or an `-e` or `--expression` value.
+    Expression(String),
+    /// The name of a file that holds the script: a `-f` or `--file` value.
+    File(String),
+}
+
+/// The scripts on the command line, in order: every `-e` and `--expression`
+/// value and every `-f` and `--file` file name, or, with none of them, the first
+/// operand.
+fn command_line(args: &[String], suffix_takes_word: bool) -> Vec<Piece> {
+    let mut pieces: Vec<Piece> = Vec::new();
     let mut first_operand: Option<&str> = None;
     let mut options_ended = false;
     let mut index = 0;
@@ -173,16 +283,19 @@ fn scripts_in(args: &[String], suffix_takes_word: bool) -> Vec<String> {
                 None => (long, None),
             };
             match (long_option(name), value) {
-                (Long::Expression, Some(value)) => scripts.push(value.to_owned()),
+                (Long::Expression, Some(value)) => pieces.push(Piece::Expression(value.to_owned())),
                 (Long::Expression, None) => {
                     if let Some(next) = args.get(index) {
-                        scripts.push(next.clone());
+                        pieces.push(Piece::Expression(next.clone()));
                     }
                     index += 1;
                 }
-                (Long::File, value) => {
-                    script_file = true;
-                    index += usize::from(value.is_none());
+                (Long::File, Some(value)) => pieces.push(Piece::File(value.to_owned())),
+                (Long::File, None) => {
+                    if let Some(next) = args.get(index) {
+                        pieces.push(Piece::File(next.clone()));
+                    }
+                    index += 1;
                 }
                 (Long::Number, None) => index += 1,
                 _ => {}
@@ -197,18 +310,24 @@ fn scripts_in(args: &[String], suffix_takes_word: bool) -> Vec<String> {
             match option {
                 'e' => {
                     if !rest.is_empty() {
-                        scripts.push(rest.to_owned());
+                        pieces.push(Piece::Expression(rest.to_owned()));
                     } else {
                         if let Some(next) = args.get(index) {
-                            scripts.push(next.clone());
+                            pieces.push(Piece::Expression(next.clone()));
                         }
                         index += 1;
                     }
                     break;
                 }
                 'f' => {
-                    script_file = true;
-                    index += usize::from(rest.is_empty());
+                    if !rest.is_empty() {
+                        pieces.push(Piece::File(rest.to_owned()));
+                    } else {
+                        if let Some(next) = args.get(index) {
+                            pieces.push(Piece::File(next.clone()));
+                        }
+                        index += 1;
+                    }
                     break;
                 }
                 'l' => {
@@ -226,13 +345,12 @@ fn scripts_in(args: &[String], suffix_takes_word: bool) -> Vec<String> {
         }
     }
 
-    if scripts.is_empty()
-        && !script_file
+    if pieces.is_empty()
         && let Some(operand) = first_operand
     {
-        scripts.push(operand.to_owned());
+        pieces.push(Piece::Expression(operand.to_owned()));
     }
-    scripts
+    pieces
 }
 
 // ------------------------------------------------------------- the parser
@@ -654,13 +772,12 @@ mod tests {
         line.split_whitespace().map(str::to_owned).collect()
     }
 
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|word| (*word).to_owned()).collect()
+    }
+
     fn files(args: &[&str]) -> ScriptFiles {
-        script_files(
-            &args
-                .iter()
-                .map(|word| (*word).to_owned())
-                .collect::<Vec<_>>(),
-        )
+        script_files(&owned(args), Stdin::Unknown)
     }
 
     fn reads(args: &[&str]) -> Vec<String> {
@@ -1047,5 +1164,144 @@ mod tests {
         assert!(files(&[script.as_str()]).refused.is_some());
         let script = format!("{}p{}", "{".repeat(100_000), "}".repeat(100_000));
         assert_eq!(files(&[script.as_str()]).refused, None);
+    }
+
+    fn operands(args: &[&str]) -> ScriptFileOperands {
+        script_file_operands(&owned(args))
+    }
+
+    #[test]
+    fn a_script_file_is_named_however_it_is_given() {
+        let named = |args: &[&str]| operands(args).named;
+
+        for args in [
+            &["-f", "x.sed", "notes"][..],
+            &["-fx.sed", "notes"],
+            &["-nf", "x.sed", "notes"],
+            &["--file=x.sed", "notes"],
+            &["--file", "x.sed", "notes"],
+            &["--fi=x.sed", "notes"],
+            &["-e", "p", "-f", "x.sed"],
+            &["-f", "x.sed", "-e", "p"],
+            // GNU runs the file; BSD takes `-f` as the suffix, so only the GNU
+            // reading names it, and the union keeps it
+            &["-i", "-f", "x.sed", "notes"],
+            &["-i.bak", "-f", "x.sed", "notes"],
+            &["-s", "-f", "x.sed", "notes"],
+        ] {
+            assert_eq!(named(args), words("x.sed"), "{args:?}");
+        }
+        assert_eq!(named(&["-f", "x.sed", "-f", "y.sed"]), words("x.sed y.sed"));
+        assert_eq!(named(&["p", "notes.txt"]), Vec::<String>::new());
+        assert_eq!(named(&["-e", "r x.sed", "notes.txt"]), Vec::<String>::new());
+        assert_eq!(
+            named(&["-f", "x.sed", ">", "out.txt"]),
+            words("x.sed"),
+            "a redirection is not a script file"
+        );
+
+        for args in [&["-f", "-", "notes"][..], &["-f", "/dev/stdin"]] {
+            let found = operands(args);
+            assert!(found.stdin, "{args:?}");
+            assert!(found.named.is_empty(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_script_file_beside_in_place_is_not_refused_for_what_the_bsd_reading_makes_of_it() {
+        // BSD takes `-f` as the suffix of `-i` and `x.sed` as the script, which
+        // does not parse; the GNU reading has no script text at all.
+        for args in [
+            &["-i", "-f", "x.sed", "notes.txt"][..],
+            &["-i", "-f", "x.sed"],
+            &["-I", "-f", "x.sed", "notes.txt"],
+            &["-n", "-i", "-f", "x.sed", "notes.txt"],
+        ] {
+            assert_eq!(files(args).refused, None, "{args:?}");
+        }
+
+        // a script that is on the command line and does not parse still is
+        for args in [
+            &["-i", "k", "notes.txt"][..],
+            &["-i", "k"],
+            &["-i", "-e", "k", "notes.txt"],
+        ] {
+            assert!(files(args).refused.is_some(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_script_on_standard_input_is_read_when_veil_has_its_text() {
+        let args = owned(&["-f", "-", "notes.txt"]);
+
+        let found = script_files(&args, Stdin::Text("r .env\n"));
+        assert_eq!((found.reads, found.refused), (words(".env"), None));
+
+        // in the order sed reads it: `1{` and `}` come from `-e`, the body from stdin
+        let braced = owned(&["-e", "1{", "-f", "-", "-e", "}"]);
+        let found = script_files(&braced, Stdin::Text("p;r .env"));
+        assert_eq!((found.reads, found.refused), (words(".env"), None));
+
+        let found = script_files(&args, Stdin::Text("w out.txt"));
+        assert_eq!(found.writes, words("out.txt"));
+        assert!(
+            script_files(&args, Stdin::Text("e id")).refused.is_some(),
+            "a script from stdin that runs a command is refused too"
+        );
+
+        // a file redirected in is the caller's to read
+        assert_eq!(script_files(&args, Stdin::File), ScriptFiles::default());
+
+        // a pipe is not text veil has
+        assert!(script_files(&args, Stdin::Unknown).refused.is_some());
+        assert!(
+            script_files(&owned(&["-f", "/dev/stdin"]), Stdin::Unknown)
+                .refused
+                .is_some()
+        );
+
+        // standard input matters only when the script comes from it
+        for stdin in [Stdin::Unknown, Stdin::File] {
+            let found = script_files(&owned(&["p", "notes.txt"]), stdin);
+            assert_eq!(found.refused, None);
+        }
+    }
+
+    #[test]
+    fn a_script_files_text_is_read_like_a_script_on_the_command_line() {
+        assert_eq!(file_script_files("r .env\n").reads, words(".env"));
+        assert_eq!(file_script_files("R .env").reads, words(".env"));
+        assert_eq!(
+            file_script_files("# note\n/a/{\n  p\n  w out.txt\n}\n").writes,
+            words("out.txt")
+        );
+        assert_eq!(
+            file_script_files("s/a/b/w out.txt\n").writes,
+            words("out.txt")
+        );
+        // a file saved with Windows line endings still names the file
+        assert!(
+            file_script_files("r .env\r\n")
+                .reads
+                .iter()
+                .any(|name| name == ".env")
+        );
+
+        for text in ["e id\n", "s/a/b/e\n", "k\n", "r\n", "s/a/b\n", "/x/{\np\n"] {
+            assert!(file_script_files(text).refused.is_some(), "{text:?}");
+        }
+        for text in [
+            "",
+            "\n",
+            "# only a comment\n",
+            "#!/usr/bin/sed -f\ns/a/b/\n",
+            "#n\n1p\n",
+            "s/r .env/x/\na r .env\n",
+            "1i\\\nheader\n",
+            "y/abc/xyz/\n",
+            ":a;N;$!ba;s/\\n/ /g\n",
+        ] {
+            assert_eq!(file_script_files(text), ScriptFiles::default(), "{text:?}");
+        }
     }
 }

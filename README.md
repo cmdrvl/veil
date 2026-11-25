@@ -66,12 +66,12 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 138 vectors run against the real binary, **96** are blocked and **31** are still allowed: 21 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 152 vectors run against the real binary, **107** are blocked and **32** are still allowed: 22 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
 | Direct readers | 10 | 9 | 0 / 0 / 0 | 9 / 0 / 0 |
-| Other readers and tools | 30 | 20 | 5 / 0 / 2 | 26 / 0 / 1 |
+| Other readers and tools | 44 | 31 | 6 / 0 / 2 | 38 / 0 / 1 |
 | Shell indirection | 12 | 12 | 0 / 0 / 0 | 12 / 0 / 0 |
 | Copies and aliases | 10 | 8 | 2 / 0 / 0 | 7 / 3 / 0 |
 | Interpreters and scripts | 16 | 8 | 7 / 0 / 0 | 15 / 0 / 0 |
@@ -281,8 +281,9 @@ Limits to know about:
 judges it. `python3 read.py` does not, so veil reads `read.py` and judges what is
 in it. A script operand is found for `python`, `node`, `nodejs`, `bun`, `deno`,
 `ruby`, `perl`, `Rscript`, `bash`, `sh` and `zsh` (also versioned, `python3.12`),
-for `source` and `.`, for a file run by name (`./tools/read.py`, when its first
-line names an interpreter), for a file the wrapper in `uv run read.py`,
+for `source` and `.`, for the `-f` and `--file` files of `sed` and `gsed`, for a
+file run by name (`./tools/read.py`, when its first line names an interpreter or
+is `#!/usr/bin/sed -f`), for a file the wrapper in `uv run read.py`,
 `poetry run`, `pdm run` or `deno run` runs, for a Python directory (its
 `__main__.py`) and for a script on standard input from a file (`python3 <
 read.py`). Options before the script (`python3 -W ignore -u read.py`) are
@@ -302,6 +303,14 @@ What is judged depends on the language:
   command, so each command in it is judged, and a script it runs is read in
   turn. A word a shell script expands (`"$1"`, `"$SRC"`) is not judged; the
   caller's arguments are not known when the script is read.
+- sed scripts (`sed -f read.sed`, `sed --file=read.sed`, a `-f` beside `-i` or
+  `-e`, a `#!/usr/bin/sed -f` file run by name, and `sed -f -` with a
+  here-document, here-string or `< read.sed`): read as the script on the command
+  line is. The file an `r` or `R` copies in is a direct read, the file a `w`, `W`
+  or the `w` flag of `s` writes is a named path, and a script veil cannot parse,
+  or one that runs a command (the GNU `e` command or flag), is refused like a word
+  veil cannot resolve, under `[policy] dynamic_args`. A `sed -f -` that is fed
+  by a pipe is refused for the same reason.
 
 A denial names the script the path was found in, and an audit record for it has
 `origin: script`. A script that is itself under a protected path is denied for
