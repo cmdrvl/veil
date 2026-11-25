@@ -226,6 +226,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         paths.extend(egress::script_paths(program, body));
     }
     paths.extend(egress::here_string_paths(program, args));
+    paths.extend(egress::option_script_paths(program, args));
 
     // A reader veil parses names its files exactly, so an unresolved word that
     // is a pattern or an option's value (`grep "$p" file`, `head -n $n file`)

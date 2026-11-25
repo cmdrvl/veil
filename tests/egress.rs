@@ -231,7 +231,7 @@ fn a_path_named_inside_a_longer_word_is_still_a_path() {
 }
 
 #[test]
-fn a_transfer_script_on_standard_input_names_what_it_sends() {
+fn a_transfer_script_names_what_it_sends() {
     let repo = repo("script");
 
     for template in [
@@ -242,6 +242,9 @@ fn a_transfer_script_on_standard_input_names_what_it_sends() {
         "ftp -n host <<EOF\nuser u p\nput {p}\nquit\nEOF",
         "ftp -n host <<EOF\nmput {p}\nEOF",
         "lftp host <<EOF\nput -O /srv/in {p}\nEOF",
+        "lftp -c 'put {p}' host",
+        "lftp -c 'open host; put -O /srv/in {p}'",
+        "lftp host -e 'put {p}; bye'",
     ] {
         assert_denied(&repo, &template.replace("{p}", HOLDINGS));
         assert_allowed(&repo, &template.replace("{p}", CLEAN));
@@ -259,6 +262,7 @@ fn a_transfer_script_on_standard_input_names_what_it_sends() {
 
     // navigation, listings and downloads of a clean name send nothing
     assert_allowed(&repo, "sftp host <<EOF\ncd /srv\nls\nget remote.csv\nEOF");
+    assert_allowed(&repo, "lftp -c 'open host; get remote.csv'");
     assert_allowed(&repo, "ftp -n host <<EOF\nuser u p\nquit\nEOF");
 }
 

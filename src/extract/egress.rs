@@ -118,6 +118,18 @@ pub(super) fn here_string_paths(program: &str, args: &[String]) -> Vec<String> {
     paths
 }
 
+/// Files an `lftp -c 'put x'` or `lftp -e 'put x; bye'` script argument sends.
+pub(super) fn option_script_paths(program: &str, args: &[String]) -> Vec<String> {
+    if command_name(program) != "lftp" {
+        return Vec::new();
+    }
+
+    (0..args.len())
+        .filter_map(|index| option_value(args, index, &["-c", "-e"], &[]))
+        .flat_map(|(script, _)| script_paths(program, script))
+        .collect()
+}
+
 fn joined(directory: Option<&str>, file: &str) -> String {
     match directory {
         Some(directory) if !file.starts_with(['/', '~']) => format!("{directory}/{file}"),
@@ -479,6 +491,27 @@ mod tests {
             script_paths("sftp", "lcd data\nput .env\nput /abs/x.csv"),
             ["data/.env", "/abs/x.csv"]
         );
+    }
+
+    #[test]
+    fn an_lftp_script_argument_is_a_transfer_script() {
+        let lftp = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            option_script_paths("lftp", &args)
+        };
+
+        assert_eq!(lftp(&["-c", "put .env"]), [".env"]);
+        assert_eq!(lftp(&["-c", "open host; put -O /r .env"]), [".env"]);
+        assert_eq!(lftp(&["host", "-e", "put .env; bye"]), [".env"]);
+        assert_eq!(lftp(&["-cput .env"]), [".env"]);
+        assert_eq!(lftp(&["-e", "mput a.csv b.csv"]), ["a.csv", "b.csv"]);
+
+        // downloads send nothing, and another option's value is not a script
+        assert!(lftp(&["-c", "get .env"]).is_empty());
+        assert!(lftp(&["-u", "put .env", "host"]).is_empty());
+        assert!(lftp(&["host"]).is_empty());
+        // only lftp takes its script this way
+        assert!(option_script_paths("sftp", &["-c".to_owned(), "put .env".to_owned()]).is_empty());
     }
 
     #[test]

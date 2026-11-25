@@ -177,7 +177,7 @@ veil also finds the file when the command hides it inside a longer word: curl's
 `-F name=@file;type=text/csv`, `--data-urlencode name@file`,
 `--cert file:password`, `gh release upload tag file#label`, and the `put`,
 `mput` and `append` lines of a script given to `ftp`, `sftp` or `lftp` in a
-here-document or a here-string (`lcd` is followed).
+here-document or a here-string, or to `lftp` as `-c` or `-e` (`lcd` is followed).
 
 Limits to know about:
 - Egress is judged by the paths a command names, not by where it sends them:
@@ -185,6 +185,9 @@ Limits to know about:
   (`curl -o out https://host`, `scp host:file out.csv`). A download into `.`
   from a directory that holds protected paths is still denied, because `scp`
   and `rsync` name the whole directory.
+- A script or config kept in a file is not read: `sftp -b batch.txt host` and
+  `curl -K curl.conf` are judged for naming that file, not for what is in it,
+  so a `put` line inside `batch.txt` is not seen.
 - `git add` and `git commit` are names-only (above) and `git push` names no
   path, so a protected file that has been committed can be pushed. veil does not
   stop that chain and does not label it egress.
