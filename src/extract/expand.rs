@@ -1438,19 +1438,25 @@ mod tests {
     }
 
     #[test]
-    fn pwd_is_not_trusted_once_the_command_changes_directory() {
-        for command in [
-            "cd data && cat $PWD/x",
-            "pushd data; cat $PWD/x",
-            "cd -; cat $OLDPWD/x",
+    fn pwd_comes_from_the_effective_cwd_but_oldpwd_stays_unresolved() {
+        for (command, cwd) in [
+            ("cd data && cat $PWD/x", "/work/repo/data"),
+            ("pushd data; cat $PWD/x", "/work/repo/data"),
         ] {
             let vars = Vars::for_command(command);
+            let env = ShellEnv {
+                cwd: Some(PathBuf::from(cwd)),
+                home: Some("/home/me".to_owned()),
+            };
             let words = vars
-                .words(&raw("cat $PWD/x $OLDPWD/x"), &env())
+                .words(&raw("cat $PWD/x $OLDPWD/x"), &env)
                 .expect("expands");
 
-            assert!(
-                words[1..].iter().all(|word| word.unresolved.is_some()),
+            assert_eq!(words[1].text, format!("{cwd}/x"), "{command}: {words:?}");
+            assert_eq!(words[1].unresolved, None, "{command}: {words:?}");
+            assert_eq!(
+                words[2].unresolved.as_deref(),
+                Some("$OLDPWD/x"),
                 "{command}: {words:?}"
             );
         }
