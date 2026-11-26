@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +59,11 @@ fn repo(extra_config: &str) -> (PathBuf, PathBuf) {
 }
 
 fn run_hook(repo_root: &Path, home: &Path, command: &str) -> Hook {
+    run_hook_on(repo_root, home, command, None)
+}
+
+/// [`run_hook`] with the `PATH` the hook looks tool names up on.
+fn run_hook_on(repo_root: &Path, home: &Path, command: &str, search_path: Option<&Path>) -> Hook {
     let payload = serde_json::json!({
         "session_id": "spine-flags",
         "cwd": repo_root,
@@ -66,7 +72,11 @@ fn run_hook(repo_root: &Path, home: &Path, command: &str) -> Hook {
         "tool_input": { "command": command },
     });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
+    let mut veil = Command::new(env!("CARGO_BIN_EXE_veil"));
+    if let Some(search_path) = search_path {
+        veil.env("PATH", search_path);
+    }
+    let mut child = veil
         .env("HOME", home)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_STATE_HOME")
@@ -96,13 +106,18 @@ fn run_hook(repo_root: &Path, home: &Path, command: &str) -> Hook {
 #[test]
 fn spine_tools_on_protected_files_are_still_allowed_without_raw_flags() {
     let (repo_root, home) = repo("");
+    let installed = home.join("bin");
+    let shape = installed.join("shape");
+    fs::create_dir_all(&installed).expect("tool directory");
+    fs::write(&shape, "#!/bin/sh\n").expect("installed tool");
+    fs::set_permissions(&shape, fs::Permissions::from_mode(0o755)).expect("mode");
 
     for command in [
-        "shape protected/x.csv",
-        "profile protected/x.csv --json",
-        "/usr/local/bin/shape protected/x.csv | jq .",
+        "shape protected/x.csv".to_owned(),
+        "profile protected/x.csv --json".to_owned(),
+        format!("{} protected/x.csv | jq .", shape.display()),
     ] {
-        let hook = run_hook(&repo_root, &home, command);
+        let hook = run_hook_on(&repo_root, &home, &command, Some(&installed));
         assert!(
             hook.allowed(),
             "`{command}` should be allowed: {}",

@@ -651,6 +651,7 @@ fn extraction(program: &str, name: &str, source: ScriptSource) -> CommandExtract
         egress: false,
         script: Some(source),
         write_targets: Vec::new(),
+        lookup_changed: false,
     }
 }
 

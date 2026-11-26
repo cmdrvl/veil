@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Flags that escalate an authorized spine tool from metadata-safe output to raw
@@ -93,9 +95,31 @@ pub fn detect_spine_argv(
     denied_flags: &DeniedFlags,
     cwd: &Path,
 ) -> Option<SpineInvocation> {
+    let search_path = std::env::var_os("PATH");
+
+    detect_spine_on(
+        argv,
+        authorized_tools,
+        denied_flags,
+        cwd,
+        search_path.as_deref(),
+    )
+}
+
+/// [`detect_spine_argv`], with the `PATH` a tool's name is looked up on.
+fn detect_spine_on(
+    argv: &[String],
+    authorized_tools: &[String],
+    denied_flags: &DeniedFlags,
+    cwd: &Path,
+    search_path: Option<&OsStr>,
+) -> Option<SpineInvocation> {
     let (program, args) = through_veil_exec(argv, authorized_tools, cwd).split_first()?;
 
     let tool_name = authorized_tool_name(program, authorized_tools)?;
+    if !runs_the_tool(program, &tool_name, authorized_tools, cwd, search_path) {
+        return None;
+    }
     let target_path = extract_target_path(args, cwd)?;
     let denied_flag = denied_flags.find(&tool_name, args).map(str::to_owned);
 
@@ -134,9 +158,46 @@ fn through_veil_exec<'a>(
     }
 }
 
+/// A tool's authority belongs to the program its name finds (bd-jn6). A bare
+/// name is looked up on `PATH`, as the shell looks it up. A program written as
+/// a path must be that same file, unless the config authorizes that very
+/// path: otherwise any file called `shape`, anywhere, would take its place.
+fn runs_the_tool(
+    program: &str,
+    tool_name: &str,
+    authorized_tools: &[String],
+    cwd: &Path,
+    search_path: Option<&OsStr>,
+) -> bool {
+    if !program.contains('/') {
+        return true;
+    }
+    if Path::new(program).is_absolute() && authorized_tools.iter().any(|tool| tool == program) {
+        return true;
+    }
+
+    // a relative `PATH` entry names a different directory wherever it is used
+    let found = search_path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(tool_name))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        });
+
+    found.is_some_and(|found| {
+        fs::canonicalize(found).is_ok_and(|found| {
+            fs::canonicalize(cwd.join(program)).is_ok_and(|named| named == found)
+        })
+    })
+}
+
 /// The word `veil`, found on `PATH` as a bare spine tool name is, or a path to
-/// the program that is running. A spine tool is recognised by its file name,
-/// but this must not be: any other script called `veil` would get its place.
+/// the program that is running. Any other script called `veil` would get its
+/// place, so a file's name is not enough.
 fn names_this_veil(program: &str, cwd: &Path) -> bool {
     if program == "veil" {
         return true;
@@ -266,15 +327,66 @@ mod tests {
         );
     }
 
+    /// A full path is authorized when it is what the name finds, or when the
+    /// config names that very path (bd-jn6).
     #[test]
-    fn matches_a_full_path_spine_invocation() {
+    fn matches_a_full_path_only_to_the_program_the_name_finds() {
+        let root = std::env::temp_dir().join(format!(
+            "veil-spine-full-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is after the epoch")
+                .as_nanos()
+        ));
+        for directory in ["installed", "elsewhere"] {
+            let program = root.join(directory).join("shape");
+            fs::create_dir_all(root.join(directory)).expect("tool directory");
+            fs::write(&program, "#!/bin/sh\n").expect("tool");
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("mode");
+        }
+        let installed = root.join("installed").join("shape");
+        let elsewhere = root.join("elsewhere").join("shape");
+        let search_path = root.join("installed").into_os_string();
+        let grants = |program: &str, tools: &[String], search_path: Option<&OsStr>| {
+            detect_spine_on(
+                &[program.to_owned(), "sensitive.csv".to_owned()],
+                tools,
+                &DeniedFlags::default(),
+                &root,
+                search_path,
+            )
+            .map(|invocation| invocation.tool_name)
+        };
+        let found = Some("shape".to_owned());
+        let bare = authorized_tools();
+
+        let installed = installed.to_str().expect("UTF-8 path");
+        let elsewhere = elsewhere.to_str().expect("UTF-8 path");
+        assert_eq!(grants(installed, &bare, Some(&search_path)), found);
+        assert_eq!(grants("installed/shape", &bare, Some(&search_path)), found);
+        assert_eq!(grants(elsewhere, &bare, Some(&search_path)), None);
+        assert_eq!(grants("./elsewhere/shape", &bare, Some(&search_path)), None);
+        assert_eq!(grants(installed, &bare, None), None);
+        // a relative search entry vouches for nothing
         assert_eq!(
-            detect("/usr/local/bin/shape sensitive.csv"),
-            Some(SpineInvocation {
-                tool_name: "shape".to_owned(),
-                target_path: PathBuf::from("/workspace/veil/sensitive.csv"),
-                denied_flag: None,
-            })
+            grants("./elsewhere/shape", &bare, Some(OsStr::new("elsewhere"))),
+            None
+        );
+        assert_eq!(
+            grants(elsewhere, &[elsewhere.to_owned()], Some(&search_path)),
+            found
+        );
+        let flagged = detect_spine_on(
+            &[installed, "--explicit", "sensitive.csv"].map(str::to_owned),
+            &bare,
+            &DeniedFlags::default(),
+            &root,
+            Some(&search_path),
+        );
+        assert_eq!(
+            flagged.and_then(|invocation| invocation.denied_flag),
+            Some("--explicit".to_owned())
         );
     }
 
@@ -320,7 +432,7 @@ mod tests {
             "shape sensitive.csv > out.txt --explicit",
             "shape '--explicit' sensitive.csv",
             "shape --expl\"\"icit sensitive.csv",
-            "/usr/local/bin/shape --explicit sensitive.csv | jq .",
+            "shape --explicit sensitive.csv | jq .",
         ] {
             assert_eq!(
                 denied_flag(command).as_deref(),

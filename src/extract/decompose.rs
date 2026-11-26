@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use super::expand::{self, Vars, Word};
 use super::wrappers;
-use super::{collect_input_redirect_paths, is_env_assignment, is_redirection_word};
+use super::{collect_input_redirect_paths, is_env_assignment, is_redirection_word, lookup};
 
 pub use super::expand::ShellEnv;
 
@@ -118,6 +118,10 @@ pub struct SimpleCommand {
     /// beneath the directory it starts in, which the path rules already judge.
     /// The consumer is the dynamic-argument stance (bd-2mi).
     pub unresolved: Vec<String>,
+    /// The text each of those words has in [`SimpleCommand::argv`], which for a
+    /// quoted word is not as it was written. A shell, `trap` or `env` handed
+    /// one is handed text veil cannot know (bd-jn6).
+    pub computed: Vec<String>,
     /// Every value the command string assigns to a variable (`d=data/clients`),
     /// wherever in the string it is assigned. A protected directory named there
     /// puts the whole string in a protected context.
@@ -131,6 +135,9 @@ pub struct SimpleCommand {
     /// the shell expands (`$x`, `` `date` ``, a backslash): the text the command
     /// reads is not the text as written.
     pub heredoc_computed: bool,
+    /// Something in the command string changes which program a name runs
+    /// (bd-jn6), so no command in it can be trusted to be the tool it names.
+    pub lookup_changed: bool,
 }
 
 impl SimpleCommand {
@@ -142,11 +149,13 @@ impl SimpleCommand {
             cwd_unresolved: false,
             redirects_in: Vec::new(),
             unresolved: Vec::new(),
+            computed: Vec::new(),
             assigned: Vec::new(),
             origin: Origin::Top,
             stdin_piped: false,
             heredoc_body: None,
             heredoc_computed: false,
+            lookup_changed: false,
         }
     }
 
@@ -172,6 +181,7 @@ pub(super) struct Run {
     pub(super) cwd_unresolved: bool,
     vars: Vars,
     assigned: Vec<String>,
+    pub(super) lookup_changed: bool,
 }
 
 impl Run {
@@ -213,8 +223,31 @@ pub fn decompose_in(command: &str, env: &ShellEnv) -> Vec<SimpleCommand> {
     }
     for simple in &mut commands {
         simple.assigned = run.assigned.clone();
+        simple.lookup_changed = run.lookup_changed;
     }
     commands
+}
+
+/// Whether a `trap` action changes how names are found. The shell stores the
+/// text and may run it before the commands that follow, so it is read as a
+/// script with variables of its own, but on the depth and segment budget of the
+/// command that holds it: an action can expand to that whole command again.
+/// Text that cannot be analysed counts as changing lookup.
+pub(super) fn action_changes_lookup(text: &str, depth: usize, run: &mut Run) -> bool {
+    let mut action = Run {
+        segments: run.segments,
+        vars: Vars::for_command(text),
+        ..Run::default()
+    };
+    script(
+        text,
+        Origin::Wrapper,
+        depth + 1,
+        &mut action,
+        &mut Vec::new(),
+    );
+    run.segments = action.segments;
+    action.failed || action.truncated || action.lookup_changed
 }
 
 /// Decomposes one script (the whole command, a substitution body, a `-c`
@@ -263,6 +296,7 @@ fn script_body(
         let mut directory = segment_directory(&segment, &root_directory, &mut scoped_directories);
         run.env.cwd = directory.path.clone();
         run.cwd_unresolved = directory.unresolved;
+        run.lookup_changed |= segment.changes_lookup;
 
         for body in &segment.substitutions {
             script(body, Origin::Subshell, depth + 1, run, out);
@@ -279,6 +313,7 @@ fn script_body(
                 // what `$f` is. `export f=data/x.csv` also hands it to every
                 // program after it, which veil does not read, so the statement
                 // goes on to be judged as a command naming that path.
+                run.lookup_changed |= lookup::changes_lookup(&raw, false);
                 if let Some(pairs) = expand::assignment_words(&raw) {
                     for (name, written) in pairs {
                         let value = run.vars.value(&written, &run.env);
@@ -299,6 +334,8 @@ fn script_body(
                 words
             }
         };
+
+        run.lookup_changed |= segment_changes_lookup(&words);
 
         match words.first().map(|word| word.text.as_str()) {
             Some("if" | "while" | "until" | "for" | "select" | "case") => {
@@ -521,6 +558,22 @@ fn for_header(words: &[Word]) -> Option<(&str, Option<Vec<String>>)> {
     Some((name, values))
 }
 
+/// Asked before assignments and loop headers are taken off a segment, which is
+/// where `PATH=x cmd` and `for PATH in x` are still to be seen.
+fn segment_changes_lookup(words: &[Word]) -> bool {
+    let words: Vec<&Word> = words
+        .iter()
+        .skip_while(|word| is_leading_keyword(&word.text))
+        .collect();
+    let unresolved_program = words
+        .iter()
+        .find(|word| !is_env_assignment(&word.text))
+        .is_some_and(|word| word.unresolved.is_some());
+    let texts: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+
+    lookup::changes_lookup(&texts, unresolved_program)
+}
+
 fn prefix_assignments(words: &[Word]) -> Vec<(String, String)> {
     words
         .iter()
@@ -552,13 +605,18 @@ fn simple_command(
     };
     let mut argv = Vec::with_capacity(words.len());
     let mut unresolved = Vec::new();
+    let mut computed = Vec::new();
     for word in words {
+        if let Some(written) = word.unresolved {
+            computed.push(word.text.clone());
+            unresolved.push(written);
+        }
         argv.push(word.text);
-        unresolved.extend(word.unresolved);
     }
 
     Some(SimpleCommand {
         unresolved,
+        computed,
         argv,
         cwd: cwd.path.clone(),
         cwd_unresolved: cwd.unresolved,
@@ -568,6 +626,7 @@ fn simple_command(
         stdin_piped: segment.stdin_piped,
         heredoc_body: segment.heredoc.clone(),
         heredoc_computed: segment.heredoc_computed,
+        lookup_changed: false,
     })
 }
 
@@ -594,6 +653,9 @@ struct Segment {
     isolated: bool,
     /// This segment only runs if the preceding `&&` or `||` condition matches.
     conditional: bool,
+    /// The scanner saw lookup change here: this is the name in `name()`, which
+    /// defines a function, or it opens zsh's array form of `PATH`.
+    changes_lookup: bool,
     heredoc: Option<String>,
     /// A here-document of this segment is expanded by the shell and its body has
     /// something to expand.
@@ -779,6 +841,16 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                 word_start = true;
             }
             b'(' => {
+                // `name()` or `name ()`; `array=()` is an assignment
+                let closed = bytes[i + 1..]
+                    .iter()
+                    .find(|byte| !matches!(byte, b' ' | b'\t'))
+                    == Some(&b')');
+                let defines_function =
+                    closed && !current.text.trim().is_empty() && !current.text.ends_with('=');
+                let last_word = current.text.rsplit(char::is_whitespace).next();
+                let zsh_path = matches!(last_word, Some("path=" | "path+=" | "fpath=" | "fpath+="));
+                current.changes_lookup |= defines_function || zsh_path;
                 end_segment(
                     &mut segments,
                     &mut current,

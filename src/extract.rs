@@ -13,6 +13,7 @@ mod egress;
 mod exec;
 mod expand;
 mod jq;
+mod lookup;
 mod script;
 mod sed;
 mod wrappers;
@@ -146,6 +147,9 @@ pub struct CommandExtraction {
     /// against these (bd-3qw), so a word taken for a target by mistake costs
     /// nothing.
     pub write_targets: Vec<PathBuf>,
+    /// The command string changes which program a name runs, so a command in
+    /// it gets no spine-tool authority (bd-jn6).
+    pub lookup_changed: bool,
 }
 
 /// A script file an interpreter runs, read by veil as the text it is (bd-1bk).
@@ -195,6 +199,7 @@ impl CommandExtraction {
             egress: false,
             script: None,
             write_targets: Vec::new(),
+            lookup_changed: false,
         }
     }
 
@@ -220,6 +225,7 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
     let simple_commands = decompose_in(command, &env);
     // A script the string writes is read as written, not as it is on disk now.
     scripts.collect_writes(&simple_commands, cwd);
+    let lookup_changed = simple_commands.iter().any(|simple| simple.lookup_changed);
 
     for simple in simple_commands {
         let cwd = simple.cwd.as_deref().unwrap_or(cwd);
@@ -227,6 +233,13 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
         commands.push(command_extraction(&simple, cwd));
         // An interpreter run on a script file: what is in the file is read too.
         script::inspect(&simple, cwd, &env, 0, &mut scripts, &mut commands);
+    }
+
+    // what the string changes, the scripts it runs inherit
+    if lookup_changed {
+        for found in &mut commands {
+            found.lookup_changed = true;
+        }
     }
 
     commands
@@ -284,6 +297,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             egress: false,
             script: None,
             write_targets: Vec::new(),
+            lookup_changed: command.lookup_changed,
         };
     };
 
@@ -404,6 +418,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         egress: egress::is_egress(program, args),
         script: None,
         write_targets: write_targets(&command.argv, cwd, home_directory().as_deref()),
+        lookup_changed: command.lookup_changed,
     }
 }
 

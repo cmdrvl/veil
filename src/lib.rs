@@ -543,7 +543,12 @@ fn evaluate_commands(
             })
         }));
 
-        let spine_invocation = detect_spine(hook_input, config, command);
+        // Where the command changes how names are found, a tool's name may run
+        // anything, so it is judged like any other program (bd-jn6).
+        let (spine_invocation, withheld) = match detect_spine(hook_input, config, command) {
+            Some(invocation) if command.lookup_changed => (None, Some(invocation.tool_name)),
+            found => (found, None),
+        };
         let mut candidates = command.candidates.clone();
 
         if candidates.is_empty()
@@ -631,6 +636,10 @@ fn evaluate_commands(
             outcomes.push(outcome);
         }
 
+        if let Some(tool) = &withheld {
+            explain_withheld_authority(&mut outcomes[first_outcome..], tool);
+        }
+
         // What came out of a script says which script it was, and that reading
         // scripts is best effort.
         if let Some(source) = &command.script {
@@ -665,6 +674,19 @@ fn script_is_protected(
             .path
             .parent()
             .is_some_and(|directory| matchers.covers_directory(directory))
+}
+
+/// Says why a spine tool's command was refused what the tool is allowed.
+fn explain_withheld_authority(outcomes: &mut [CandidateOutcome], tool: &str) {
+    for outcome in outcomes {
+        if would_deny(&outcome.decision)
+            && let Some(remediation) = outcome.decision.remediation.as_mut()
+        {
+            remediation.push_str(&format!(
+                " `{tool}` has no spine-tool authority here: this command changes how program names are found, or may (it sets `PATH`, `HOME` or a loader variable, gives a name another meaning, sources a file, uses a runner such as `sudo`, `uv run` or `env -i`, or hands a shell, `eval`, `trap` or `env` text computed at run time). Run `{tool}` by name in a command that does none of that."
+            ));
+        }
+    }
 }
 
 fn annotate_script_outcomes(outcomes: &mut [CandidateOutcome], source: &ScriptSource) {

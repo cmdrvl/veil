@@ -240,6 +240,28 @@ written to the audit log with an `origin` of `top`, `subshell` or `wrapper`.
 An authorized spine tool authorizes only its own command: `shape data/a.csv;
 cat data/b.csv` still denies the `cat`.
 
+That authority belongs to the program the tool's name finds. A command string
+gets none if it changes how names are found:
+
+- it sets `PATH`, `HOME`, `ZDOTDIR`, `BASH_ENV`, `ENV` or an `LD_*` or `DYLD_*`
+  variable, by assignment, `export`, `read`, `for`, `${PATH:=...}` or zsh's
+  `path=(...)`;
+- it defines a function or alias, or uses `source`, `.`, `hash -p`, `enable` or
+  `autoload`, or sets a `trap` whose action does any of this;
+- it hands `eval`, a shell, `trap` or `env` text with something computed in it
+  (`sh -c "cd $dir && shape a.csv"`), or runs a command or sets a variable whose
+  name veil cannot work out;
+- it runs through `sudo`, `doas`, `uv run`, `uvx`, `uv tool run`, `poetry run`,
+  `pdm run`, `pipx run`, `deno run`, `npx`, `bunx`, `command -p`, or `env` with
+  `-i`, `-`, `-P` or `-u PATH`.
+
+One such change anywhere in the string covers all of it, and the denial says so.
+Run a tool by name, or by the path of the file `PATH` finds or a path your
+config lists: `./tools/shape` is otherwise an ordinary program. This is a list of
+the ways veil knows, not a proof that there are no others. It does not cover a
+change made in an earlier Bash call, another program already on `PATH` under a
+tool's name, or variables that change what a tool does (`PYTHONPATH`).
+
 `find data -exec cat {} \;` is treated as a content read of `data`, because the
 files `{}` stands for are unknown; `-name`, `-type` and `-prune` filters are not
 honored, so it is denied if `data` holds anything protected. What veil does not

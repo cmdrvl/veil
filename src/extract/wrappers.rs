@@ -16,8 +16,10 @@
 use std::fs;
 use std::path::Path;
 
-use super::command_name;
-use super::decompose::{MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, emit, script};
+use super::decompose::{
+    MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, action_changes_lookup, emit, script,
+};
+use super::{command_name, lookup};
 
 /// Options a wrapper takes, and which of them carry a value.
 struct Options {
@@ -319,9 +321,30 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
             break;
         };
 
+        // each wrapper, and what it turns out to run, on the way down
+        let texts: Vec<&str> = words.iter().map(String::as_str).collect();
+        let unnamed = command.computed.contains(&words[0]);
+        run.lookup_changed |= lookup::changes_lookup(&texts, unnamed);
+
+        // An action with something computed in it when it is set can be any
+        // script; otherwise it is read.
+        if program == "trap"
+            && let Some(action) = lookup::trap_action(&words[1..])
+        {
+            run.lookup_changed |=
+                command.computed.contains(action) || action_changes_lookup(action, depth, run);
+        }
+
         if SHELLS.contains(&program) || program == "eval" {
             let is_eval = program == "eval";
             let scripts = shell_scripts(words, is_eval, &command);
+            // likewise the text a shell or `eval` is handed to run
+            run.lookup_changed |= if is_eval {
+                !command.unresolved.is_empty()
+            } else {
+                command.heredoc_computed
+                    || scripts.iter().any(|text| command.computed.contains(text))
+            };
             command.argv.drain(..start);
             if !is_eval {
                 emit(command, out);
@@ -332,7 +355,21 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
             return;
         }
 
-        match step(words) {
+        let step = step(words);
+        // Computed text among what `env` reads as its own can be an option or
+        // an assignment, or, split at its spaces, several.
+        if program == "env" {
+            let own = match &step {
+                Step::Skip { count, .. } => words.get(1..*count),
+                _ => words.get(1..),
+            };
+            run.lookup_changed |= own
+                .into_iter()
+                .flatten()
+                .any(|word| command.computed.contains(word));
+        }
+
+        match step {
             Step::Done => {
                 let directories = native_directory_targets(words);
                 for directory in directories {
@@ -381,11 +418,13 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                         cwd_unresolved: command.cwd_unresolved,
                         redirects_in: Vec::new(),
                         unresolved: command.unresolved.clone(),
+                        computed: command.computed.clone(),
                         assigned: Vec::new(),
                         origin: Origin::Wrapper,
                         stdin_piped: command.stdin_piped,
                         heredoc_body: None,
                         heredoc_computed: false,
+                        lookup_changed: false,
                     };
                     expand(inner, depth + 1, run, out);
                 }
