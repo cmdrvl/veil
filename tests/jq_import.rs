@@ -260,6 +260,23 @@ fn include_and_a_module_import_read_a_jq_file_never_a_json_one() {
             verdict.reason
         );
     }
+
+    // a link to the protected module is the protected module: denied, not quoted
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            repo.root.join("data/clients/holdings.jq"),
+            repo.root.join("lib/linked.jq"),
+        )
+        .expect("symlink");
+        let verdict = judge(&repo, "jq -L lib -n 'include \"linked\"; x'");
+        assert!(verdict.denied, "records: {:?}", verdict.records);
+        assert!(
+            !verdict.reason.contains("MARKER-4471"),
+            "a protected module's text is never quoted: {}",
+            verdict.reason
+        );
+    }
 }
 
 #[test]
