@@ -6,12 +6,14 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
     name: Verify release commit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Check out repository
@@ -48,6 +50,11 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: verify
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
@@ -97,6 +104,11 @@ jobs:
           echo "asset_name=${archive_stem}.tar.gz" >> "${GITHUB_OUTPUT}"
           echo "asset_path=dist/${archive_stem}.tar.gz" >> "${GITHUB_OUTPUT}"
 
+      - name: Attest release artifact provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ steps.package.outputs.asset_path }}
+
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
@@ -108,8 +120,32 @@ jobs:
     name: Publish GitHub release assets
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
 
     steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare release output directory
+        run: mkdir -p dist
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/veil-${{ github.ref_name }}-SBOM.spdx.json
+          syft-version: v1.57.1
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
         with:
@@ -130,6 +166,24 @@ jobs:
           done < <(printf '%s\n' veil-*.tar.gz | LC_ALL=C sort)
           test -s "${checksum_file}"
           echo "checksum_path=dist/${checksum_file}" >> "${GITHUB_OUTPUT}"
+          echo "bundle_path=dist/${checksum_file}.sigstore.json" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab
+        with:
+          cosign-release: v3.1.5
+
+      - name: Sign checksum manifest
+        env:
+          CHECKSUM_PATH: ${{ steps.checksums.outputs.checksum_path }}
+          BUNDLE_PATH: ${{ steps.checksums.outputs.bundle_path }}
+        run: cosign sign-blob --yes --bundle "${BUNDLE_PATH}" "${CHECKSUM_PATH}"
+
+      - name: Attest release SBOMs
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: dist/*.tar.gz
+          sbom-path: dist/veil-${{ github.ref_name }}-SBOM.spdx.json
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -137,6 +191,8 @@ jobs:
           files: |
             dist/*.tar.gz
             ${{ steps.checksums.outputs.checksum_path }}
+            ${{ steps.checksums.outputs.bundle_path }}
+            dist/veil-${{ github.ref_name }}-SBOM.spdx.json
           fail_on_unmatched_files: true
           generate_release_notes: true
 
