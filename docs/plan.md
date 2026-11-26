@@ -495,14 +495,27 @@ This is a cut-down decentralized label model. It replaces three ad hoc
 notions (protected globs, safe globs, spine allowlist) with one invariant and
 gives the property tests something to check: **enforcement dominance**, i.e.
 every protected-read decision the hook denies is also denied by the compiled
-sandbox policy. The `proptest` feature checks label-join laws, safe-glob
-precedence, monotonicity after adding protected patterns, simple-command
-decomposition idempotence, and denial representation in both compiled read
-profiles with 512 fixed-seed cases in CI. These checks exercise compiled plans;
-the separate sandbox integration test applies a Landlock plan to a real kernel.
-Broker-output readability remains a property for the broker implementation
-(bd-27o), which is not yet present. Egress denials and unsupported path
-mappings are not covered by these properties.
+sandbox policy. With the `proptest` feature, CI checks these with 512
+fixed-seed cases each:
+
+- label join is commutative, associative and idempotent, and a clearance admits
+  exactly the labels at or below it;
+- for generated configs, each compiling its own Seatbelt profile and Landlock
+  ruleset, a read the hook denies under a protected directory is excluded by
+  both; a safe glob that matches it does not allow it; and adding a protected
+  pattern does not turn that denial into an allow;
+- decomposing a normalized simple command again gives the same result
+  (`tests/formal_properties.rs`);
+- a broker output is registered exactly when the client receives it, whole and
+  under the registered hash, through the socket framing; one the detectors flag
+  is neither delivered nor registered (`src/broker.rs`). A broker tool writes
+  no file, so the socket is how a registered output enters a sandbox.
+
+Dominance covers `[sensitivity].protected` directory patterns only. Built-in
+pack classifications are not compiled into either profile, and other glob
+shapes, egress denials and unsupported path mappings are not covered by these
+properties. The checks exercise compiled plans; separate integration tests
+apply a Seatbelt profile and a Landlock plan to a real kernel.
 
 ### Track A — hook hardening (0.5): honest, measured, generated claims
 

@@ -1016,3 +1016,84 @@ mod tests {
         writer.join().expect("request writer should finish");
     }
 }
+
+#[cfg(all(test, feature = "proptest"))]
+mod properties {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// A broker whose `shape` is `/bin/echo`, so a generated argument is the
+    /// tool's output.
+    fn echo_broker(case: &Path) -> BrokerContext {
+        let mut config = config::load_config(case).expect("default config");
+        config.policy.audit_path = case.join("audit.jsonl");
+        BrokerContext {
+            config,
+            cwd: case.to_path_buf(),
+            session: "property".to_owned(),
+            executables: BTreeMap::from([("shape".to_owned(), PathBuf::from("/bin/echo"))]),
+            scanner: BrokerOutputScanner::new(),
+            derived_path: case.join("derived.jsonl"),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// An output is registered exactly when the client receives it: whole,
+        /// under the registered hash. A refused one is neither.
+        #[test]
+        fn an_output_is_registered_exactly_when_the_client_receives_it(
+            words in "[a-z]{1,12}( [a-z]{1,12}){0,6}",
+            secret in any::<bool>(),
+        ) {
+            static CASE: AtomicUsize = AtomicUsize::new(0);
+            let case = env::temp_dir().join(format!(
+                "veil-broker-property-{}-{}-{}",
+                std::process::id(),
+                timestamp(),
+                CASE.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir_all(&case).expect("case directory");
+            let broker = echo_broker(&case);
+            let output = if secret {
+                format!("{words} AKIAIOSFODNN7EXAMPLE")
+            } else {
+                words
+            };
+            let request = BrokerRequest {
+                tool: "shape".to_owned(),
+                argv: vec![output.clone()],
+                cwd: None,
+            };
+
+            // through the socket framing, which is how output enters a sandbox
+            let (mut server, client) = UnixStream::pair().expect("socket pair");
+            write_result(&mut server, broker.process(request, "direct", "property"))
+                .expect("result is framed");
+            drop(server);
+            let received = read_result(&mut BufReader::new(client)).expect("client reads");
+            let registry = fs::read_to_string(&broker.derived_path).unwrap_or_default();
+
+            if secret {
+                prop_assert!(received.error.is_some());
+                prop_assert!(received.stdout.is_empty() && received.stderr.is_empty());
+                prop_assert!(registry.is_empty());
+            } else {
+                prop_assert!(received.error.is_none());
+                let echoed = format!("{output}\n").into_bytes();
+                prop_assert_eq!(&received.stdout, &echoed);
+                let record: Value = serde_json::from_str(registry.trim()).expect("one record");
+                let delivered = hash_streams(&received.stdout, &received.stderr);
+                prop_assert_eq!(record["hash"].as_str(), Some(delivered.as_str()));
+            }
+        }
+    }
+}
