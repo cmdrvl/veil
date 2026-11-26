@@ -724,6 +724,147 @@ exit 0
     }
 }
 
+/// The broker appends to the audit log from outside the sandbox, and the
+/// confined process can write where that log is. A link there must not turn the
+/// broker's append into a write the command could not make itself.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_broker_does_not_write_through_a_linked_audit_log() {
+    const ORIGINAL: &str = "#!/bin/sh\necho '{\"rows\":1}'\n";
+    // point the log, or its rotation lock, at a tool; then have the broker write
+    // a record that carries shell text; then run the tool
+    let script = r#"
+veil=$1 root=$2 planted=$3
+log="$HOME/.cmdrvl/logs/veil/audit.jsonl"
+/bin/mkdir -p "$HOME/.cmdrvl/logs/veil"
+if [ "$planted" != before ]; then /bin/ln -sf "$root/bin/shape" "$log" && echo LINKED; fi
+echo "FIRST: $("$veil" exec '$(/bin/cat protected.txt >&2)' 2>&1)"
+echo "SECOND: $("$veil" exec shape protected.txt 2>&1)"
+"#;
+
+    for planted in ["during", "before"] {
+        let root = fixture();
+        let home = short_home();
+        fs::write(root.join("protected.txt"), "MERIDIAN-VAULT-CONFIDENTIAL\n").expect("protected");
+        fs::write(
+            root.join(".veil.toml"),
+            "[sensitivity]\nprotected = [\"protected.txt\"]\n[spine]\nauthorized_tools = [\"shape\"]\n",
+        )
+        .expect("project policy");
+        create_executable(&root.join("bin/shape"), ORIGINAL);
+        if planted == "before" {
+            // as an earlier session could have left it
+            fs::create_dir_all(home.join(".cmdrvl/logs/veil")).expect("log directory");
+            std::os::unix::fs::symlink(
+                root.join("bin/shape"),
+                home.join(".cmdrvl/logs/veil/audit.jsonl"),
+            )
+            .expect("planted link");
+        }
+        let path = std::env::join_paths([
+            root.join("bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .expect("fixture PATH");
+
+        let output = veil(&root)
+            .args(["sandbox", "--", "/bin/sh", "-c", script, "sh"])
+            .arg(env!("CARGO_BIN_EXE_veil"))
+            .arg(&root)
+            .arg(planted)
+            .env("HOME", &home)
+            .env("PATH", path)
+            .env("VEIL_PROTECTED", "protected.txt")
+            .output()
+            .expect("veil should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let context = format!(
+            "planted {planted}\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(output.status.success(), "{context}");
+        assert!(!stdout.contains("MERIDIAN-VAULT-CONFIDENTIAL"), "{context}");
+        assert_eq!(
+            fs::read_to_string(root.join("bin/shape")).expect("tool"),
+            ORIGINAL,
+            "{context}"
+        );
+        // a call that cannot be recorded is refused
+        for call in ["FIRST", "SECOND"] {
+            assert!(
+                stdout.contains(&format!("{call}: veil exec refused: broker_audit_failed")),
+                "{context}"
+            );
+        }
+    }
+}
+
+/// The veil that launched the session is the running broker, and it launches the
+/// next session, so the confined process must not be able to change it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_confined_process_cannot_change_the_veil_that_launched_it() {
+    let script = r#"
+real=$1 link=$2
+(printf x >> "$real") 2>/dev/null && echo APPENDED
+(printf x >> "$link") 2>/dev/null && echo APPENDED_THROUGH_LINK
+/bin/mv "$real" "$real.moved" 2>/dev/null && echo MOVED
+/bin/rm -f "$link" 2>/dev/null && echo LINK_REMOVED
+/bin/ln -sf /usr/bin/true "$link" 2>/dev/null && echo LINK_REPLACED
+/bin/mv "$(/usr/bin/dirname "$real")" "$(/usr/bin/dirname "$real").moved" 2>/dev/null && echo DIRECTORY_MOVED
+echo ordinary > ordinary.txt && echo ORDINARY_WRITE_ALLOWED
+"#;
+
+    for second_name in [false, true] {
+        let root = fixture();
+        let home = short_home();
+        fs::write(root.join("protected.txt"), "private\n").expect("protected");
+        // a copy, so that a failing run cannot damage the build under test,
+        // started through a link as an installed veil often is
+        let real = root.join("install/veil");
+        let link = root.join("path/veil");
+        fs::create_dir_all(real.parent().expect("parent")).expect("install directory");
+        fs::create_dir_all(link.parent().expect("parent")).expect("link directory");
+        fs::copy(env!("CARGO_BIN_EXE_veil"), &real).expect("copy of veil");
+        std::os::unix::fs::symlink(&real, &link).expect("veil link");
+        if second_name {
+            fs::hard_link(&real, root.join("veil-second-name")).expect("second name");
+        }
+        let length = fs::metadata(&real).expect("veil").len();
+
+        let output = Command::new(&link)
+            .current_dir(&root)
+            .args(["sandbox", "--", "/bin/sh", "-c", script, "sh"])
+            .arg(&real)
+            .arg(&link)
+            .env("HOME", &home)
+            .env("VEIL_PROTECTED", "protected.txt")
+            .env_remove("VEIL_BROKER_SOCKET")
+            .output()
+            .expect("veil should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!("second name: {second_name}\nstdout: {stdout}\nstderr: {stderr}");
+
+        assert_eq!(
+            fs::metadata(&real).ok().map(|veil| veil.len()),
+            Some(length),
+            "{context}"
+        );
+        assert_eq!(fs::read_link(&link).ok(), Some(real.clone()), "{context}");
+        if second_name {
+            assert!(!output.status.success(), "{context}");
+            assert!(stdout.is_empty(), "{context}");
+            assert!(stderr.contains("hard link"), "{context}");
+        } else {
+            assert!(output.status.success(), "{context}");
+            assert_eq!(stdout, "ORDINARY_WRITE_ALLOWED\n", "{context}");
+        }
+    }
+}
+
 /// A client that speaks the broker protocol itself, so that only reaching the
 /// broker is in question. It tries one broker's socket under several names and
 /// prints what each connection got back.

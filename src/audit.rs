@@ -4,6 +4,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -143,6 +144,24 @@ pub fn append_audit_record_with_enforcement(
     )
 }
 
+/// Appends one record without writing through a symbolic link. The broker does
+/// this from outside the sandbox to a log the confined process can replace,
+/// and through a link there it would make a write the process could not.
+pub fn append_audit_record_refusing_links(
+    path: &Path,
+    record: &AuditRecord,
+    enforcement: &str,
+) -> io::Result<()> {
+    append_line(
+        path,
+        record,
+        enforcement,
+        ROTATE_BYTES,
+        ROTATED_FILES,
+        libc::O_NOFOLLOW,
+    )
+}
+
 /// Appends one record as one line, after rotating a log that has reached
 /// `max_bytes` and keeping `keep` rotated files.
 ///
@@ -169,6 +188,18 @@ pub fn append_audit_record_rotating_with_enforcement(
     max_bytes: u64,
     keep: usize,
 ) -> io::Result<()> {
+    append_line(path, record, enforcement, max_bytes, keep, 0)
+}
+
+/// `open_flags` are added to those the log is opened with.
+fn append_line(
+    path: &Path,
+    record: &AuditRecord,
+    enforcement: &str,
+    max_bytes: u64,
+    keep: usize,
+    open_flags: i32,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -179,7 +210,11 @@ pub fn append_audit_record_rotating_with_enforcement(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     line.push(b'\n');
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(open_flags)
+        .open(path)?;
     file.write_all(&line)?;
     file.flush()?;
 
@@ -208,10 +243,12 @@ pub(crate) fn rotate_if_full(path: &Path, max_bytes: u64, keep: usize) -> io::Re
 
     let mut lock_name: OsString = path.as_os_str().to_owned();
     lock_name.push(".lock");
+    // never through a link, which would create a file wherever it points
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(PathBuf::from(lock_name))?;
     // released when `lock` is dropped, or if this process dies
     lock.lock()?;

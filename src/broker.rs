@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use crate::audit::{AuditRecord, append_audit_record_with_enforcement};
+use crate::audit::{
+    AuditRecord, append_audit_record_refusing_links, append_audit_record_with_enforcement,
+};
 use crate::broker_output::{BrokerOutputScanner, MAX_BROKER_OUTPUT_BYTES};
 use crate::config::{self, Config};
 use crate::derived::{self, OutTargets, Sources, VeilState, Written};
@@ -489,7 +491,14 @@ impl BrokerContext {
                 "output_bytes": output_bytes,
             })),
         };
-        append_audit_record_with_enforcement(&self.config.policy.audit_path, &record, enforcement)
+        // A served call is recorded from outside the sandbox. `veil exec`
+        // without a broker is confined by whatever confines its caller.
+        let append = if enforcement == "sandbox" {
+            append_audit_record_refusing_links
+        } else {
+            append_audit_record_with_enforcement
+        };
+        append(&self.config.policy.audit_path, &record, enforcement)
     }
 }
 
@@ -549,17 +558,25 @@ fn exit_with_launcher(socket: PathBuf) {
     });
 }
 
-/// What the confined process must not change while the broker is running: the
-/// executables the broker will run, as the paths found on `path` and as the
-/// files they resolve to, and the broker's own state.
+/// What the confined process must not change while the broker is running: this
+/// veil, which is the broker and launches the next session; the executables the
+/// broker will run, as the paths found on `path` and as the files they resolve
+/// to; and the broker's own state. The launcher calls this.
 pub fn sandbox_write_denials(
     config: &Config,
     path: &std::ffi::OsStr,
     state_dir: &Path,
 ) -> io::Result<String> {
-    let mut files = Vec::new();
+    let invoked = env::current_exe()?;
+    let veil = fs::canonicalize(&invoked)?;
+    refuse_second_names("veil itself,", &veil)?;
+    let mut files = vec![veil];
+    // the name it was started by, which may be a link
+    if let (Some(parent), Some(name)) = (invoked.parent(), invoked.file_name()) {
+        files.push(fs::canonicalize(parent)?.join(name));
+    }
     for (name, executable) in resolve_authorized_tools(config, path) {
-        refuse_second_names(&executable)?;
+        refuse_second_names("authorized tool", &executable)?;
         files.push(executable);
         let found = env::split_paths(path)
             .map(|directory| directory.join(&name))
@@ -588,13 +605,13 @@ pub fn sandbox_write_denials(
 /// one more path to the same file: through it the confined process could
 /// rewrite what the broker runs (bd-wwh). The profile denies new links, so
 /// counting them before confinement covers the whole session.
-fn refuse_second_names(executable: &Path) -> io::Result<()> {
+fn refuse_second_names(what: &str, executable: &Path) -> io::Result<()> {
     let links = fs::metadata(executable)?.nlink();
     if links > 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "authorized tool {} has {links} hard links, so the sandbox cannot stop the confined command from rewriting it through another of its names; replace it with a copy of its own and start the sandbox again",
+                "{what} {} has {links} hard links, so the sandbox cannot stop the confined command from rewriting it through another of its names; replace it with a copy of its own and start the sandbox again",
                 executable.display()
             ),
         ));
