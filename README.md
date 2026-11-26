@@ -128,22 +128,47 @@ The broker:
   (with or without the whitespace at the join), and output over 16 MiB; allows
   64 calls a session; and exits when its launcher does.
 
-The sandbox also stops the confined command from changing the tool executables
-the broker runs and the broker's state under `~/.cmdrvl/state/veil/`. Those
-rules name paths, and a hard link made earlier is another path to the same file,
-so `veil sandbox` does not start when a tool the broker would run has more than
-one; replace the tool with a copy of its own. Nor does it start when the derived
-registry or its key (see [Derived Outputs](#derived-outputs)) is a symlink or has
-a second hard link. Each call that returns output adds one record to that
-registry, and each call is in the audit log with `enforcement: sandbox`,
-`origin: broker`. The confined side cannot read the registry or the key, so a
-hook running inside the sandbox allows nothing on their account.
+The confined command also cannot change what the broker runs or what a later
+session depends on. A session takes its policy, what it protects, its tools and
+veil itself from names on disk, so inside a session:
+
+- no `.veil.toml` can be written anywhere, in any letter case, so `git` cannot
+  check out or restore one there;
+- these cannot be changed: veil's user settings under `~/.cmdrvl/config/veil/`,
+  the older places they are copied from (`~/.config/veil/` and
+  `$XDG_CONFIG_HOME/veil/`), a file that the `.veil.toml` of the launch
+  directory, or of one above it, links to, the veil binary, the tools the broker
+  runs, and the broker's state under `~/.cmdrvl/state/veil/`. Where one of those
+  settings paths does not exist yet, it cannot be created;
+- on the way to any of these, or to a protected path, no link can be replaced
+  and no directory renamed or removed, however many links the path goes through.
+
+Those rules name paths, and a hard link made earlier is another path to the same
+file, so `veil sandbox` does not start when veil, a tool the broker would run or
+one of those settings files has more than one; replace it with a copy of its
+own. Nor does it start when the derived registry or its key (see [Derived
+Outputs](#derived-outputs)) is a symlink or has a second hard link.
+
+Each call that returns output adds one record to that registry, and each call is
+in the audit log with `enforcement: sandbox`, `origin: broker`. The broker
+refuses the call rather than write that record through an audit log that is a
+symlink. The confined side cannot read the registry or the key, so a hook running
+inside the sandbox allows nothing on their account. That hook can read veil's
+own settings file, `~/.cmdrvl/config/veil/config.toml`, and the sandbox adds no
+other exception to the protection of `~/.cmdrvl/config`.
 
 A confined command reaches no broker but its own session's. Another broker
 answers with its own session's files and policy, which this session may deny, so
 the profile refuses connections to every socket named `veil-broker-*.sock`
 except this session's, under any `HOME`, and to anything else in this `HOME`'s
 broker directory. Other programs' sockets are not affected.
+
+It also cannot signal a process outside its own sandbox, start an application
+through LaunchServices (so `open` does not work inside), or use a tmux server
+whose socket is in `/tmp/tmux-<user number>/`, in such a directory under
+`$TMUX_TMPDIR`, or named by `$TMUX`. The profile denies sending Apple events
+too; no test sends one, because that can raise a permission dialog.
+`sandbox-exec` cannot be run again inside the sandbox.
 
 It does not:
 
@@ -152,12 +177,25 @@ It does not:
 - restrict the network;
 - catch protected values a tool prints that no detector flags, including a value
   a tool encodes, or breaks apart in any other way within or across its streams;
-- protect libraries or config files a tool loads, other programs it starts from
-  `PATH`, or stop a new program being planted on `PATH` for a later session;
-- contain a determined process. The profile allows everything it does not name:
-  whether the confined command can signal or inspect the broker, or ask a macOS
-  service (`launchctl`, `open`, Apple events) to act outside the sandbox, rests
-  on macOS alone and has not been tested;
+- stop the confined command writing to a protected file. It cannot read, rename
+  or remove one, but it can still append to it;
+- protect libraries or config files a tool loads, a script's interpreter or
+  other programs a tool starts from `PATH`, or stop a new program being planted
+  earlier on `PATH` for a later session;
+- protect what runs later outside a sandbox: shell startup files (which can also
+  set `VEIL_*` variables for the next session), LaunchAgents, git hooks, or an
+  agent harness's own settings and hooks;
+- fix the policy of a session started in a subdirectory. The confined command
+  can move a directory that already holds a `.veil.toml` there, or, where a
+  `.veil.toml` there is already a link to a file of another name, rewrite that
+  file;
+- protect the directory the audit log is in; and `veil exec` outside a sandbox
+  follows an audit log that is a symlink;
+- contain a determined process. The profile allows everything it does not name.
+  Another server outside the sandbox that acts on request (Docker, or a tmux
+  server listening elsewhere) is not blocked, `lsof` can show paths that other
+  processes have open, and whether a debugger can read the broker's memory has
+  not been tested;
 - run on Linux. `veil sandbox -- <command>` refuses there, and the broker has no
   seccomp filter;
 - yet set up an agent harness: running one inside it has not been tested.
@@ -836,8 +874,10 @@ again.
   forge records: another harness, an install without the write hooks, an MCP tool
   veil is told not to screen, a script that builds the path while it runs, or
   any process of yours outside the harness. The same ability can edit
-  `.veil.toml` or the harness settings and turn veil off. veil does not guard
-  those two from writes.
+  `.veil.toml` or the harness settings and turn veil off. The hook does not
+  guard those two from writes;
+  [Sandboxed commands](#sandboxed-commands-macos) stop writes to `.veil.toml`,
+  and not to harness settings.
 - Session expiry limits how long a record lasts. It is not a security boundary:
   a command the agent writes can set the variable or pass `--persist`.
 - The hook hashes the file before the harness reads it. A process that changes
