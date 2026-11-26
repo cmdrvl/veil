@@ -151,6 +151,19 @@ pub struct SandboxArgs {
     pub print_profile: bool,
     #[arg(long, conflicts_with = "print_profile")]
     pub dry_run: bool,
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["print_profile", "dry_run"],
+        help = "Write the profile applied to this launch to a new file"
+    )]
+    pub profile_out: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with_all = ["print_profile", "dry_run", "command"],
+        help = "Open a confined shell: $SHELL, or /bin/sh"
+    )]
+    pub shell: bool,
     #[arg(last = true, value_name = "COMMAND", num_args = 1..)]
     pub command: Vec<OsString>,
 }
@@ -349,6 +362,8 @@ mod tests {
             Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
                 print_profile: true,
                 dry_run: false,
+                profile_out: None,
+                shell: false,
                 command: Vec::new(),
             }))
         );
@@ -357,6 +372,8 @@ mod tests {
             Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
                 print_profile: false,
                 dry_run: false,
+                profile_out: None,
+                shell: false,
                 command: vec!["/bin/echo".into(), "hello".into()],
             }))
         );
@@ -365,6 +382,18 @@ mod tests {
             Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
                 print_profile: false,
                 dry_run: true,
+                profile_out: None,
+                shell: false,
+                command: Vec::new(),
+            }))
+        );
+        assert_eq!(
+            parse(&["veil", "sandbox", "--profile-out", "a.sb", "--shell"]),
+            Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
+                print_profile: false,
+                dry_run: false,
+                profile_out: Some("a.sb".into()),
+                shell: true,
                 command: Vec::new(),
             }))
         );

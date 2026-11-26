@@ -29,6 +29,12 @@ fn fixture() -> PathBuf {
 
 fn veil(root: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_veil"));
+    isolate(&mut command, root);
+    command
+}
+
+/// Run in the fixture, with its settings and nothing from the caller's.
+fn isolate(command: &mut Command, root: &Path) {
     command
         .current_dir(root)
         .env("HOME", root.join("home"))
@@ -41,7 +47,6 @@ fn veil(root: &Path) -> Command {
         .env_remove("VEIL_AUDIT_LOG")
         .env_remove("VEIL_AUDIT_PATH")
         .env_remove("VEIL_DYNAMIC_ARGS");
-    command
 }
 
 #[cfg(unix)]
@@ -1134,6 +1139,378 @@ fn a_protected_file_behind_two_links_stays_protected_in_the_next_session() {
     let printed = String::from_utf8_lossy(&next.stdout);
     assert!(!printed.contains(MOVED_CANARY), "{printed}");
     assert!(!next.status.success(), "{printed}");
+}
+
+/// A project with one protected file, a `HOME` short enough for the broker's
+/// socket, and `veil` set to start there.
+#[cfg(target_os = "macos")]
+fn launch_fixture() -> (PathBuf, PathBuf) {
+    let root = fixture();
+    let home = short_home();
+    fs::write(root.join("protected.txt"), format!("{MOVED_CANARY}\n")).expect("protected");
+    fs::write(root.join("open.txt"), "ordinary\n").expect("unprotected");
+    (root, home)
+}
+
+#[cfg(target_os = "macos")]
+fn launcher(root: &Path, home: &Path) -> Command {
+    let mut command = veil(root);
+    command
+        .env("HOME", home)
+        .env("VEIL_PROTECTED", "protected.txt")
+        .env_remove("VEIL_BROKER_SOCKET")
+        .arg("sandbox");
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn session_sockets(home: &Path) -> Vec<PathBuf> {
+    fs::read_dir(home.join(".cmdrvl/state/veil/broker"))
+        .expect("broker directory")
+        .map(|entry| entry.expect("entry").path())
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_launcher_reports_how_the_confined_command_ended() {
+    let (root, home) = launch_fixture();
+
+    // 128 and the signal's number is what a shell reports
+    for (script, expected) in [
+        ("exit 7", 7),
+        ("kill -TERM $$", 143),
+        ("kill -KILL $$", 137),
+    ] {
+        let output = launcher(&root, &home)
+            .args(["--", "/bin/sh", "-c", script])
+            .output()
+            .expect("veil should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(expected), "{script}: {stderr}");
+        assert_eq!(session_sockets(&home), Vec::<PathBuf>::new(), "{script}");
+    }
+}
+
+/// Ctrl-C and Ctrl-\ reach every process in the terminal's foreground group. A
+/// command that handles one carries on, so the launcher and its broker have to
+/// as well.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_signal_from_the_terminal_leaves_the_launcher_and_broker_to_the_command() {
+    use std::os::unix::process::CommandExt;
+
+    let veil_binary = env!("CARGO_BIN_EXE_veil");
+    for signal in ["INT", "QUIT"] {
+        let (root, home) = launch_fixture();
+        let bin = root.join("bin");
+        create_executable(&bin.join("shape"), "#!/bin/sh\necho BROKER_ANSWERED\n");
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .expect("fixture PATH should be joinable");
+        // after the signal the command asks the broker to run a tool; the loop
+        // ends by itself, so nothing is left running if this test fails
+        let script = format!(
+            r#"
+trap 'caught=yes' {signal}
+: > ready
+tries=0
+while [ -z "$caught" ] && [ $tries -lt 200 ]; do
+  tries=$((tries + 1))
+  /bin/sleep 0.05
+done
+/bin/sleep 0.2
+echo "caught=$caught"
+'{veil_binary}' exec shape open.txt
+exit 42
+"#
+        );
+        let child = launcher(&root, &home)
+            .env("PATH", path)
+            .args(["--", "/bin/sh", "-c", &script])
+            // a group of this test's own, so that the signal reaches nothing else
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("veil should launch");
+        let ready = root.join("ready");
+        assert!(
+            (0..1000).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                ready.exists()
+            }),
+            "the confined command should start"
+        );
+        let sent = Command::new("/bin/kill")
+            .args(["-s", signal, "--", &format!("-{}", child.id())])
+            .status()
+            .expect("kill should run");
+        assert!(sent.success());
+
+        let output = child.wait_with_output().expect("launcher should exit");
+        let context = format!(
+            "{signal}: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(42), "{context}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "caught=yes\nBROKER_ANSWERED\n",
+            "{context}"
+        );
+        assert_eq!(session_sockets(&home), Vec::<PathBuf>::new(), "{context}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_applied_profile_can_be_written_out() {
+    use std::os::unix::fs::symlink;
+
+    let (root, home) = launch_fixture();
+    let written = root.join("applied.sb");
+    let output = launcher(&root, &home)
+        .arg("--profile-out")
+        .arg(&written)
+        .args(["--", "/bin/sh", "-c", "printf %s \"$VEIL_BROKER_SOCKET\""])
+        .output()
+        .expect("veil should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let profile = fs::read_to_string(&written).expect("the profile is written");
+
+    // it is the one that was applied, this session's broker rule included
+    let socket = PathBuf::from(String::from_utf8_lossy(&output.stdout).as_ref());
+    let name = socket
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("socket name");
+    assert!(
+        profile
+            .lines()
+            .any(|line| line.starts_with("(allow network-outbound") && line.contains(name)),
+        "{profile}"
+    );
+    let read = |file: &str| sandbox_exec(&profile, &root, "/bin/cat", &[file]);
+    assert!(read("open.txt").status.success());
+    assert!(!read("protected.txt").status.success());
+
+    // a path that is taken, by a file or by a link, is left alone and nothing runs
+    let victim = root.join("victim.txt");
+    fs::write(&victim, "keep me\n").expect("victim");
+    let link = root.join("linked.sb");
+    symlink(&victim, &link).expect("link");
+    for taken in [&written, &link] {
+        let output = launcher(&root, &home)
+            .arg("--profile-out")
+            .arg(taken)
+            .args(["--", "/usr/bin/touch", "ran.txt"])
+            .output()
+            .expect("veil should run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{}", taken.display());
+        assert!(stderr.contains("--profile-out"), "{stderr}");
+        assert!(!root.join("ran.txt").exists(), "{stderr}");
+    }
+    assert_eq!(fs::read_to_string(&written).expect("profile"), profile);
+    assert_eq!(fs::read_to_string(&victim).expect("victim"), "keep me\n");
+    assert_eq!(session_sockets(&home), Vec::<PathBuf>::new());
+
+    // the printing modes have their own output
+    let output = launcher(&root, &home)
+        .args(["--print-profile", "--profile-out", "other.sb"])
+        .output()
+        .expect("veil should run");
+    assert!(!output.status.success());
+    assert!(!root.join("other.sb").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_shell_opens_a_confined_shell() {
+    use std::io::Write;
+
+    for shell in [Some("/bin/bash"), None] {
+        let (root, home) = launch_fixture();
+        let mut command = launcher(&root, &home);
+        command.arg("--shell");
+        match shell {
+            Some(shell) => command.env("SHELL", shell),
+            None => command.env_remove("SHELL"),
+        };
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("veil should launch");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(
+                b"/bin/cat protected.txt || echo REFUSED\necho \"BASH=${BASH_VERSION:+yes}\"\n/bin/cat open.txt\nexit 5\n",
+            )
+            .expect("commands");
+        let output = child.wait_with_output().expect("the shell should end");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!("{shell:?}\nstdout: {stdout}\nstderr: {stderr}");
+
+        assert_eq!(output.status.code(), Some(5), "{context}");
+        assert!(!stdout.contains(MOVED_CANARY), "{context}");
+        // `/bin/sh` on macOS is bash too, so only the named shell is checked
+        if shell.is_some() {
+            assert!(stdout.contains("BASH=yes"), "{context}");
+        }
+        assert!(stdout.starts_with("REFUSED\n"), "{context}");
+        assert!(stdout.ends_with("ordinary\n"), "{context}");
+    }
+
+    let (root, home) = launch_fixture();
+    let output = launcher(&root, &home)
+        .args(["--shell", "--", "/usr/bin/touch", "ran.txt"])
+        .output()
+        .expect("veil should run");
+    assert!(!output.status.success());
+    assert!(!root.join("ran.txt").exists());
+}
+
+/// The shell tests above feed a pipe. At a terminal a shell also runs jobs in
+/// process groups of their own and signals them, under a profile that limits
+/// signals. `expect` is the terminal here.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_shell_controls_its_jobs_at_a_terminal() {
+    // Waiting goes through `expect`: a plain `sleep` reads nothing, and zsh
+    // stalls until its output is read. The jobs end by themselves, should a
+    // step fail.
+    const TERMINAL: &str = r#"
+set timeout 20
+proc await {pattern step} {
+    expect {
+        -re $pattern {}
+        timeout { puts "\nTIMED OUT: $step"; exit 90 }
+        eof { puts "\nSHELL ENDED: $step"; exit 91 }
+    }
+}
+proc line {text pattern} {
+    send -- "$text\r"
+    await $pattern $text
+}
+proc pause {} {
+    expect -timeout 1 timeout {}
+}
+proc job {} {
+    line {/bin/sh -c 'echo started-$((5+5)); exec /bin/sleep 30'} {started-10}
+    pause
+}
+set veil $env(VEIL_UNDER_TEST)
+spawn -noecho $veil sandbox --shell
+line {echo ready-$((1+1))} {ready-2}
+line {/bin/cat protected.txt; echo status-$?} {status-1}
+# Ctrl-C ends the job in the foreground and leaves the shell
+job
+send -- "\003"
+line {echo interrupted-$((2+2))} {interrupted-4}
+# Ctrl-Z stops a job, `fg` continues it, Ctrl-C ends it
+job
+send -- "\032"
+pause
+line {jobs} {(Stopped|suspended)}
+send -- "fg\r"
+pause
+send -- "\003"
+line {kill -0 %1; echo job-gone-$?} {job-gone-1}
+# the shell ends a job of its own: 128 and SIGTERM's number
+line {/bin/sleep 30 & echo background-$((6+6))} {background-12}
+pause
+line {kill %1; wait %1; echo ended-$?} {ended-143}
+line "'$veil' exec shape open.txt" {BROKER_ANSWERED}
+send -- "exit 5\r"
+expect {
+    eof {}
+    timeout { puts "\nTIMED OUT: exit"; exit 92 }
+}
+lassign [wait] pid id os_error status
+exit $status
+"#;
+    for shell in ["/bin/bash", "/bin/zsh"] {
+        let (root, home) = launch_fixture();
+        fs::write(home.join(".zshrc"), "").expect("empty zsh startup file");
+        let bin = root.join("bin");
+        create_executable(&bin.join("shape"), "#!/bin/sh\necho BROKER_ANSWERED\n");
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .expect("fixture PATH should be joinable");
+        let script = root.join("terminal.exp");
+        fs::write(&script, TERMINAL).expect("terminal script");
+
+        let mut expect = Command::new("/usr/bin/expect");
+        isolate(&mut expect, &root);
+        let output = expect
+            .arg("-f")
+            .arg(&script)
+            .env("VEIL_UNDER_TEST", env!("CARGO_BIN_EXE_veil"))
+            .env("VEIL_PROTECTED", "protected.txt")
+            .env("HOME", &home)
+            .env("PATH", path)
+            .env("SHELL", shell)
+            .env("TERM", "dumb")
+            .env_remove("VEIL_BROKER_SOCKET")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("expect should run");
+        let terminal = String::from_utf8_lossy(&output.stdout);
+        let context = format!(
+            "{shell}: {:?}\nterminal: {terminal}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert_eq!(output.status.code(), Some(5), "{context}");
+        assert!(!terminal.contains(MOVED_CANARY), "{context}");
+        assert!(terminal.contains("Operation not permitted"), "{context}");
+        assert!(!terminal.contains("no job control"), "{context}");
+        assert_eq!(session_sockets(&home), Vec::<PathBuf>::new(), "{context}");
+    }
+}
+
+/// A script's `command &` is started ignoring SIGINT, so that a Ctrl-C meant
+/// for something else leaves it alone. The confined command has to be too.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_launch_that_ignores_interrupts_hands_that_to_the_command() {
+    let (root, home) = launch_fixture();
+    let mut outer = Command::new("/bin/sh");
+    isolate(&mut outer, &root);
+    let output = outer
+        .args([
+            "-c",
+            "trap '' INT; exec \"$0\" sandbox -- /bin/sh -c 'kill -INT $$; echo survived'",
+            env!("CARGO_BIN_EXE_veil"),
+        ])
+        .env("HOME", &home)
+        .env("VEIL_PROTECTED", "protected.txt")
+        .env_remove("VEIL_BROKER_SOCKET")
+        .output()
+        .expect("sh should run");
+    let context = format!(
+        "{:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "survived\n",
+        "{context}"
+    );
+    assert!(output.status.success(), "{context}");
 }
 
 /// A client that speaks the broker protocol itself, so that only reaching the

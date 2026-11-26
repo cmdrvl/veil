@@ -98,12 +98,14 @@
       "description": "Compile the merged config's protected paths into a macOS Seatbelt profile, or launch a command confined by that profile with a session-scoped metadata broker.",
       "options": [
         { "name": "print_profile", "flag": "--print-profile", "type": "flag", "description": "Print the generated Seatbelt profile to stdout; compiler warnings go to stderr" },
-        { "name": "dry_run", "flag": "--dry-run", "type": "flag", "description": "Compile and report rule coverage and limitations without printing the profile or applying confinement" }
+        { "name": "dry_run", "flag": "--dry-run", "type": "flag", "description": "Compile and report rule coverage and limitations without printing the profile or applying confinement" },
+        { "name": "profile_out", "flag": "--profile-out", "type": "file_path", "description": "Write the profile applied to a launch to a new file; an existing file or link is refused and nothing is launched" },
+        { "name": "shell", "flag": "--shell", "type": "flag", "description": "Launch $SHELL, or /bin/sh, confined; takes no command" }
       ],
       "read_only": false,
       "guard_preflight_required": false,
       "arguments": [{ "name": "command", "type": "string[]", "position": 0, "required": false, "description": "Command and arguments after `--`; runs under Seatbelt with the broker outside confinement" }],
-      "notes": "Loading merged config may migrate a legacy user config. Relative protected patterns are rooted at the current project directory. Glob matches are a filesystem snapshot; newly matching paths require recompilation. Hook-only built-in path classifiers and pre-existing hardlink aliases are not covered by this profile. It does not restrict network access or revoke read-capable file descriptors opened before confinement. The broker socket is private to the session, and broker output is scanned before return."
+      "notes": "A launch exits with the command's status, or 128 plus the signal number if a signal ended it. Loading merged config may migrate a legacy user config. Relative protected patterns are rooted at the current project directory. Glob matches are a filesystem snapshot; newly matching paths require recompilation. Hook-only built-in path classifiers and pre-existing hardlink aliases are not covered by this profile. It does not restrict network access or revoke read-capable file descriptors opened before confinement. The broker socket is private to the session, and broker output is scanned before return."
     },
     {
       "name": "exec",

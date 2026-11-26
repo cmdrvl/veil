@@ -64,11 +64,11 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             path_decision_command(args.json, || operator::run_scan(&args))
         }
         cli::OperatorCommand::Sandbox(args) => {
-            if args.command.is_empty() {
+            if args.command.is_empty() && !args.shell {
                 println!("{}", operator::run_sandbox(&args)?);
                 Ok(0)
             } else {
-                operator::launch_sandbox(&args.command)
+                operator::launch_sandbox(&args)
             }
         }
         cli::OperatorCommand::Exec(args) => {

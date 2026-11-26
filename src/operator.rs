@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::env;
-use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
@@ -10,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicBool;
 #[cfg(target_os = "macos")]
 use std::thread;
 #[cfg(target_os = "macos")]
@@ -262,8 +265,14 @@ pub fn run_scan(args: &DirCommandArgs) -> Result<String, Box<dyn std::error::Err
 /// Printing modes are diagnostics only; `launch_sandbox` applies the compiled
 /// profile to a child process and starts its broker outside confinement.
 pub fn run_sandbox(args: &SandboxArgs) -> Result<String, Box<dyn std::error::Error>> {
-    if !args.command.is_empty() {
+    if !args.command.is_empty() || args.shell {
         return Err("sandbox launch is handled by the launcher".into());
+    }
+    if args.profile_out.is_some() {
+        return Err(
+            "--profile-out records the profile applied to a launch: add `-- <command>` or `--shell`"
+                .into(),
+        );
     }
     if args.print_profile == args.dry_run {
         return Err("choose exactly one of --print-profile or --dry-run".into());
@@ -295,9 +304,9 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, Box<dyn std::error::Err
 /// Start the broker outside Seatbelt and apply the compiled profile to the
 /// requested client process. The broker is stopped and its socket removed when
 /// the confined process exits.
-pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Error>> {
-    if command.is_empty() {
-        return Err("veil sandbox requires a command after `--`".into());
+pub fn launch_sandbox(args: &SandboxArgs) -> Result<u8, Box<dyn std::error::Error>> {
+    if args.command.is_empty() && !args.shell {
+        return Err("veil sandbox requires `-- <command>` or `--shell`".into());
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -306,8 +315,19 @@ pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Er
 
     #[cfg(target_os = "macos")]
     {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
 
+        let command = if args.shell {
+            vec![
+                env::var_os("SHELL")
+                    .filter(|shell| !shell.is_empty())
+                    .unwrap_or_else(|| "/bin/sh".into()),
+            ]
+        } else {
+            args.command.clone()
+        };
         let project_root = env::current_dir()?;
         let config = config::load_config(&project_root)?;
         let compiled = veil::sandbox::seatbelt::compile(&config, &project_root)?;
@@ -340,9 +360,19 @@ pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Er
             &resolved_broker_dir,
             &resolved_broker_dir.join(&socket_name),
         )?);
+        // written before anything starts, so a failure here runs nothing
+        if let Some(path) = &args.profile_out {
+            // `create_new` fails on a link too: nothing that exists is written to
+            fs::File::create_new(path)
+                .and_then(|mut file| file.write_all(profile.as_bytes()))
+                .map_err(|error| format!("--profile-out {}: {error}", path.display()))?;
+        }
         let mut broker = Command::new(executable)
             .arg("--broker")
             .current_dir(&project_root)
+            // A group of its own: what the terminal signals the foreground
+            // group with is for the confined command.
+            .process_group(0)
             .env("VEIL_BROKER_SOCKET", &socket)
             .env("VEIL_BROKER_SESSION", &session)
             // The pipe stays open as long as this launcher lives; the broker
@@ -367,12 +397,14 @@ pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Er
             thread::sleep(Duration::from_millis(10));
         }
 
-        let status = Command::new("/usr/bin/sandbox-exec")
-            .arg("-p")
-            .arg(profile)
-            .args(command)
-            .env("VEIL_BROKER_SOCKET", &socket)
-            .status();
+        let status = leave_interrupts_to_the_command().and_then(|()| {
+            Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(profile)
+                .args(&command)
+                .env("VEIL_BROKER_SOCKET", &socket)
+                .status()
+        });
         let _ = broker.kill();
         let stop_result = broker.wait().map(|_| ());
         // `wait` closes the pipe the broker watches, and the broker removes the
@@ -386,9 +418,37 @@ pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Er
         socket_result?;
         Ok(status
             .code()
+            // ended by a signal: 128 and its number, as a shell reports it
+            .or_else(|| status.signal().map(|signal| 128 + signal))
             .and_then(|code| u8::try_from(code).ok())
             .unwrap_or(1))
     }
+}
+
+/// Ctrl-C and Ctrl-\ are the confined command's to act on, so the launcher
+/// catches them and goes on waiting. Unlike an ignored signal, a caught one is
+/// back to its default in the command. So where they were ignored already, as
+/// for a script's `command &`, they are left alone.
+#[cfg(target_os = "macos")]
+fn leave_interrupts_to_the_command() -> io::Result<()> {
+    // `forbid(unsafe_code)` leaves no way to ask whether SIGINT is ignored, so
+    // a child, which inherits the answer, sends it to itself: `exec` keeps the
+    // shell's process id. SIGQUIT is not tried, because its default dumps core;
+    // a script ignores the two together.
+    let ignored = Command::new("/bin/sh")
+        .args(["-c", "exec /bin/kill -s INT \"$$\""])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success();
+    if !ignored {
+        for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT] {
+            signal_hook::flag::register(signal, Arc::new(AtomicBool::new(false)))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
