@@ -345,10 +345,12 @@ fn commands_that_only_name_a_protected_path_to_list_count_or_stage_it_stay_allow
         format!("shape {HOLDINGS}"),
         format!("shape {HOLDINGS} data/clients"),
         format!("profile {HOLDINGS} --json"),
-        format!("env A=1 shape {HOLDINGS}"),
+        format!("env LC_ALL=C shape {HOLDINGS}"),
     ] {
         assert_allowed(&repo, &command);
     }
+    // a variable that is not on the list takes the authority with it (bd-szf)
+    assert_denied(&repo, &format!("env A=1 shape {HOLDINGS}"));
 }
 
 #[test]

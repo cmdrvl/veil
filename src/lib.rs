@@ -721,7 +721,7 @@ fn explain_withheld_authority(outcomes: &mut [CandidateOutcome], tool: &str) {
             && let Some(remediation) = outcome.decision.remediation.as_mut()
         {
             remediation.push_str(&format!(
-                " `{tool}` has no spine-tool authority here: this command changes how program names are found, or may (it sets `PATH`, `HOME` or a loader variable, gives a name another meaning, sources a file, uses a runner such as `sudo`, `uv run` or `env -i`, or hands a shell, `eval`, `trap` or `env` text computed at run time). Run `{tool}` by name in a command that does none of that."
+                " `{tool}` has no spine-tool authority here: this command changes how program names are found or what a program is handed, or may (it puts a variable other than a locale, time zone or terminal setting into a program's environment, sets `PATH` or another variable that reaches what runs later, gives a name another meaning, sources or names a startup file, uses a runner such as `sudo`, `uv run` or `env -i`, or hands a shell, `eval`, `trap` or `env` text computed at run time). Run `{tool}` by name in a command that does none of that."
             ));
         }
     }

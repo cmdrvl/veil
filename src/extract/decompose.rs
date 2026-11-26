@@ -26,7 +26,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::expand::{self, Vars, Word};
-use super::{collect_input_redirect_paths, is_env_assignment, is_redirection_word, lookup};
+use super::{collect_input_redirect_paths, is_redirection_word, is_shell_assignment, lookup};
 use super::{redirect, wrappers};
 
 pub use super::expand::ShellEnv;
@@ -590,7 +590,7 @@ fn segment_changes_lookup(words: &[Word]) -> bool {
         .collect();
     let unresolved_program = words
         .iter()
-        .find(|word| !is_env_assignment(&word.text))
+        .find(|word| !is_shell_assignment(&word.text))
         .is_some_and(|word| word.unresolved.is_some());
     let texts: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
 
@@ -600,7 +600,8 @@ fn segment_changes_lookup(words: &[Word]) -> bool {
 fn prefix_assignments(words: &[Word]) -> Vec<(String, String)> {
     words
         .iter()
-        .take_while(|word| is_env_assignment(&word.text))
+        .take_while(|word| is_shell_assignment(&word.text))
+        // a name with `+=` in the line is never given a value (`unknowable_names`)
         .filter_map(|word| word.text.split_once('='))
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect()
@@ -614,7 +615,7 @@ fn simple_command(
 ) -> Option<SimpleCommand> {
     let start = words
         .iter()
-        .position(|word| !(is_env_assignment(&word.text) || is_leading_keyword(&word.text)))?;
+        .position(|word| !(is_shell_assignment(&word.text) || is_leading_keyword(&word.text)))?;
     if is_header_keyword(&words[start].text) {
         return None;
     }
@@ -895,7 +896,10 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
                 let defines_function =
                     closed && !current.text.trim().is_empty() && !current.text.ends_with('=');
                 let last_word = current.text.rsplit(char::is_whitespace).next();
-                let zsh_path = matches!(last_word, Some("path=" | "path+=" | "fpath=" | "fpath+="));
+                let zsh_path = last_word
+                    .and_then(|word| word.strip_suffix('='))
+                    .map(|name| name.strip_suffix('+').unwrap_or(name))
+                    .is_some_and(|name| matches!(name, "path" | "fpath" | "module_path"));
                 current.changes_lookup |= defines_function || zsh_path;
                 end_segment(
                     &mut segments,

@@ -322,7 +322,7 @@ fn an_authorized_spine_tool_authorizes_only_its_own_command() {
         format!("shape {protected}"),
         format!("shape {protected} | jq ."),
         format!("sh -c \"shape {protected}\""),
-        format!("env A=1 timeout 9 shape {protected}"),
+        format!("env LC_ALL=C timeout 9 shape {protected}"),
         "find data -exec shape {} \\;".to_owned(),
         format!("echo hi; shape {protected}"),
     ] {
@@ -342,6 +342,9 @@ fn an_authorized_spine_tool_authorizes_only_its_own_command() {
         format!("shape {protected}; sh -c 'cat {protected}'"),
         format!("shape {protected}; shape --explicit {protected}"),
         format!("shape {protected} $(cat {protected})"),
+        // a variable that is not on the list takes the authority with it
+        // (bd-szf)
+        format!("env A=1 timeout 9 shape {protected}"),
         // in a uv project this runs `.venv/bin/shape`, which anything that can
         // write the project can put there (bd-jn6)
         format!("uv run shape {protected}"),

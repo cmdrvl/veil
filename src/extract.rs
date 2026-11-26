@@ -2160,9 +2160,34 @@ fn is_env_assignment(token: &str) -> bool {
         return false;
     };
 
+    is_variable_name(name)
+}
+
+fn is_variable_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// A word the shell takes for an assignment where it stands before a command:
+/// `NAME=x`, `NAME+=x`, or one element, `NAME[i]=x`. Taken for the command, it
+/// would hide the command behind it (bd-szf).
+fn is_shell_assignment(token: &str) -> bool {
+    let end = token
+        .find(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .unwrap_or(token.len());
+    let (name, rest) = token.split_at(end);
+    if !is_variable_name(name) {
+        return false;
+    }
+    let assigns = |rest: &str| rest.starts_with('=') || rest.starts_with("+=");
+    match rest.strip_prefix('[') {
+        // the subscript may hold anything, `]` and `=` included
+        Some(subscript) => subscript
+            .match_indices(']')
+            .any(|(at, _)| assigns(&subscript[at + 1..])),
+        None => assigns(rest),
+    }
 }
 
 #[cfg(test)]

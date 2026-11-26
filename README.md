@@ -235,32 +235,63 @@ backticks and `<( )`, runs the string given to `sh`/`bash`/`zsh`/`dash -c`,
 steps, and looks through `env`, `nice`, `nohup`, `time`, `timeout`, `sudo`,
 `doas`, `exec`, `xargs`, `find -exec`/`-execdir`/`-ok`, `uv run`, `uvx`,
 `pipx run`, `poetry run`, `pdm run`, `npx`, `bunx` and `deno run` to the command
-they run. Every command is evaluated, the first denial wins, and each is
+they run. To find that command it passes over the words that assign: `NAME=x`,
+`NAME+=x` and `NAME[0]=x` before a command, and for `env` and `sudo` any word
+with `=` in it. Every command is evaluated, the first denial wins, and each is
 written to the audit log with an `origin` of `top`, `subshell` or `wrapper`.
 An authorized spine tool authorizes only its own command: `shape data/a.csv;
 cat data/b.csv` still denies the `cat`.
 
-That authority belongs to the program the tool's name finds. A command string
-gets none if it changes how names are found:
+That authority belongs to the program the tool's name finds, run with an
+environment the command has not added to. A command may put only these
+variables into a program's environment and keep it: `LANG`, `LANGUAGE`,
+`LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`,
+`LC_NUMERIC`, `LC_TIME`, `TZ`, `TERM`, `COLUMNS`, `LINES`, `NO_COLOR`,
+`FORCE_COLOR`, `CLICOLOR` and `CLICOLOR_FORCE`. Any other loses it, harmless
+ones too (`RUST_LOG=debug shape a.csv`), whether it comes before the command,
+as an operand of `env`, or through `export` or `declare -x`: veil cannot tell
+which variables can carry code, and bash takes a function from any
+`BASH_FUNC_name%%`.
 
-- it sets `PATH`, `HOME`, `ZDOTDIR`, `BASH_ENV`, `ENV` or an `LD_*` or `DYLD_*`
-  variable, by assignment, `export`, `read`, `for`, `${PATH:=...}` or zsh's
-  `path=(...)`;
-- it defines a function or alias, or uses `source`, `.`, `hash -p`, `enable` or
-  `autoload`, or sets a `trap` whose action does any of this;
+A command string also gets none if:
+
+- it has the shell export what it assigns (`set -a`, `set -k`, `allexport` or
+  `keyword`, or the same options given to a shell);
+- it sets a variable for the shell itself that can reach what runs later:
+  `PATH`, `HOME`, `ZDOTDIR`, `ENV`, an `LD_*`, `DYLD_*` or `BASH*` variable, or
+  any unlisted variable that the hook's own environment already has, by
+  assignment, `read`, `for` or `printf -v`; `unset` or `${PATH:=...}` of one of
+  the named ones; or it gives zsh's `path`, `fpath` or `module_path` an array,
+  or sets an element of those or of zsh's command tables;
+- it defines a function or alias, uses `source`, `.`, `hash -p`, `enable`,
+  `autoload`, `zmodload` or `exec -c`, or sets a `trap` whose action does any of
+  this;
+- it names a shell's startup file (`--rcfile`, `--init-file`), or runs `fish`,
+  `csh` or `tcsh`, whose syntax veil does not read;
 - it hands `eval`, a shell, `trap` or `env` text with something computed in it
   (`sh -c "cd $dir && shape a.csv"`), or runs a command or sets a variable whose
   name veil cannot work out;
 - it runs through `sudo`, `doas`, `uv run`, `uvx`, `uv tool run`, `poetry run`,
-  `pdm run`, `pipx run`, `deno run`, `npx`, `bunx`, `command -p`, or `env` with
-  `-i`, `-`, `-P` or `-u PATH`.
+  `pdm run`, `pipx run`, `deno run`, `npx`, `bunx`, `command -p`, `xargs
+  --process-slot-var`, or `env` with `-i`, `-`, `-P`, `-u PATH` or an option
+  veil does not know.
 
 One such change anywhere in the string covers all of it, and the denial says so.
 Run a tool by name, or by the path of the file `PATH` finds or a path your
-config lists: `./tools/shape` is otherwise an ordinary program. This is a list of
-the ways veil knows, not a proof that there are no others. It does not cover a
-change made in an earlier Bash call, another program already on `PATH` under a
-tool's name, or variables that change what a tool does (`PYTHONPATH`).
+config lists: `./tools/shape` is otherwise an ordinary program.
+
+What stays possible: veil judges one command string, and apart from the
+variable list, the ways above are the ones it knows, not a proof that there are
+no others. It does not cover:
+
+- anything already in place before the command: a change from an earlier Bash
+  call, the harness's settings, or a shell startup file, including those a
+  shell reads on its own (zsh reads `.zshenv` for every shell);
+- a plain assignment to a variable the agent's shell exports and the hook's
+  environment does not have;
+- another program already on `PATH` under a tool's name, or a `PATH` that
+  differs between the hook and the shell;
+- what a tool does with the listed variables, or with ones set earlier.
 
 `find data -exec cat {} \;` is treated as a content read of `data`, because the
 files `{}` stands for are unknown; `-name`, `-type` and `-prune` filters are not
@@ -268,10 +299,15 @@ honored, so it is denied if `data` holds anything protected. What veil does not
 follow: a script piped into a shell (`echo '...' | sh`), a `cd` earlier in the
 line (paths resolve against the directory the hook started in), and programs
 that run a command but are not in the list above (`docker exec`, `ssh host
-cmd`, `git grep`). Those are allowed today. A script file an interpreter is
-asked to run is read; see [Script Files](#script-files). Variables, `$( )` results, what
-`xargs` reads, command text veil cannot parse and anything past the 64th command
-of one line or the 8th level of nesting are the dynamic-argument stance's; see
+cmd`, `git grep`, and `stdbuf`, `caffeinate`, `arch`, `script` or
+`sandbox-exec` running `sh -c '...'`). It also misses code held in a
+variable's value that bash then runs (`PS4` under `bash -x`, `$( )` in
+`BASH_ENV`, a function in `BASH_FUNC_name%%`), and a shell string behind a
+redirection written first (`>log bash -c '...'`). Those are allowed today. A
+script file an interpreter is asked to run is read; see
+[Script Files](#script-files). Variables, `$( )` results, what `xargs` reads,
+command text veil cannot parse and anything past the 64th command of one line
+or the 8th level of nesting are the dynamic-argument stance's; see
 [Dynamic Arguments](#dynamic-arguments).
 
 Each of those commands is then judged by the paths it names, not by whether veil

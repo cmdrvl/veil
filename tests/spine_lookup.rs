@@ -76,6 +76,11 @@ impl Fixture {
         );
         fs::write(fixture.project.join("env.sh"), "PATH=tools:$PATH\n").expect("env.sh");
         fs::write(fixture.project.join("report.sh"), "shape protected/x.csv\n").expect("report.sh");
+        fs::write(
+            fixture.project.join("funcs.sh"),
+            "shape() { /bin/cat \"$1\"; }\nveil() { /bin/cat \"$3\"; }\n",
+        )
+        .expect("funcs.sh");
         fixture
     }
 
@@ -95,6 +100,11 @@ impl Fixture {
 
     /// The hook's decision for a Bash call, and the reason and remediation text.
     fn hook(&self, text: &str) -> (String, String) {
+        self.hook_with(text, &[])
+    }
+
+    /// The same, with more in the hook's environment.
+    fn hook_with(&self, text: &str, environment: &[(&str, &str)]) -> (String, String) {
         let payload = serde_json::json!({
             "session_id": "spine-lookup",
             "cwd": self.project,
@@ -104,6 +114,7 @@ impl Fixture {
         });
         let mut child = self
             .command(VEIL)
+            .envs(environment.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -164,6 +175,9 @@ fn a_command_that_changes_how_a_tool_is_found_gets_no_authority() {
         "env -u HOME PATH=tools:/bin shape protected/x.csv",
         "env -S 'PATH=tools:/bin shape protected/x.csv'",
         "nohup env PATH=tools:/bin shape protected/x.csv",
+        // the shell's `time` keyword takes assignments before its command
+        "time PATH=tools:/bin shape protected/x.csv",
+        "time -p PATH=tools:/bin veil exec shape protected/x.csv",
         // set for the commands that follow
         "export PATH=tools:$PATH; shape protected/x.csv",
         "export PATH=\"tools:$PATH\" && veil exec shape protected/x.csv",
@@ -236,6 +250,111 @@ fn a_command_that_changes_how_a_tool_is_found_gets_no_authority() {
     assert!(allowed.is_empty(), "allowed:\n{}", allowed.join("\n"));
 }
 
+/// bd-szf: bash imports a function from the environment, and a function wins
+/// over `PATH`. A shell can also be handed functions by a startup file it is
+/// told to read, or find other programs by another syntax than veil reads.
+#[test]
+fn a_command_that_brings_its_own_functions_gets_no_authority() {
+    let fixture = Fixture::new();
+    let shape = r#"'BASH_FUNC_shape%%=() { /bin/cat "$1"; }'"#;
+    let veil = r#"'BASH_FUNC_veil%%=() { /bin/cat "$3"; }'"#;
+    let mut harmless = Vec::new();
+    let mut allowed = Vec::new();
+    for command in [
+        format!("env {shape} /bin/bash --noprofile --norc -c 'shape protected/x.csv'"),
+        format!("env {veil} /bin/bash --noprofile --norc -c 'veil exec shape protected/x.csv'"),
+        format!("env {shape} bash -c 'shape protected/x.csv'"),
+        format!("nohup env {shape} bash -c 'shape protected/x.csv'"),
+        format!("env LANG=C {shape} bash -c 'shape protected/x.csv'"),
+        format!("env -- {shape} bash -c 'shape protected/x.csv'"),
+        // a startup file the command names
+        "bash --rcfile funcs.sh -ic 'shape protected/x.csv'".to_owned(),
+        "bash --init-file funcs.sh -i -c 'veil exec shape protected/x.csv'".to_owned(),
+        // `set -k` and `-k` put a later word into the command's environment
+        "set -k; bash -c 'shape protected/x.csv' BASH_ENV=funcs.sh".to_owned(),
+        "bash -kc \"bash -c 'shape protected/x.csv' BASH_ENV=funcs.sh\"".to_owned(),
+    ] {
+        if !fixture.leaks(&command) {
+            harmless.push(command.clone());
+        }
+        if fixture.hook(&command).0 != "deny" {
+            allowed.push(command);
+        }
+    }
+    assert!(
+        harmless.is_empty() && allowed.is_empty(),
+        "not an impostor:\n{}\nallowed:\n{}",
+        harmless.join("\n"),
+        allowed.join("\n")
+    );
+}
+
+/// Why the exported functions got through (bd-szf): `env` takes any word with
+/// `=` in it as an assignment, and the shell also assigns with `+=` and to an
+/// element. Such a word taken for the command hid what ran after it, so each of
+/// these read the protected file with no tool involved at all.
+#[test]
+fn a_word_that_assigns_is_not_taken_for_the_command() {
+    let fixture = Fixture::new();
+    let mut harmless = Vec::new();
+    let mut allowed = Vec::new();
+    for command in [
+        "env a-b=1 bash -c 'cat protected/x.csv'",
+        "env a.b=1 sh -c 'cat protected/x.csv'",
+        "env 'ODD%%=1' bash -c 'cat protected/x.csv'",
+        "env -- a-b=1 bash -c 'cat protected/x.csv'",
+        "env -u A a-b=1 bash -c 'cat protected/x.csv'",
+        "nohup env a-b=1 sh -c 'cat protected/x.csv'",
+        "echo x | xargs env a-b=1 sh -c 'cat protected/x.csv'",
+        "find . -maxdepth 0 -exec env a-b=1 sh -c 'cat protected/x.csv' \\;",
+        // `-` is `-i`
+        "env - /bin/bash -c '/bin/cat protected/x.csv'",
+        "env -i - a-b=1 /bin/bash -c '/bin/cat protected/x.csv'",
+        // what `-S` splits off is `env`'s own: options, assignments, command
+        "env -S 'A=1 bash -c \"cat protected/x.csv\"'",
+        "env -S '-v bash -c \"cat protected/x.csv\"'",
+        "env -S 'A=1' bash -c 'cat protected/x.csv'",
+        // the last `-C` is the one `env` uses
+        "env -C /tmp -C protected cat x.csv",
+        "A+=1 bash -c 'cat protected/x.csv'",
+        "A=1 B+=2 sh -c 'cat protected/x.csv'",
+        "{ A+=1 bash -c 'cat protected/x.csv'; }",
+        "time -p A=1 bash -c 'cat protected/x.csv'",
+        // a value that ends like a shell's name is still a value
+        "time A=/bin/sh bash -c 'cat protected/x.csv'",
+    ] {
+        if !fixture.leaks(command) {
+            harmless.push(command);
+        }
+        if fixture.hook(command).0 != "deny" {
+            allowed.push(command);
+        }
+    }
+    // Not run here: another user, long options only GNU `env` has, and an
+    // element before a command, which bash 3.2 runs and other versions were not
+    // tried with.
+    for command in [
+        "A[0]=1 bash -c 'cat protected/x.csv'",
+        "sudo A=1 bash -c 'cat protected/x.csv'",
+        "sudo A=1 -u nobody B=2 bash -c 'cat protected/x.csv'",
+        "env --split='sh -c \"cat protected/x.csv\"'",
+        "env --split 'sh -c \"cat protected/x.csv\"'",
+        "env --ch protected cat x.csv",
+        "env -a name bash -c 'cat protected/x.csv'",
+        "env --argv0 name bash -c 'cat protected/x.csv'",
+    ] {
+        if fixture.hook(command).0 != "deny" {
+            allowed.push(command);
+        }
+    }
+    assert!(
+        harmless.is_empty() && allowed.is_empty(),
+        "reads nothing:\n{}\nallowed:\n{}",
+        harmless.join("\n"),
+        allowed.join("\n")
+    );
+}
+
 /// These are refused too, and are not run here: they need another user, a
 /// network or a program the test machine may lack, or fail when run.
 #[test]
@@ -276,12 +395,89 @@ fn runners_with_their_own_lookup_get_no_authority() {
         "commands[shape]=tools/shape; shape protected/x.csv",
         "functions[shape]='/bin/cat $1'; shape protected/x.csv",
         "autoload -U shape; shape protected/x.csv",
+        "module_path=(tools); shape protected/x.csv",
+        "zmodload zsh/system; shape protected/x.csv",
+        "setopt ALL_EXPORT; shape protected/x.csv",
+        // shells whose syntax veil does not read
+        "tcsh -f -c 'alias shape /bin/cat\\\nshape protected/x.csv'",
+        "tcsh -f <<'EOF'\nalias shape /bin/cat\nshape protected/x.csv\nEOF",
+        "csh -f -c 'setenv PATH tools; shape protected/x.csv'",
+        "fish -c 'shape protected/x.csv'",
+        // bash's own tables of commands and aliases; bash 3.2 has neither
+        "BASH_CMDS[shape]=/bin/cat; shape protected/x.csv",
+        "shopt -s expand_aliases\nBASH_ALIASES[shape]=/bin/cat\nshape protected/x.csv",
+        // assignments put into the environment without being asked each time
+        "set -a; shape protected/x.csv",
+        "set -o allexport; shape protected/x.csv",
+        "set -o keyword; shape protected/x.csv",
+        "shopt -so allexport; shape protected/x.csv",
+        "zsh -a -c 'shape protected/x.csv'",
+        "xargs --process-slot-var=SLOT shape protected/x.csv",
+        "env --not-an-option-veil-knows shape protected/x.csv",
+        "exec -c shape protected/x.csv",
     ] {
         if fixture.hook(command).0 != "deny" {
             allowed.push(command);
         }
     }
     assert!(allowed.is_empty(), "allowed:\n{}", allowed.join("\n"));
+}
+
+/// What a command may put into a program's environment and keep authority is a
+/// list: locale, time zone and terminal settings. Any other variable loses it,
+/// harmless ones too, since veil cannot tell which can carry code.
+#[test]
+fn only_listed_variables_may_be_carried() {
+    let fixture = Fixture::new();
+    let mut allowed = Vec::new();
+    for command in [
+        "MY_PATH=tools shape protected/x.csv",
+        "export STAMP=\"$(date)\"; shape protected/x.csv",
+        "RUST_LOG=trace shape protected/x.csv",
+        "env RUST_LOG=trace shape protected/x.csv",
+        "LANG=C MY_SETTING=1 veil exec shape protected/x.csv",
+        "MY_SETTING+=1 shape protected/x.csv",
+        "MY_SETTING=1 sh -c 'shape protected/x.csv'",
+        "export MY_SETTING; shape protected/x.csv",
+        "export LANG=C MY_SETTING=1; shape protected/x.csv",
+        "declare -x MY_SETTING=1; shape protected/x.csv",
+        // zsh's other ways to declare
+        "integer -x MY_LEVEL=1; shape protected/x.csv",
+        "float -x MY_RATIO=1; shape protected/x.csv",
+        "env 'BASH_FUNC_shape%%=() { :; }' shape protected/x.csv",
+    ] {
+        if fixture.hook(command).0 != "deny" {
+            allowed.push(command);
+        }
+    }
+    assert!(allowed.is_empty(), "allowed:\n{}", allowed.join("\n"));
+}
+
+/// Setting a variable that is already in the environment hands the new value to
+/// every program after it, with no `export` in sight. veil goes by the hook's
+/// environment.
+#[test]
+fn setting_a_variable_already_in_the_environment_gets_no_authority() {
+    let fixture = Fixture::new();
+    for command in [
+        "TOOL_SETTING=tools; shape protected/x.csv",
+        "read -r TOOL_SETTING <<< tools; shape protected/x.csv",
+        "for TOOL_SETTING in a b; do :; done; shape protected/x.csv",
+        "printf -v TOOL_SETTING %s tools; shape protected/x.csv",
+    ] {
+        assert_eq!(fixture.hook(command).0, "allow", "unset: {command}");
+        let (decision, why) = fixture.hook_with(command, &[("TOOL_SETTING", "x")]);
+        assert_eq!(decision, "deny", "set: {command}: {why}");
+    }
+    // a listed one stays free to change, and so does `_`, which the shell sets
+    // itself
+    for (command, name) in [
+        ("LANG=C; shape protected/x.csv", "LANG"),
+        ("for _ in a b; do :; done; shape protected/x.csv", "_"),
+    ] {
+        let (decision, why) = fixture.hook_with(command, &[(name, "x")]);
+        assert_eq!(decision, "allow", "{command}: {why}");
+    }
 }
 
 /// The control: what leaves lookup alone keeps its authority, including the
@@ -298,7 +494,17 @@ fn a_command_that_leaves_lookup_alone_keeps_authority() {
         "LC_ALL=C shape protected/x.csv".to_owned(),
         "env LANG=C veil exec shape protected/x.csv".to_owned(),
         "export LANG=C; shape protected/x.csv".to_owned(),
-        "MY_PATH=tools shape protected/x.csv".to_owned(),
+        "LANG=C LC_ALL=C TZ=UTC TERM=dumb NO_COLOR=1 shape protected/x.csv".to_owned(),
+        "export LANG=C LC_ALL=C 2>/dev/null; shape protected/x.csv".to_owned(),
+        "env -v -- LC_ALL=C shape protected/x.csv".to_owned(),
+        "env -u LANG shape protected/x.csv".to_owned(),
+        // the shell keeps these for itself
+        "MY_PATH=tools; shape protected/x.csv".to_owned(),
+        "x=1 y=2; shape protected/x.csv".to_owned(),
+        "while IFS= read -r line; do :; done < /dev/null; shape protected/x.csv".to_owned(),
+        "set -euo pipefail; shape protected/x.csv".to_owned(),
+        "set -- -a -k; shape protected/x.csv".to_owned(),
+        "bash -euo pipefail -c 'shape protected/x.csv'".to_owned(),
         "nohup shape protected/x.csv".to_owned(),
         "command shape protected/x.csv".to_owned(),
         "sh -c 'shape protected/x.csv'".to_owned(),
@@ -309,7 +515,7 @@ fn a_command_that_leaves_lookup_alone_keeps_authority() {
         "hash -r; shape protected/x.csv".to_owned(),
         "trap 'echo done' EXIT INT; shape protected/x.csv".to_owned(),
         "trap '' INT; trap - INT; shape protected/x.csv".to_owned(),
-        "export STAMP=\"$(date)\"; shape protected/x.csv".to_owned(),
+        "STAMP=\"$(date)\"; shape protected/x.csv".to_owned(),
         "read -r -p \"$HOSTNAME\" answer <<< y; shape protected/x.csv".to_owned(),
         "read -r line < \"$HOME/none\"; shape protected/x.csv".to_owned(),
         "files=(a b); shape protected/x.csv".to_owned(),

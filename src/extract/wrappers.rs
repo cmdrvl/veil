@@ -108,11 +108,6 @@ const NO_OPTIONS: Options = Options {
     long_value: &[],
 };
 
-/// `env`: GNU and BSD together (`-u`, `-C`, `-S`, BSD `-P`).
-const ENV: Options = Options {
-    short_value: &['u', 'C', 'S', 'P'],
-    long_value: &["unset", "chdir", "split-string"],
-};
 /// `nice [-n N | --adjustment=N]`.
 const NICE: Options = Options {
     short_value: &['n'],
@@ -326,6 +321,18 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
         let unnamed = command.computed.contains(&words[0]);
         run.lookup_changed |= lookup::changes_lookup(&texts, unnamed);
 
+        // The shell's `time` keyword is followed by a command, assignments and
+        // all. They are passed over only once the check above has read them,
+        // and before a value such as `/bin/sh` is read as a program's name.
+        let assigned = texts
+            .iter()
+            .take_while(|word| super::is_shell_assignment(word))
+            .count();
+        if assigned > 0 && assigned < texts.len() {
+            start += assigned;
+            continue;
+        }
+
         // An action with something computed in it when it is set can be any
         // script; otherwise it is read.
         if program == "trap"
@@ -344,6 +351,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
             } else {
                 command.heredoc_computed
                     || scripts.iter().any(|text| command.computed.contains(text))
+                    || lookup::shell_changes_lookup(program, &words[1..])
             };
             command.argv.drain(..start);
             if !is_eval {
@@ -539,15 +547,21 @@ fn step(words: &[String]) -> Step {
         }
         "sudo" => {
             let skipped = skip_options(args, &SUDO);
-            let shell = skipped
-                .short_flags
-                .iter()
-                .any(|flag| matches!(flag, 's' | 'i'));
-            let rest = &args[skipped.end.min(args.len())..];
+            let mut flags = skipped.short_flags;
+            let mut end = skipped.end;
+            // `VAR=value` before the command sets it for the command, and
+            // options may follow
+            while args.get(end).is_some_and(|word| word.contains('=')) {
+                let more = skip_options(&args[end + 1..], &SUDO);
+                flags.extend(more.short_flags);
+                end += 1 + more.end;
+            }
+            let shell = flags.iter().any(|flag| matches!(flag, 's' | 'i'));
+            let rest = &args[end.min(args.len())..];
             if shell && !rest.is_empty() {
                 Step::Script(rest.join(" "))
             } else {
-                finish(1, skipped.end, args.len(), false)
+                finish(1, end, args.len(), false)
             }
         }
         "doas" => skip(1, &DOAS, args, false),
@@ -634,33 +648,95 @@ fn finish_with_directory(
     }
 }
 
-/// `env [options] [NAME=value]... command`. `-S` carries words to run.
+/// The option of `env` that takes a value and has this long name. GNU takes
+/// any start of a long name that no other shares, and no other starts the way
+/// these do.
+fn env_long_option(name: &str) -> Option<char> {
+    [
+        ("unset", 'u'),
+        ("chdir", 'C'),
+        ("split-string", 'S'),
+        ("argv0", 'a'),
+    ]
+    .into_iter()
+    .find(|(long, _)| !name.is_empty() && long.starts_with(name))
+    .map(|(_, flag)| flag)
+}
+
+/// `env [options] [-] [NAME=value]... command`, GNU and BSD, read as `env`
+/// reads it: a word with `=` in it is an assignment whatever stands before the
+/// `=`, and what `-S` splits off takes its place among `env`'s own words. A
+/// word of `env`'s taken for the command would hide the command (bd-szf).
 fn env_step(args: &[String]) -> Step {
     let mut i = 0;
     let mut directory = None;
 
     loop {
-        let skipped = skip_options(&args[i..], &ENV);
-        if let Some(value) = skipped.value_of(&["-C", "--chdir"]) {
-            directory = Some(value.to_owned());
-        }
-        if let Some(text) = skipped.value_of(&["-S", "--split-string"])
-            && let Some(mut words) = shlex::split(text)
-        {
-            words.extend(args[i + skipped.end..].iter().cloned());
-            return if words.is_empty() {
-                Step::Done
-            } else {
-                Step::Words(words, directory)
-            };
-        }
-        i += skipped.end;
-
         let before = i;
-        while args
-            .get(i)
-            .is_some_and(|word| super::is_env_assignment(word))
-        {
+        while let Some(arg) = args.get(i) {
+            // an option that takes a value, and the value written onto it
+            let (flag, attached) = if arg == "--" {
+                i += 1;
+                break;
+            } else if let Some(long) = arg.strip_prefix("--") {
+                i += 1;
+                let (name, value) = match long.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (long, None),
+                };
+                match env_long_option(name) {
+                    Some(flag) => (flag, value),
+                    None => continue,
+                }
+            } else if let Some(cluster) = arg.strip_prefix('-')
+                && !cluster.is_empty()
+            {
+                i += 1;
+                // `-u`, `-C`, `-S`, BSD's `-P` and GNU's `-a`
+                let mut letters = cluster.chars();
+                let Some(flag) = letters.find(|flag| matches!(flag, 'u' | 'C' | 'S' | 'P' | 'a'))
+                else {
+                    continue;
+                };
+                let rest = letters.as_str();
+                (flag, (!rest.is_empty()).then_some(rest))
+            } else {
+                break;
+            };
+            let value = match attached {
+                Some(value) => value,
+                None => {
+                    let Some(value) = args.get(i) else {
+                        break;
+                    };
+                    i += 1;
+                    value
+                }
+            };
+            match flag {
+                // the last `-C` is the one that counts
+                'C' => directory = Some(value.to_owned()),
+                'S' => {
+                    if let Some(split) = shlex::split(value) {
+                        // the next step reads these as `env`'s own; the count
+                        // of steps bounds a `-S` inside a `-S`
+                        let mut own = vec!["env".to_owned()];
+                        if let Some(directory) = directory {
+                            own.extend(["-C".to_owned(), directory]);
+                        }
+                        own.extend(split);
+                        own.extend(args.iter().skip(i).cloned());
+                        return Step::Words(own, None);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // `-` is `-i`
+        if args.get(i).is_some_and(|arg| arg == "-") {
+            i += 1;
+        }
+        while args.get(i).is_some_and(|word| word.contains('=')) {
             i += 1;
         }
         if i == before {
