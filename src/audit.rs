@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 /// Written on every record as `schema_version`. The records before it came in
 /// generations with different keys and nothing to tell them apart; a reader
 /// that meets any other value, or none, is looking at a legacy record.
-pub const SCHEMA_VERSION: &str = "veil.audit.v1";
+pub const SCHEMA_VERSION: &str = "veil.audit.v2";
 
 /// Written on every record as `enforcement`: what stood behind the decision.
 /// `hook` is a hook reading the text of a tool call, which is advisory and
@@ -62,6 +62,13 @@ pub struct AuditRecord {
     /// record `veil audit --class egress` answers "did anything try to leave"
     /// from. Null for every other record, whatever its `reason_class`.
     pub class: Option<String>,
+    /// True if the current deny policy would refuse this input, including an
+    /// allow-with-warning during the rollout period.
+    pub would_deny: bool,
+    /// True when `path` is a one-way digest because replay inputs are disabled.
+    pub path_is_hash: bool,
+    /// Replayable tool metadata and arguments; may contain sensitive values.
+    pub tool_input: Option<Value>,
 }
 
 impl AuditRecord {
@@ -79,6 +86,9 @@ impl AuditRecord {
             "origin": self.origin,
             "reason_class": self.reason_class,
             "class": self.class,
+            "would_deny": self.would_deny,
+            "path_is_hash": self.path_is_hash,
+            "tool_input": self.tool_input,
             "enforcement": ENFORCEMENT,
         })
     }
@@ -296,6 +306,9 @@ mod tests {
             origin: Some("top".to_owned()),
             reason_class: Some("direct_read".to_owned()),
             class: None,
+            would_deny: true,
+            path_is_hash: false,
+            tool_input: None,
         }
     }
 
@@ -348,7 +361,7 @@ mod tests {
         assert_eq!(value["decision"], "deny");
         assert_eq!(value["session_id"], "session-123");
         assert_eq!(value["origin"], "top");
-        assert_eq!(value["schema_version"], "veil.audit.v1");
+        assert_eq!(value["schema_version"], "veil.audit.v2");
         assert_eq!(
             value["enforcement"], "hook",
             "a record says what stood behind it: a hook, until a sandbox does"
@@ -630,14 +643,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_line(
-                br#"{"schema_version":"veil.audit.v1","ts":"1","tool":"Read","path":"a","decision":"allow"}"#
+                br#"{"schema_version":"veil.audit.v2","ts":"1","tool":"Read","path":"a","decision":"allow"}"#
             ),
             Line::Entry { current: true, .. }
         ));
-        // another version is readable but not this one
+        // Earlier schemas remain readable but are classified as legacy.
         assert!(matches!(
             parse_line(
-                br#"{"schema_version":"veil.audit.v2","ts":"1","tool":"Read","path":"a","decision":"allow"}"#
+                br#"{"schema_version":"veil.audit.v1","ts":"1","tool":"Read","path":"a","decision":"allow"}"#
             ),
             Line::Entry { current: false, .. }
         ));
@@ -678,6 +691,9 @@ mod tests {
                 origin: Some("wrapper".to_owned()),
                 reason_class: Some("argv_path".to_owned()),
                 class: Some("egress".to_owned()),
+                would_deny: true,
+                path_is_hash: false,
+                tool_input: None,
             },
         )
         .expect("second append should succeed");

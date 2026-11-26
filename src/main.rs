@@ -75,6 +75,10 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             println!("{}", operator::run_audit(&args)?);
             Ok(0)
         }
+        cli::OperatorCommand::Replay(args) => {
+            println!("{}", operator::run_replay(&args)?);
+            Ok(0)
+        }
         cli::OperatorCommand::Doctor(args) => {
             let (rendered, exit_code) = operator::run_doctor(&args)?;
             println!("{rendered}");

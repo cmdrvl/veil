@@ -72,8 +72,10 @@ fn config(
         },
         policy: PolicyConfig {
             default: PolicyMode::Deny,
+            egress: Some(PolicyMode::Warn),
             audit_log: false,
             audit_path: PathBuf::from("/unused/veil-formal-properties-audit.jsonl"),
+            audit_inputs: false,
             require_dcg: false,
             dynamic_args: DynamicArgsMode::Deny,
         },

@@ -120,8 +120,18 @@
       "description": "Show recent audit log entries. Lines that are not audit entries are skipped and counted, not an error.",
       "options": [
         { "name": "json", "flag": "--json", "type": "flag", "description": "Emit recent audit entries as JSON" },
-        { "name": "validate", "flag": "--validate", "type": "flag", "description": "Instead of listing entries, count the audit log's lines by kind (current veil.audit.v1, legacy, unparseable) and list the first 20 unparseable line numbers; takes no --class" },
+        { "name": "validate", "flag": "--validate", "type": "flag", "description": "Instead of listing entries, count the audit log's lines by kind (current veil.audit.v2, legacy, unparseable) and list the first 20 unparseable line numbers; takes no --class" },
         { "name": "class", "flag": "--class", "type": "string", "description": "Only entries of one class: egress (a command that sends a protected path off the machine), or a reason_class: direct_read, argv_path, dynamic_path_unresolvable, mcp_argument (a path handed to an MCP tool in its arguments), script_too_large_to_inspect (a script an interpreter was asked to run that veil did not read)" }
+      ],
+      "read_only": true,
+      "guard_preflight_required": true
+    },
+    {
+      "name": "replay",
+      "description": "Re-evaluate saved Bash, Read, and Grep tool inputs under the current policy and report decision flips. Requires [policy] audit_inputs = true for replayable entries; paths are hashed and entries are skipped when input capture is disabled.",
+      "options": [
+        { "name": "audit", "flag": "--audit", "type": "string", "description": "Audit JSONL path; defaults to the configured audit path" },
+        { "name": "since", "flag": "--since", "type": "string", "description": "Replay entries since Unix seconds or a duration such as 30d" }
       ],
       "read_only": true,
       "guard_preflight_required": true

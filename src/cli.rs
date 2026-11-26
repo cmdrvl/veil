@@ -72,6 +72,22 @@ pub struct AuditArgs {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct ReplayArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Audit JSONL file; defaults to the configured audit path"
+    )]
+    pub audit: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "TIME",
+        help = "Replay entries since Unix seconds or a duration such as 30d"
+    )]
+    pub since: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct DoctorArgs {
     #[arg(long = "robot-triage", help = "Emit read-only doctor triage JSON")]
     pub robot_triage: bool,
@@ -163,6 +179,8 @@ pub enum OperatorCommand {
     Config(ConfigArgs),
     #[command(about = "Show recent audit log entries")]
     Audit(AuditArgs),
+    #[command(about = "Replay saved tool inputs against the current policy")]
+    Replay(ReplayArgs),
     #[command(about = "Inspect local config, audit, and hook health without writing")]
     Doctor(DoctorArgs),
     #[command(about = "Install managed veil Claude PreToolUse hooks")]
@@ -319,6 +337,13 @@ mod tests {
                 }),
             ),
             (
+                "replay",
+                OperatorCommand::Replay(ReplayArgs {
+                    audit: None,
+                    since: None,
+                }),
+            ),
+            (
                 "doctor",
                 OperatorCommand::Doctor(DoctorArgs {
                     robot_triage: false,
@@ -356,6 +381,7 @@ mod tests {
             "packs",
             "config",
             "audit",
+            "replay",
             "doctor",
             "install",
             "uninstall",
@@ -387,6 +413,24 @@ mod tests {
                 json: true,
                 class: None,
                 validate: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn replay_subcommand_accepts_audit_path_and_since_window() {
+        assert_eq!(
+            parse(&[
+                "veil",
+                "replay",
+                "--audit",
+                "state/audit.jsonl",
+                "--since",
+                "30d"
+            ]),
+            Dispatch::Operator(OperatorCommand::Replay(ReplayArgs {
+                audit: Some(PathBuf::from("state/audit.jsonl")),
+                since: Some("30d".to_owned()),
             }))
         );
     }

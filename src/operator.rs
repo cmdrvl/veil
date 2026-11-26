@@ -19,7 +19,8 @@ use veil::types::{Decision, DecisionAction, SensitivityResult, ToolKind};
 
 use crate::cli::{
     AuditArgs, CapabilitiesArgs, ConfigArgs, DirCommandArgs, DoctorAction, DoctorArgs,
-    DoctorCapabilitiesArgs, JsonOutputArgs, PathCommandArgs, RobotDocsArgs, SandboxArgs,
+    DoctorCapabilitiesArgs, JsonOutputArgs, PathCommandArgs, ReplayArgs, RobotDocsArgs,
+    SandboxArgs,
 };
 use crate::hooks;
 
@@ -159,6 +160,20 @@ pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>>
         args.class.as_deref(),
         RECENT_AUDIT_LIMIT,
     )
+}
+
+pub fn run_replay(args: &ReplayArgs) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = env::current_dir()?;
+    let config = config::load_config(&repo_root)?;
+    let audit_path = args
+        .audit
+        .as_deref()
+        .unwrap_or(config.policy.audit_path.as_path());
+    Ok(veil::replay::render_report(
+        audit_path,
+        &config,
+        args.since.as_deref(),
+    )?)
 }
 
 /// `veil --describe`: the operator manifest, byte-for-byte the repo's `operator.json`.
@@ -330,11 +345,25 @@ fn render_doctor_health_for_repo(
 ) -> Result<(String, u8), Box<dyn std::error::Error>> {
     let report = current_doctor_report(repo_root);
     let exit = report.exit_code();
+    let config = config::load_config(repo_root)?;
+    let rollout_warning = (config.policy.dynamic_args == config::DynamicArgsMode::Warn
+        || config.policy.egress_mode() == &PolicyMode::Warn)
+        .then(|| {
+            "Track A rollout policy is in warn mode for dynamic arguments or egress; run `veil replay --since 30d` before switching to deny.".to_owned()
+        });
 
     if json_output {
-        Ok((serde_json::to_string_pretty(&report.to_json_value())?, exit))
+        let mut value = report.to_json_value();
+        if let Some(warning) = rollout_warning {
+            value["rollout_warnings"] = json!([warning]);
+        }
+        Ok((serde_json::to_string_pretty(&value)?, exit))
     } else {
-        Ok((render_doctor_human(&report), exit))
+        let mut rendered = render_doctor_human(&report);
+        if let Some(warning) = rollout_warning {
+            writeln!(rendered, "\nWarning: {warning}")?;
+        }
+        Ok((rendered, exit))
     }
 }
 
@@ -594,8 +623,10 @@ fn config_json(config: &Config) -> Value {
         },
         "policy": {
             "default": policy_mode_name(&config.policy.default),
+            "egress": policy_mode_name(config.policy.egress_mode()),
             "audit_log": config.policy.audit_log,
             "audit_path": config.policy.audit_path.display().to_string(),
+            "audit_inputs": config.policy.audit_inputs,
             "dynamic_args": config.policy.dynamic_args.as_str(),
         },
     })
@@ -611,10 +642,16 @@ fn render_config_human(config: &Config) -> String {
     );
     let _ = writeln!(
         output,
+        "  egress: {}",
+        policy_mode_name(config.policy.egress_mode())
+    );
+    let _ = writeln!(
+        output,
         "  dynamic_args: {}",
         config.policy.dynamic_args.as_str()
     );
     let _ = writeln!(output, "  audit_log: {}", config.policy.audit_log);
+    let _ = writeln!(output, "  audit_inputs: {}", config.policy.audit_inputs);
     let _ = writeln!(
         output,
         "  audit_path: {}",
@@ -2369,7 +2406,7 @@ mod tests {
         write_file(
             &audit_path,
             concat!(
-                "{\"schema_version\":\"veil.audit.v1\",\"ts\":\"1\",\"tool\":\"Read\",\"path\":\"a\",\"decision\":\"allow\"}\n",
+                "{\"schema_version\":\"veil.audit.v2\",\"ts\":\"1\",\"tool\":\"Read\",\"path\":\"a\",\"decision\":\"allow\"}\n",
                 "{\"ts\":\"2\",\"tool\":\"Read\",\"path\":\"b\",\"decision\":\"allow\"}\n",
                 "not json\n",
                 "\n",
@@ -2379,7 +2416,7 @@ mod tests {
         let json = render_audit_validation(&audit_path, true).expect("validation");
         let value: Value = serde_json::from_str(&json).expect("validation JSON should parse");
         assert_eq!(value["exists"], true);
-        assert_eq!(value["schema_version"], "veil.audit.v1");
+        assert_eq!(value["schema_version"], "veil.audit.v2");
         assert_eq!(value["lines"], 4);
         assert_eq!(value["blank"], 1);
         assert_eq!(value["current"], 1);
@@ -2389,9 +2426,9 @@ mod tests {
 
         let text = render_audit_validation(&audit_path, false).expect("validation");
         assert!(text.contains("lines: 4 (1 blank)"), "{text}");
-        assert!(text.contains("current (veil.audit.v1): 1"), "{text}");
+        assert!(text.contains("current (veil.audit.v2): 1"), "{text}");
         assert!(
-            text.contains("legacy (readable, no veil.audit.v1): 1"),
+            text.contains("legacy (readable, no veil.audit.v2): 1"),
             "{text}"
         );
         assert!(text.contains("unparseable: 1"), "{text}");

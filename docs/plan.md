@@ -556,9 +556,12 @@ mappings are not covered by these properties.
     README carry `enforcement: hook-only | sandboxed`. The 36-vector probe
     becomes `tests/bypass_matrix.rs`; `docs/bypass-matrix.md` is generated
     from it and CI fails on drift. README alt text stops claiming grants.
-11. **Replay harness.** `veil replay --audit <jsonl>` re-evaluates historic
-    Bash entries under the new rules and reports allow→deny flips, so the
-    false-positive cost of every rule is a number in the release notes.
+11. **Replay harness.** `veil replay --audit <jsonl> --since 30d` re-evaluates
+    historic Bash, Read, and Grep entries that retained their tool inputs under
+    the current rules. It reports allow→deny and deny→allow flips by rule and
+    the 20 commands newly denied; release notes publish the operator's last-30-
+    day counts before the 0.6 deny-default transition. `[policy] audit_inputs =
+    false` hashes paths and omits tool inputs, so those records are not replayed.
 
 ### Track B — OS sandbox enforcement (1.0): ADR B-1
 

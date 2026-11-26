@@ -10,6 +10,7 @@ mod mcp;
 pub mod packs;
 pub mod protected_corpus;
 pub mod render;
+pub mod replay;
 pub mod sandbox;
 pub mod spine;
 pub mod types;
@@ -33,9 +34,9 @@ use extract::{
 use hook::parse_hook_input;
 use packs::PackRegistry;
 use render::{RenderedDecision, render_decision};
-use serde_json::Value;
+use serde_json::{Value, json};
 use spine::detect_spine_argv;
-use types::{Decision, DecisionAction, HookInput, InformationLabel, ToolKind};
+use types::{Decision, DecisionAction, HookInput, HookProtocol, InformationLabel, ToolKind};
 
 #[derive(Clone, Debug)]
 struct CandidateOutcome {
@@ -50,6 +51,13 @@ struct CandidateOutcome {
     egress: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReplayDecision {
+    pub path: PathBuf,
+    pub rule: &'static str,
+    pub would_deny: bool,
+}
+
 /// What an egress denial tells the agent besides the reason: the path is on its
 /// way off the machine, so a copy or an encoding of it is no way around the rule,
 /// and there are two ways to get the information somewhere: a derived artifact
@@ -62,11 +70,28 @@ const EGRESS_REMEDIATION: &str = "Egress blocked: this command would send a prot
 /// `aws`, a mail client...) as an egress attempt: its remediation says so and
 /// the audit record carries `class: egress`. Any other decision is unchanged.
 fn classify_egress(command: &CommandExtraction, mut decision: Decision) -> (Decision, bool) {
-    let egress = command.egress && decision.action == DecisionAction::Deny;
+    let egress = command.egress && would_deny(&decision);
     if egress {
         decision.remediation = Some(EGRESS_REMEDIATION.to_owned());
     }
     (decision, egress)
+}
+
+fn would_deny(decision: &Decision) -> bool {
+    decision.action == DecisionAction::Deny
+        || decision.reason.as_deref().is_some_and(|reason| {
+            reason.starts_with("policy default warn:")
+                || reason.starts_with("policy default log:")
+                || reason.starts_with("[policy] dynamic_args = warn:")
+        })
+}
+
+fn warn_mode_would_deny(decision: &Decision) -> bool {
+    decision.action == DecisionAction::Allow
+        && decision.reason.as_deref().is_some_and(|reason| {
+            reason.starts_with("policy default warn:")
+                || reason.starts_with("[policy] dynamic_args = warn:")
+        })
 }
 
 /// How a path came to be judged (bd-29r, bd-2mi, bd-1wa, bd-1bk): read by
@@ -108,6 +133,9 @@ const MCP_REMEDIATION: &str = "MCP argument blocked: this tool call hands a prot
 
 /// What a denial of arguments veil did not read to the end tells the agent.
 const MCP_OVERSIZE_REMEDIATION: &str = "MCP arguments too large to screen: call the tool with fewer strings and less nesting, so that veil can show that none of them names a protected path. If the tool genuinely needs arguments this large, stop and ask the operator.";
+
+/// Audit replay inputs are bounded independently of the hook input parser.
+const MAX_AUDIT_TOOL_INPUT_BYTES: usize = 1024 * 1024;
 
 const BARE_INVOCATION_GUIDANCE: &str = "no hook payload received on stdin; bare `veil` is hook mode. Pipe a Claude/Gemini/Copilot hook payload into stdin, or run `veil --robot-triage`, `veil capabilities --json`, or `veil robot-docs guide` for operator discovery. For help with veil, run `veil --help`.";
 
@@ -180,13 +208,57 @@ fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
     let decision = select_decision(&outcomes);
     let mut rendered = render_decision(hook_input.protocol, &decision);
 
+    let warned = outcomes
+        .iter()
+        .filter(|outcome| warn_mode_would_deny(&outcome.decision))
+        .count();
+    if warned > 0 {
+        append_stderr_line(
+            &mut rendered,
+            format!(
+                "Warning: deny policy would refuse {warned} access finding(s); this policy is in warn mode."
+            ),
+        );
+    }
+
     if config.policy.audit_log
-        && let Err(error) = append_audit_records(&config.policy.audit_path, hook_input, &outcomes)
+        && let Err(error) = append_audit_records(
+            &config.policy.audit_path,
+            hook_input,
+            &outcomes,
+            config.policy.audit_inputs,
+        )
     {
         append_stderr_line(&mut rendered, format!("Audit logging failed: {error}"));
     }
 
     Ok(rendered)
+}
+
+pub(crate) fn evaluate_for_replay(
+    hook_input: &HookInput,
+    config: &config::Config,
+    registry: &PackRegistry,
+) -> Vec<ReplayDecision> {
+    let outcomes = if hook_input.tool == ToolKind::Mcp {
+        if config.mcp.screens(&hook_input.tool_name) {
+            evaluate_mcp(hook_input, config, registry)
+        } else {
+            Vec::new()
+        }
+    } else {
+        let commands = extract_commands(hook_input);
+        evaluate_commands(hook_input, config, registry, &commands)
+    };
+
+    outcomes
+        .into_iter()
+        .map(|outcome| ReplayDecision {
+            path: outcome.path,
+            rule: outcome.reason_class.as_str(),
+            would_deny: would_deny(&outcome.decision),
+        })
+        .collect()
 }
 
 /// What the tool call would read, one entry per simple command. A Read or Grep
@@ -302,6 +374,11 @@ fn evaluate_commands(
     let mut outcomes = Vec::new();
 
     for command in commands {
+        let mut command_config = config.clone();
+        if command.egress {
+            command_config.policy.default = config.policy.egress_mode().clone();
+        }
+
         // A script that is itself a protected path is denied where it was named
         // (`python3 data/x.csv`); what is in it is not read into another reason.
         if let Some(source) = &command.script
@@ -331,7 +408,7 @@ fn evaluate_commands(
 
             let (decision, egress) = classify_egress(
                 command,
-                evaluate_access_with(&evaluation_input, config, registry, &matchers),
+                evaluate_access_with(&evaluation_input, &command_config, registry, &matchers),
             );
             outcomes.push(CandidateOutcome {
                 path: path.clone(),
@@ -365,7 +442,8 @@ fn evaluate_commands(
                     evaluation_input.with_spine_invocation(invocation.for_path(argv.path.clone()));
             }
 
-            let decision = evaluate_access_with(&evaluation_input, config, registry, &matchers);
+            let decision =
+                evaluate_access_with(&evaluation_input, &command_config, registry, &matchers);
 
             // A word that is not protected is the common case (`git commit -m
             // a/b`, `sed s/a/b/`); it is neither blocked nor worth a record.
@@ -389,12 +467,13 @@ fn evaluate_commands(
         // argument it is given needs no resolving either.
         let already_denied = outcomes[first_outcome..]
             .iter()
-            .any(|outcome| outcome.decision.action == DecisionAction::Deny);
+            .any(|outcome| would_deny(&outcome.decision));
         if command.has_dynamic_args()
             && !already_denied
             && spine_invocation.is_none()
-            && let Some(outcome) = dynamic_outcome(config, command, &context)
+            && let Some(mut outcome) = dynamic_outcome(&command_config, command, &context)
         {
+            outcome.egress = command.egress && would_deny(&outcome.decision);
             outcomes.push(outcome);
         }
 
@@ -405,7 +484,13 @@ fn evaluate_commands(
 
             if let Some(why) = &source.unread {
                 outcomes.push(unread_script_outcome(
-                    hook_input, config, registry, &matchers, command, source, why,
+                    hook_input,
+                    &command_config,
+                    registry,
+                    &matchers,
+                    command,
+                    source,
+                    why,
                 ));
             }
         }
@@ -691,12 +776,15 @@ fn append_audit_records(
     audit_path: &Path,
     hook_input: &HookInput,
     outcomes: &[CandidateOutcome],
+    audit_inputs: bool,
 ) -> io::Result<()> {
     if outcomes.is_empty() {
         return Ok(());
     }
 
     let timestamp = audit_timestamp();
+    let tool_input = (audit_inputs && hook_input.raw_args.len() <= MAX_AUDIT_TOOL_INPUT_BYTES)
+        .then(|| audit_tool_input(hook_input));
 
     for outcome in outcomes {
         append_audit_record(
@@ -704,7 +792,11 @@ fn append_audit_records(
             &AuditRecord {
                 ts: timestamp.clone(),
                 tool: audit_tool_name(hook_input),
-                path: outcome.path.to_string_lossy().into_owned(),
+                path: if audit_inputs {
+                    outcome.path.to_string_lossy().into_owned()
+                } else {
+                    boundary_detectors::hash_match(outcome.path.to_string_lossy().as_bytes())
+                },
                 decision: decision_name(&outcome.decision.action).to_owned(),
                 reason: outcome.decision.reason.clone(),
                 sensitivity: outcome.sensitivity.clone(),
@@ -713,11 +805,37 @@ fn append_audit_records(
                 origin: Some(outcome.origin.as_str().to_owned()),
                 reason_class: Some(outcome.reason_class.as_str().to_owned()),
                 class: outcome.egress.then(|| "egress".to_owned()),
+                would_deny: would_deny(&outcome.decision),
+                path_is_hash: !audit_inputs,
+                tool_input: tool_input.clone(),
             },
         )?;
     }
 
     Ok(())
+}
+
+fn audit_tool_input(hook_input: &HookInput) -> Value {
+    json!({
+        "protocol": match hook_input.protocol {
+            HookProtocol::ClaudeCode => "claude_code",
+            HookProtocol::GeminiCli => "gemini_cli",
+            HookProtocol::GitHubCopilot => "github_copilot",
+            HookProtocol::Grok => "grok",
+            HookProtocol::Unknown => "unknown",
+        },
+        "tool_kind": match hook_input.tool {
+            ToolKind::Read => "read",
+            ToolKind::Grep => "grep",
+            ToolKind::Bash => "bash",
+            ToolKind::Mcp => "mcp",
+            ToolKind::Unknown => "unknown",
+        },
+        "tool_name": hook_input.tool_name,
+        "cwd": hook_input.cwd.to_string_lossy(),
+        "session_id": hook_input.session_id,
+        "raw_args": hook_input.raw_args,
+    })
 }
 
 fn audit_timestamp() -> String {

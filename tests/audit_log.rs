@@ -222,8 +222,19 @@ fn every_new_record_says_which_schema_it_is() {
     let records = repo.records();
 
     assert_eq!(records.len(), 2);
-    for record in &records {
-        assert_eq!(record["schema_version"], "veil.audit.v1", "{record}");
+    for (record, expected_input) in records.iter().zip([
+        r#"{"command":"cat data/clients/holdings.csv"}"#,
+        r#"{"command":"cat data/clients/holdings.csv 2>/dev/null"}"#,
+    ]) {
+        assert_eq!(record["schema_version"], "veil.audit.v2", "{record}");
+        assert_eq!(record["tool_input"]["tool_kind"], "bash", "{record}");
+        assert_eq!(
+            record["tool_input"]["raw_args"].as_str(),
+            Some(expected_input),
+            "{record}"
+        );
+        assert_eq!(record["path_is_hash"], false, "{record}");
+        assert!(record["would_deny"].as_bool().is_some(), "{record}");
     }
 }
 
@@ -246,6 +257,58 @@ fn every_record_says_a_hook_decided_because_nothing_enforces_a_sandbox_yet() {
     for record in &records {
         assert_eq!(record["enforcement"], "hook", "{record}");
     }
+}
+
+#[test]
+fn dynamic_warn_allows_with_warning_and_records_the_counterfactual_denial() {
+    let repo = repo("warn-input");
+    let mut config = fs::read_to_string(repo.root.join(".veil.toml")).expect("config");
+    config.push_str("dynamic_args = \"warn\"\n");
+    fs::write(repo.root.join(".veil.toml"), config).expect("warn config");
+
+    let output = spawn_hook(&repo, "cat $UNSET")
+        .wait_with_output()
+        .expect("hook should exit");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let decision: Value = serde_json::from_slice(&output.stdout).expect("hook JSON");
+    assert_eq!(
+        decision["hookSpecificOutput"]["permissionDecision"],
+        "allow"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Warning: deny policy would refuse"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let record = repo.records().pop().expect("audit record");
+    assert_eq!(record["decision"], "allow");
+    assert_eq!(record["would_deny"], true);
+    assert_eq!(record["reason_class"], "dynamic_path_unresolvable");
+    assert_eq!(
+        record["tool_input"]["raw_args"].as_str(),
+        Some(r#"{"command":"cat $UNSET"}"#)
+    );
+}
+
+#[test]
+fn disabling_audit_inputs_hashes_paths_and_omits_replay_input() {
+    let repo = repo("no-inputs");
+    let mut config = fs::read_to_string(repo.root.join(".veil.toml")).expect("config");
+    config.push_str("audit_inputs = false\n");
+    fs::write(repo.root.join(".veil.toml"), config).expect("privacy config");
+
+    assert!(hook(&repo, "cat data/clients/holdings.csv"));
+    let record = repo.records().pop().expect("audit record");
+    assert_eq!(record["path_is_hash"], true);
+    assert!(
+        record["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("blake3:")),
+        "{record}"
+    );
+    assert!(record["tool_input"].is_null(), "{record}");
+    assert!(!record.to_string().contains("holdings.csv"), "{record}");
 }
 
 /// The log of a machine that has run several versions of veil and two hooks at once.
@@ -280,7 +343,7 @@ fn audit_validate_counts_what_a_log_that_mixes_generations_holds() {
 
     assert!(output.status.success(), "{output:?}");
     let value: Value = serde_json::from_slice(&output.stdout).expect("validation JSON");
-    assert_eq!(value["schema_version"], "veil.audit.v1");
+    assert_eq!(value["schema_version"], "veil.audit.v2");
     assert_eq!(value["lines"], 6, "{value}");
     assert_eq!(value["current"], 2, "{value}");
     assert_eq!(value["legacy"], 1, "{value}");
@@ -348,7 +411,7 @@ fn a_log_that_has_grown_to_the_limit_is_rotated_and_five_are_kept() {
 
     let current = repo.records();
     assert_eq!(current.len(), 1, "the log starts again with this record");
-    assert_eq!(current[0]["schema_version"], "veil.audit.v1");
+    assert_eq!(current[0]["schema_version"], "veil.audit.v2");
     let rotated = |index: usize| {
         let file = repo.root.join(format!("state/audit.jsonl.{index}"));
         fs::read(&file).expect("every rotated file up to the fifth should exist")

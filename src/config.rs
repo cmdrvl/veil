@@ -120,14 +120,28 @@ pub struct SpineConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyConfig {
     pub default: PolicyMode,
+    /// Egress attempts have an independent transition mode so their rollout
+    /// does not soften direct protected-file reads.
+    pub egress: Option<PolicyMode>,
     pub audit_log: bool,
     pub audit_path: PathBuf,
+    /// Capture the hook tool input needed by `veil replay`; false stores only a
+    /// one-way path digest and makes that record non-replayable.
+    pub audit_inputs: bool,
     /// Opt-in: operator preflight additionally requires a healthy dcg companion guard.
     pub require_dcg: bool,
     /// What veil does with a command whose arguments it cannot resolve to
     /// paths (bd-2mi). Denies by default: dynamic arguments are the canonical
     /// way around a path rule.
     pub dynamic_args: DynamicArgsMode,
+}
+
+impl PolicyConfig {
+    /// The effective egress policy, inheriting the general default unless
+    /// `[policy] egress` explicitly overrides it.
+    pub fn egress_mode(&self) -> &PolicyMode {
+        self.egress.as_ref().unwrap_or(&self.default)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -363,8 +377,10 @@ impl Config {
             },
             policy: PolicyConfig {
                 default: PolicyMode::Deny,
+                egress: None,
                 audit_log: true,
                 audit_path: default_audit_path(home, xdg_state_home)?,
+                audit_inputs: true,
                 require_dcg: false,
                 dynamic_args: DynamicArgsMode::Deny,
             },
@@ -406,12 +422,20 @@ impl Config {
                 self.policy.default = default_mode;
             }
 
+            if let Some(egress) = policy.egress {
+                self.policy.egress = Some(egress);
+            }
+
             if let Some(audit_log) = policy.audit_log {
                 self.policy.audit_log = audit_log;
             }
 
             if let Some(audit_path) = policy.audit_path {
                 self.policy.audit_path = audit_path;
+            }
+
+            if let Some(audit_inputs) = policy.audit_inputs {
+                self.policy.audit_inputs = audit_inputs;
             }
 
             if let Some(require_dcg) = policy.require_dcg {
@@ -509,7 +533,9 @@ impl PartialConfig {
         let safe_patterns = split_csv_env("VEIL_SAFE_PATTERNS");
         let authorized_tools = split_csv_env("VEIL_SPINE_TOOLS");
         let default_mode = parse_env_var("VEIL_POLICY", parse_policy_mode)?;
+        let egress = parse_env_var("VEIL_EGRESS_POLICY", parse_policy_mode)?;
         let audit_log = parse_env_var("VEIL_AUDIT_LOG", parse_bool)?;
+        let audit_inputs = parse_env_var("VEIL_AUDIT_INPUTS", parse_bool)?;
         let dynamic_args = parse_env_var("VEIL_DYNAMIC_ARGS", parse_dynamic_args_mode)?;
         let audit_path = parse_env_var("VEIL_AUDIT_PATH", |value| {
             Ok(expand_tilde(Path::new(value), home, xdg_state_home))
@@ -527,14 +553,18 @@ impl PartialConfig {
                 denied_flags: None,
             }),
             policy: if default_mode.is_some()
+                || egress.is_some()
                 || audit_log.is_some()
+                || audit_inputs.is_some()
                 || audit_path.is_some()
                 || dynamic_args.is_some()
             {
                 Some(PartialPolicyConfig {
                     default: default_mode,
+                    egress,
                     audit_log,
                     audit_path,
+                    audit_inputs,
                     require_dcg: None,
                     dynamic_args,
                 })
@@ -580,8 +610,10 @@ struct PartialSpineConfig {
 struct PartialPolicyConfig {
     #[serde(rename = "default")]
     default: Option<PolicyMode>,
+    egress: Option<PolicyMode>,
     audit_log: Option<bool>,
     audit_path: Option<PathBuf>,
+    audit_inputs: Option<bool>,
     require_dcg: Option<bool>,
     dynamic_args: Option<DynamicArgsMode>,
 }
@@ -1572,8 +1604,10 @@ mod tests {
             spine: None,
             policy: Some(PartialPolicyConfig {
                 default: Some(PolicyMode::Warn),
+                egress: None,
                 audit_log: Some(false),
                 audit_path: None,
+                audit_inputs: None,
                 require_dcg: None,
                 dynamic_args: None,
             }),
@@ -1624,8 +1658,10 @@ mod tests {
             }),
             policy: Some(PartialPolicyConfig {
                 default: Some(PolicyMode::Warn),
+                egress: None,
                 audit_log: Some(false),
                 audit_path: Some(home.join("custom/audit.jsonl")),
+                audit_inputs: None,
                 require_dcg: None,
                 dynamic_args: None,
             }),
@@ -1888,6 +1924,38 @@ mod tests {
             .dynamic_args,
             DynamicArgsMode::Allow
         );
+    }
+
+    #[test]
+    fn egress_override_layers_independently_and_otherwise_follows_default() {
+        let load = |system: Option<&str>, user: Option<&str>, project: Option<&str>| {
+            let repo_root = unique_temp_root("repo");
+            let home = unique_temp_root("home");
+            load_for_test(
+                &repo_root,
+                &home,
+                system,
+                user,
+                project,
+                PartialConfig::default(),
+            )
+            .unwrap()
+        };
+
+        let inherited = load(
+            Some("[policy]\ndefault = \"warn\"\n"),
+            None,
+            Some("[policy]\ndefault = \"deny\"\n"),
+        );
+        assert_eq!(inherited.policy.egress_mode(), &PolicyMode::Deny);
+
+        let explicit = load(
+            Some("[policy]\negress = \"warn\"\n"),
+            Some("[policy]\ndefault = \"deny\"\n"),
+            None,
+        );
+        assert_eq!(explicit.policy.default, PolicyMode::Deny);
+        assert_eq!(explicit.policy.egress_mode(), &PolicyMode::Warn);
     }
 
     #[test]
