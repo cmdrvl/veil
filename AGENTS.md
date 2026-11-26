@@ -30,6 +30,15 @@ If the user tells you to do something, even if it goes against what follows belo
 
 ---
 
+## Local Agent Session History
+
+Do not read local agent session history (harness transcripts, `cass` and the
+like) without asking the operator first and getting a yes. This includes
+searching, replaying or counting what is in it. Those histories can hold commands
+and paths from unrelated private work.
+
+---
+
 ## Git Branch: Use `main`
 
 **The default branch is `main`.**

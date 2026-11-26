@@ -189,6 +189,13 @@ one of those settings files has more than one; replace it with a copy of its
 own. Nor does it start when the derived registry or its key (see [Derived
 Outputs](#derived-outputs)) is a symlink or has a second hard link.
 
+That check is made only at the start, and this is a limit of the sandbox. If a
+process outside it, running as you, hard-links one of those files into the
+project afterwards, the confined command can write through the new name, so it
+can replace a tool the broker then runs. The confined command cannot make the
+link itself. A process outside the sandbox can already read protected files; the
+link also lets the confined command get at them.
+
 Each call that returns output adds one record to that registry, and each call is
 in the audit log with `enforcement: sandbox`, `origin: broker`. The broker
 refuses the call rather than write that record through an audit log that is a
@@ -931,7 +938,11 @@ An install made before this has no hooks for the four writing tools. `veil
 doctor` reports that as the `write_guard` check until `veil install` is run
 again.
 
-**What stays possible.** The registry is exactly as good as the checks above:
+**What stays possible.** In hook mode, unlocking a file this way is a guard
+against reading protected data by accident. It is not a barrier against an agent
+that sets out to get it, and no hook is a kernel boundary; [Sandboxed
+commands](#sandboxed-commands-macos) are where veil works on that. The registry
+is exactly as good as the checks above:
 
 - A tool can put protected values into output in a shape that neither a detector
   nor the text comparison sees: columns dropped or reordered, values re-encoded
