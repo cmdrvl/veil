@@ -2038,10 +2038,7 @@ fn vectors() -> Vec<Vector> {
             Since,
             bash("echo x >~/.cmdrvl/config/veil/config.toml"),
             blocked("redirect_write"),
-            Sandbox::Allowed(
-                Evidence::Design,
-                "a confined session can create a settings file that is not there yet",
-            ),
+            SB_BLOCKED,
             "a new file among veil's own protected paths can change what veil allows (bd-qe9)",
         ),
         // ---- git

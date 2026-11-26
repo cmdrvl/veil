@@ -298,7 +298,7 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `wrap-glued-redirect` | `cat .env>out.txt` | blocked: direct_read | blocked (design, not run) | found since | a redirect glued to the word was the shell's redirect, not part of the name (bd-5zy) |
 | `wrap-redirect-spaced` | `cat data/clients/holdings.csv > out.txt 2>&1` | blocked: direct_read | blocked (design, not run) | baseline |  |
 | `redirect-append` | `echo x >>data/clients/holdings.csv` | blocked: redirect_write | **ALLOWED** (design, not run): the profile denies reading, renaming and removing a protected file, not writing into it | found since | the shell opens the file itself, though `echo` reads nothing (bd-qe9) |
-| `redirect-new-veil-settings` | `echo x >~/.cmdrvl/config/veil/config.toml` | blocked: redirect_write | **ALLOWED** (design, not run): a confined session can create a settings file that is not there yet | found since | a new file among veil's own protected paths can change what veil allows (bd-qe9) |
+| `redirect-new-veil-settings` | `echo x >~/.cmdrvl/config/veil/config.toml` | blocked: redirect_write | blocked (design, not run) | found since | a new file among veil's own protected paths can change what veil allows (bd-qe9) |
 
 ### Git
 

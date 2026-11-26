@@ -81,7 +81,7 @@ Of 212 vectors run against the real binary, **159** are blocked and **25** are s
 | Egress | 17 | 13 | 2 / 0 / 0 | 15 / 0 / 0 |
 | Content search | 9 | 5 | 0 / 0 / 4 | 7 / 0 / 2 |
 | Dynamic and hidden paths | 6 | 6 | 0 / 0 / 0 | 6 / 0 / 0 |
-| Wrappers and prefixes | 9 | 9 | 0 / 0 / 0 | 7 / 2 / 0 |
+| Wrappers and prefixes | 9 | 9 | 0 / 0 / 0 | 8 / 1 / 0 |
 | Git | 8 | 2 | 2 / 3 / 0 | 3 / 4 / 0 |
 | Agent tools (Read, Grep, Glob, Notebook) | 10 | 6 | 2 / 0 / 1 | 6 / 2 / 1 |
 | MCP tools | 5 | 3 | 1 / 0 / 0 | 0 / 0 / 4 |

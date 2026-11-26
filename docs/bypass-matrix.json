@@ -2978,7 +2978,7 @@
         "reason_class": "redirect_write"
       },
       "id": "redirect-new-veil-settings",
-      "sandbox": "**ALLOWED** (design, not run): a confined session can create a settings file that is not there yet",
+      "sandbox": "blocked (design, not run)",
       "tool_input": {
         "command": "echo x >~/.cmdrvl/config/veil/config.toml"
       },
