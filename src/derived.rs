@@ -1569,7 +1569,12 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&directory).expect("state directory");
-        let lock = File::create(directory.join("derived.key.lock")).expect("lock file");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(directory.join("derived.key.lock"))
+            .expect("lock file");
         lock.lock().expect("held by this test");
 
         let registry = Registry::at(directory.join(REGISTRY_FILE));

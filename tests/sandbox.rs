@@ -850,7 +850,12 @@ fn a_held_audit_lock_stops_neither_the_broker_nor_the_hook() {
     fs::create_dir_all(&logs).expect("log directory");
     let full = format!("{}\n", "x".repeat(10 * 1024 * 1024));
     fs::write(logs.join("audit.jsonl"), full).expect("a full log");
-    let lock = fs::File::create(logs.join("audit.jsonl.lock")).expect("lock file");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(logs.join("audit.jsonl.lock"))
+        .expect("lock file");
     lock.lock().expect("held by this test");
 
     // a call the broker cannot record as it should is refused
