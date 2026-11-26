@@ -563,6 +563,49 @@ mappings are not covered by these properties.
     day counts before the 0.6 deny-default transition. `[policy] audit_inputs =
     false` hashes paths and omits tool inputs, so those records are not replayed.
 
+#### Cairn attachment and export paths
+
+Veil classifies paths; it does not infer that an arbitrary directory belongs to
+Cairn or that a file is an attachment. Add the real staging, export, and
+temporary roots used by the deployment to the project `.veil.toml`. This
+example shows a dedicated project tree plus common user-owned subtrees; the
+`~/.local/share/cairn` and `~/.cache/cairn` roots are examples, not Cairn
+defaults. Keep only entries that match the installed layout, and merge them
+into an existing `[sensitivity]` table rather than adding a second table.
+
+```toml
+[sensitivity]
+protected = [
+    "cairn/attachments/**",
+    "cairn/staging/**",
+    "cairn/exports/**",
+    "cairn/tmp/**",
+    "~/.local/share/cairn/attachments/**",
+    "~/.local/share/cairn/exports/**",
+    "~/.cache/cairn/attachments/**",
+    "~/.cache/cairn/tmp/**",
+    "~/Downloads/cairn-attachments/**",
+    "~/Downloads/cairn-exports/**",
+]
+```
+
+Path-component patterns in a project config are rooted at the directory
+containing that `.veil.toml`; `~/` patterns expand against the hook user's
+home. Shell variables such as `$CAIRN_HOME` are not expanded in config, so use
+the configured literal path. If a nested project has its own `.veil.toml`, it
+replaces the outer project config; carry forward any Cairn roots that still
+need protection there.
+
+With MCP screening enabled (the default), a path Cairn hands to an attachment
+or upload tool is checked against these same roots. A path outside them is not
+classified as a Cairn attachment by name alone, so include custom staging and
+download destinations explicitly. Keep attachment/export roots separate from
+Markdown and documentation trees: the built-in safe patterns keep ordinary
+`.md` files and `docs/**` usable, while a protected-directory match takes
+precedence over that allowlist. Avoid blanket roots such as `~/Downloads/**`,
+`/tmp/**`, or all of `~/.cache/**`; use dedicated Cairn subdirectories and
+inspect a representative staged path with `veil explain <absolute-path>`.
+
 ### Track B — OS sandbox enforcement (1.0): ADR B-1
 
 **Status (2026-11-25):** Adopt the hybrid direction below; implementation and
