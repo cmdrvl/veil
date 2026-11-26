@@ -21,12 +21,15 @@
 //! A file run by name (`./x.py`) is read when its first line names an
 //! interpreter. A Python directory runs its `__main__.py`.
 //!
+//! An `http` or `https` address is not read as a path (bd-a5g).
+//!
 //! This is best effort, and the remediation says so. A script that builds a path
 //! at run time, takes it from the environment or a file, or imports a module
 //! that does, is not seen; only an OS sandbox is airtight. A script larger than
 //! [`SCRIPT_LIMIT`], or the 17th script of one command, is not read: it is denied
 //! where a protected path is in reach, and allowed with a record where none is.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -1134,7 +1137,7 @@ fn path_words(kind: InterpreterKind, text: &str, already: &[PathBuf], cwd: &Path
     let mut resolver = ArgvResolver::new(cwd);
     let mut budget = FILESYSTEM_BUDGET;
 
-    for word in words(kind, text) {
+    for word in words(kind, text, cwd) {
         let resolved = budget > 0;
         let path = if resolved {
             budget -= 1;
@@ -1155,7 +1158,7 @@ fn path_words(kind: InterpreterKind, text: &str, already: &[PathBuf], cwd: &Path
     found
 }
 
-fn words(kind: InterpreterKind, text: &str) -> Vec<Word> {
+fn words(kind: InterpreterKind, text: &str, cwd: &Path) -> Vec<Word> {
     let tokens = lex(kind, text);
     let folder = Folder::new(&tokens);
     let mut words: Vec<Word> = Vec::new();
@@ -1177,6 +1180,14 @@ fn words(kind: InterpreterKind, text: &str) -> Vec<Word> {
         });
     };
 
+    // a word holding a web address is not a path (bd-a5g); what else its text
+    // holds is still found word by word below
+    let mut add = |word: &str, certain: bool| {
+        if matches!(without_web_addresses(word, cwd), Cow::Borrowed(_)) {
+            add(word, certain);
+        }
+    };
+
     // what the script builds out of literals
     for built in folder.built() {
         add(&built, built.contains('/'));
@@ -1193,6 +1204,7 @@ fn words(kind: InterpreterKind, text: &str) -> Vec<Word> {
 
     // any word of the text, comments and all: no reading of the syntax is
     // needed to see `data/clients/a.csv`, and none can be led astray
+    let text = without_web_addresses(text, cwd);
     let mut bare: Vec<&str> = Vec::new();
     for word in text.split(is_separator) {
         if word.contains('/') {
@@ -1216,6 +1228,107 @@ fn words(kind: InterpreterKind, text: &str) -> Vec<Word> {
     }
 
     words
+}
+
+/// bd-a5g: `text` with its `http://` and `https://` addresses blanked out.
+/// Split into words, `https://host/data/x` leaves `//host/data/x`, which reads
+/// as an absolute path under `data/`.
+///
+/// An address is blanked only when it cannot also be a local path: it starts a
+/// word, names a host, climbs with no `..`, and no entry named `https:` (or
+/// `http:`) is in `cwd`. What it holds in braces is code and is kept. Borrowed
+/// means there was nothing to blank.
+fn without_web_addresses<'a>(text: &'a str, cwd: &Path) -> Cow<'a, str> {
+    let bytes = text.as_bytes();
+    let mut kept = String::new();
+    let mut copied = 0;
+
+    for (separator, _) in text.match_indices("://") {
+        let Some(start) = web_scheme_start(bytes, separator) else {
+            continue;
+        };
+        let host = separator + 3;
+        if start < copied
+            || !bytes
+                .get(host)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'[')
+            || fs::symlink_metadata(cwd.join(&text[start..=separator])).is_ok()
+        {
+            continue;
+        }
+
+        let (end, literal, code) = web_address(text, host);
+        if literal
+            .split(['/', '?', '#', '&', '='])
+            .any(|segment| segment == "..")
+        {
+            continue;
+        }
+
+        kept.push_str(&text[copied..start]);
+        kept.push(' ');
+        kept.push_str(&code);
+        copied = end;
+    }
+
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    kept.push_str(&text[copied..]);
+    Cow::Owned(kept)
+}
+
+/// Where the scheme before the `://` at `separator` starts, when it is `http` or
+/// `https` and begins a word.
+fn web_scheme_start(bytes: &[u8], separator: usize) -> Option<usize> {
+    ["https", "http"].iter().find_map(|scheme| {
+        let start = separator.checked_sub(scheme.len())?;
+        let begins_word = start == 0 || {
+            let before = bytes[start - 1];
+            !before.is_ascii_alphanumeric() && !b"+-._/".contains(&before)
+        };
+        (begins_word && bytes[start..separator].eq_ignore_ascii_case(scheme.as_bytes()))
+            .then_some(start)
+    })
+}
+
+/// The address whose host starts at `from`: where it ends, its own characters,
+/// and the code between its braces.
+fn web_address(text: &str, from: usize) -> (usize, String, String) {
+    let mut literal = String::new();
+    let mut code = String::new();
+    let mut depth = 0_usize;
+
+    for (offset, character) in text[from..].char_indices() {
+        let index = from + offset;
+        match character {
+            '\n' => return (index, literal, code),
+            '{' => {
+                depth += 1;
+                code.push(' ');
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                code.push(' ');
+            }
+            _ if depth > 0 => code.push(character),
+            '\'' | '"' | '`' | '(' | ')' | '<' | '>' | ';' | '|' | '\\' | ',' | '}' => {
+                return (index, literal, code);
+            }
+            // `&` joins the parts of a query; `&&` and `& ` end a command
+            '&' if text[index + 1..]
+                .chars()
+                .next()
+                .is_none_or(|next| next == '&' || next.is_whitespace()) =>
+            {
+                return (index, literal, code);
+            }
+            _ if character.is_whitespace() => return (index, literal, code),
+            _ => literal.push(character),
+        }
+    }
+
+    (text.len(), literal, code)
 }
 
 fn is_separator(character: char) -> bool {
@@ -1804,7 +1917,7 @@ mod tests {
     }
 
     fn texts(kind: InterpreterKind, script: &str) -> Vec<String> {
-        words(kind, script)
+        words(kind, script, Path::new("."))
             .into_iter()
             .map(|word| word.text)
             .collect()

@@ -729,6 +729,109 @@ fn a_warn_policy_lets_the_script_through_and_records_why() {
     );
 }
 
+/// A repo whose user also protects `data/**` wherever it is, which is what an
+/// address misread as a path would match.
+fn repo_protecting_data_anywhere(label: &str) -> Repo {
+    repo_with(label, "[sensitivity]\nprotected = [\"data/**\"]")
+}
+
+#[test]
+fn a_web_address_in_a_script_is_not_a_local_path() {
+    // bd-a5g: `//host/.../data/...` was judged as an absolute path under `data/`
+    let repo = repo_protecting_data_anywhere("web");
+    let scripts = [
+        (
+            "plain.py",
+            "LINK = 'https://www.example.com/Archives/data/123/index.htm'\nprint(LINK)\n",
+        ),
+        (
+            "formatted.py",
+            r#"cik = "0001"
+def link(acc):
+    return f"https://www.example.com/Archives/data/{str(cik).lstrip('0')}/{acc}/index.htm"
+"#,
+        ),
+        (
+            "prose.py",
+            "\"\"\"Links go to http://example.com/data/filings?id=1&x=data/y today.\"\"\"\n# see https://example.com/data/help\nprint('done')\n",
+        ),
+        (
+            "built.py",
+            "BASE = 'https://example.com/data/'\nprint(BASE + 'index.json')\n",
+        ),
+        (
+            "link.js",
+            "const link = `https://example.com/data/${1}/index.json`;\nconsole.log(link);\n",
+        ),
+    ];
+
+    for (name, text) in scripts {
+        repo.write(name, text);
+        let program = if name.ends_with(".js") {
+            "node"
+        } else {
+            "python3"
+        };
+        assert_allowed(&repo, &format!("{program} {name}"));
+    }
+}
+
+#[test]
+fn a_web_address_does_not_hide_a_local_path() {
+    let repo = repo_protecting_data_anywhere("web-negative");
+    repo.write(
+        "file_scheme.py",
+        &format!("p = 'file://{}/{HOLDINGS}'\n", repo.root.display()),
+    );
+    assert_denied(&repo, "python3 file_scheme.py");
+    let scripts = [
+        (
+            "beside",
+            "link = 'https://example.com/a'\np = 'data/clients/holdings.csv'\n",
+        ),
+        (
+            "same_string",
+            "note = 'from https://example.com/a data/clients/holdings.csv'\n",
+        ),
+        (
+            "same_comment",
+            "# https://example.com/a,data/clients/holdings.csv\nprint(1)\n",
+        ),
+        (
+            "interpolated",
+            "x = f\"https://example.com/{open('data/clients/holdings.csv').read()}\"\n",
+        ),
+        (
+            "interpolated_word",
+            "x = f\"https://example.com/{load('data/clients/holdings.csv')}\"\n",
+        ),
+        (
+            "shell_string",
+            "import os\nos.system('curl https://example.com/a;cat data/clients/holdings.csv')\n",
+        ),
+        ("no_host", "p = 'https://../data/clients/holdings.csv'\n"),
+        (
+            "climbs_out",
+            "p = 'https://x/../../data/clients/holdings.csv'\n",
+        ),
+    ];
+
+    for (name, text) in scripts {
+        repo.write(&format!("{name}.py"), text);
+        assert_denied(&repo, &format!("python3 {name}.py"));
+    }
+}
+
+#[test]
+fn a_local_directory_named_like_a_scheme_is_still_a_local_path() {
+    // `https:/host/...` opens a local file when a directory is named `https:`
+    let repo = repo_protecting_data_anywhere("web-directory");
+    repo.write("https:/host/keep", "x\n");
+    repo.write("p.py", "p = 'https://host/data/clients/holdings.csv'\n");
+
+    assert_denied(&repo, "python3 p.py");
+}
+
 #[test]
 fn commands_that_run_no_script_are_judged_as_before() {
     let repo = repo("none");
