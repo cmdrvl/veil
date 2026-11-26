@@ -3,7 +3,8 @@
 //! These modules compile merged policy into backend rules. Compilation alone
 //! does not confine a process; callers must apply the result before launching
 //! the harness and must report that enforcement was applied only after it
-//! succeeds.
+//! succeeds. [`marker`] is how a veil process then tells that it is confined.
 
 pub mod landlock;
+pub mod marker;
 pub mod seatbelt;

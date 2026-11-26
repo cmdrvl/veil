@@ -169,7 +169,7 @@
     },
     {
       "name": "doctor",
-      "description": "Inspect config, audit path and guard-hook health without writing; every JSON form is a cmdrvl.doctor.v1 report. `doctor --json` is mode health; `doctor capabilities --json` is mode capabilities (its `contract` is this document); `doctor triage --json` is mode triage (with next_actions). Exits 0 healthy, 1 unhealthy. Says `enforcement: hook-only (advisory; parser-based)` (human form) and carries an `enforcement` object (health JSON): veil is a hook that reads the text of a tool call, and nothing in it enforces an OS sandbox. Deprecated aliases kept for compatibility: `doctor health [--json]`, `doctor --robot-triage` and top-level `--robot-triage` (same document as `doctor triage --json`).",
+      "description": "Inspect config, audit path and guard-hook health without writing; every JSON form is a cmdrvl.doctor.v1 report. `doctor --json` is mode health; `doctor capabilities --json` is mode capabilities (its `contract` is this document); `doctor triage --json` is mode triage (with next_actions). Exits 0 healthy, 1 unhealthy. Says `enforcement: hook-only (advisory; parser-based)` (human form) and carries an `enforcement` object (health JSON): veil is a hook that reads the text of a tool call, which by itself enforces nothing. Where `veil sandbox` confines the process doctor runs in, both say `sandbox` instead. Deprecated aliases kept for compatibility: `doctor health [--json]`, `doctor --robot-triage` and top-level `--robot-triage` (same document as `doctor triage --json`).",
       "subcommands": ["health", "capabilities", "triage", "robot-docs"],
       "options": [
         { "name": "json", "flag": "--json", "type": "flag", "description": "Emit doctor health as JSON" },
@@ -217,7 +217,7 @@
     "writes_files": true,
     "network": false,
     "writes_witness": false,
-    "notes": "Hook mode appends one audit record per evaluated path to the audit log when audit_log is enabled; every record carries enforcement: hook (a hook decided, which is advisory and parser-based; no sandbox is enforced). veil exec appends to the audit log and to the derived registry in ~/.cmdrvl/state/veil/, and creates that registry's MAC key there on first use. install/uninstall edit Claude settings. config may migrate a legacy user config. All other commands are read-only. veil never writes to the witness ledger."
+    "notes": "Hook mode appends one audit record per evaluated path to the audit log when audit_log is enabled; a hook's record carries enforcement: hook (a hook decided, which is advisory and parser-based), or enforcement: sandbox where `veil sandbox` confines the hook. veil believes that only when it also finds this session's marker and is refused opening it, not on VEIL_ENFORCEMENT alone. veil exec appends to the audit log and to the derived registry in ~/.cmdrvl/state/veil/, and creates that registry's MAC key there on first use. install/uninstall edit Claude settings. config may migrate a legacy user config. All other commands are read-only. veil never writes to the witness ledger."
   },
   "pipeline": {
     "upstream": ["dcg"],

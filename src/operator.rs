@@ -25,6 +25,7 @@ use veil::config::{self, Config, PolicyMode};
 use veil::evaluator::{EvaluationInput, evaluate_access};
 use veil::extract::{PathExposure, extract_read_or_grep_paths};
 use veil::packs::{BUILTIN_PACK_NAMES, PackRegistry};
+use veil::sandbox::marker;
 use veil::types::{Decision, DecisionAction, SensitivityResult, ToolKind};
 
 use crate::cli::{
@@ -43,13 +44,32 @@ const HOOK_DECISION_SCHEMA: &str = include_str!("../hook-decision.schema.json");
 const DOCTOR_SCHEMA_VERSION: &str = "cmdrvl.doctor.v1";
 const DOCTOR_CAPABILITIES_SCHEMA_VERSION: &str = "veil.doctor.capabilities.v1";
 const READ_ONLY_DOCTOR_CONTRACT: &str = "cmdrvl.read_only_doctor.v1";
-/// What stands behind a veil decision, as `veil doctor` says it. veil is a hook
-/// that reads the text of a tool call; nothing in it enforces an OS sandbox, so
-/// every report says so and none says otherwise. The audit log's matching field
-/// is `audit::ENFORCEMENT` (`hook`). Whatever makes this depend on whether a
-/// sandbox is actually wrapping the agent (bd-apj) changes both together.
-const ENFORCEMENT_MODE: &str = "hook-only";
-const ENFORCEMENT_SUMMARY: &str = "advisory; parser-based";
+/// What stands behind veil's decisions in the process `veil doctor` runs in.
+/// veil is a hook that reads the text of a tool call, which by itself enforces
+/// nothing. The report says there is a sandbox only where `veil sandbox`
+/// confines the process (`veil::sandbox::marker`). The audit log's matching
+/// field is `audit::hook_enforcement`. bd-apj reshapes this report.
+struct Enforcement {
+    mode: &'static str,
+    summary: &'static str,
+    sandbox: bool,
+}
+
+fn enforcement() -> Enforcement {
+    if marker::confines_this_process() {
+        Enforcement {
+            mode: marker::SANDBOX,
+            summary: "macOS Seatbelt confines this process; hook decisions stay parser-based",
+            sandbox: true,
+        }
+    } else {
+        Enforcement {
+            mode: "hook-only",
+            summary: "advisory; parser-based",
+            sandbox: false,
+        }
+    }
+}
 /// Version tag on every `test`, `explain` and `scan` `--json` document,
 /// including their error documents. These documents are decisions about
 /// paths only: veil does not read file contents or message bodies to produce
@@ -348,6 +368,7 @@ pub fn launch_sandbox(args: &SandboxArgs) -> Result<u8, Box<dyn std::error::Erro
             veil::sandbox::seatbelt::BROKER_SOCKET_PREFIX
         );
         let socket = broker_dir.join(&socket_name);
+        let session_marker = marker::beside(&socket);
         let executable = env::current_exe()?;
         let mut profile = compiled.profile;
         profile.push_str(&veil::broker::sandbox_write_denials(
@@ -356,10 +377,14 @@ pub fn launch_sandbox(args: &SandboxArgs) -> Result<u8, Box<dyn std::error::Erro
             &home.join(".cmdrvl/state/veil"),
         )?);
         let resolved_broker_dir = fs::canonicalize(&broker_dir)?;
+        let resolved_socket = resolved_broker_dir.join(&socket_name);
         profile.push_str(&veil::sandbox::seatbelt::broker_reach(
             &resolved_broker_dir,
-            &resolved_broker_dir.join(&socket_name),
+            &resolved_socket,
         )?);
+        profile.push_str(&veil::sandbox::seatbelt::refuse_opening(&marker::beside(
+            &resolved_socket,
+        ))?);
         // written before anything starts, so a failure here runs nothing
         if let Some(path) = &args.profile_out {
             // `create_new` fails on a link too: nothing that exists is written to
@@ -397,25 +422,31 @@ pub fn launch_sandbox(args: &SandboxArgs) -> Result<u8, Box<dyn std::error::Erro
             thread::sleep(Duration::from_millis(10));
         }
 
-        let status = leave_interrupts_to_the_command().and_then(|()| {
-            Command::new("/usr/bin/sandbox-exec")
-                .arg("-p")
-                .arg(profile)
-                .args(&command)
-                .env("VEIL_BROKER_SOCKET", &socket)
-                .status()
-        });
+        let status = leave_interrupts_to_the_command()
+            .and_then(|()| fs::File::create_new(&session_marker).map(drop))
+            .and_then(|()| {
+                Command::new("/usr/bin/sandbox-exec")
+                    .arg("-p")
+                    .arg(profile)
+                    .args(&command)
+                    .env("VEIL_BROKER_SOCKET", &socket)
+                    .env(marker::ENFORCEMENT_ENV, marker::SANDBOX)
+                    .status()
+            });
         let _ = broker.kill();
         let stop_result = broker.wait().map(|_| ());
         // `wait` closes the pipe the broker watches, and the broker removes the
-        // socket when that closes, so it may be gone before this removes it.
-        let socket_result = match fs::remove_file(&socket) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        };
+        // marker and the socket when that closes, so either may be gone before
+        // this removes it.
+        let removed = [&session_marker, &socket].into_iter().try_for_each(|path| {
+            match fs::remove_file(path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            }
+        });
         let status = status?;
         stop_result?;
-        socket_result?;
+        removed?;
         Ok(status
             .code()
             // ended by a signal: 128 and its number, as a shell reports it
@@ -1482,10 +1513,8 @@ fn render_doctor_human(report: &DoctorReport) -> String {
     );
     let _ = writeln!(output, "Doctor");
     let _ = writeln!(output, "  overall: {overall}");
-    let _ = writeln!(
-        output,
-        "  enforcement: {ENFORCEMENT_MODE} ({ENFORCEMENT_SUMMARY})"
-    );
+    let Enforcement { mode, summary, .. } = enforcement();
+    let _ = writeln!(output, "  enforcement: {mode} ({summary})");
 
     for check in &report.checks {
         let status = check.status.as_str();
@@ -1565,7 +1594,7 @@ fn render_robot_docs_guide() -> String {
         "Guard preflight:",
         "- Under Claude Code, domain commands fail closed unless healthy veil Read/Grep/Bash hooks are installed. Other harnesses (Codex, Gemini CLI, Cursor, plain shell) do not need Claude hooks; their veil wiring is reported as unverified.",
         "- dcg is optional: set `[policy] require_dcg = true` to make a healthy dcg a hard requirement.",
-        "- `veil doctor --json` and `veil doctor triage --json` report the detected harness and `guard_posture`; `veil doctor` and `veil doctor --json` also say `enforcement: hook-only (advisory; parser-based)`, because nothing in veil enforces an OS sandbox. Set `VEIL_HARNESS` (claude-code, codex, gemini-cli, cursor, plain) to override detection.",
+        "- `veil doctor --json` and `veil doctor triage --json` report the detected harness and `guard_posture`; `veil doctor` and `veil doctor --json` also say `enforcement: hook-only (advisory; parser-based)`, or `enforcement: sandbox` where `veil sandbox` confines the process they run in. Set `VEIL_HARNESS` (claude-code, codex, gemini-cli, cursor, plain) to override detection.",
         "- `veil doctor`, `veil capabilities --json`, `veil --describe`, `veil robot-docs guide`, `veil install`, and `veil uninstall` remain available for maintenance.",
         "",
         "Derived outputs:",
@@ -2036,6 +2065,7 @@ impl DoctorReport {
     /// additive extras; `contract` is reserved for capabilities mode, so the old
     /// string of that name is now `read_only_contract`.
     fn to_json_value(&self) -> Value {
+        let enforced = enforcement();
         json!({
             "schema_version": DOCTOR_SCHEMA_VERSION,
             "mode": "health",
@@ -2051,9 +2081,9 @@ impl DoctorReport {
             "recommended_actions": self.recommended_actions_json_value(),
             "guard_posture": self.guard_posture,
             "enforcement": {
-                "mode": ENFORCEMENT_MODE,
-                "summary": ENFORCEMENT_SUMMARY,
-                "sandbox": false,
+                "mode": enforced.mode,
+                "summary": enforced.summary,
+                "sandbox": enforced.sandbox,
             },
             "fixers": [],
         })

@@ -653,6 +653,16 @@ fn keep_in_place(rules: &BTreeSet<DenyRule>) -> io::Result<String> {
     Ok(lines.into_iter().collect())
 }
 
+/// A rule, to append to a compiled profile, that keeps the confined process from
+/// opening the file at `path` for its contents. It is how veil tells that it is
+/// confined (see [`super::marker`]). `path` has symlinked directories resolved.
+pub fn refuse_opening(path: &Path) -> io::Result<String> {
+    Ok(format!(
+        "(deny file-read-data (literal \"{}\"))\n",
+        seatbelt_string(path)?
+    ))
+}
+
 /// Rules, to append to a compiled profile, that keep the confined process from
 /// changing `files` or anything under `subtrees`. No directory above one of
 /// them may be renamed or removed, which would let another take its place.

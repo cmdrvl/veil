@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use crate::sandbox::marker;
+
 /// Written on every record as `schema_version`. The records before it came in
 /// generations with different keys and nothing to tell them apart; a reader
 /// that meets any other value, or none, is looking at a legacy record.
@@ -17,11 +19,21 @@ pub const SCHEMA_VERSION: &str = "veil.audit.v2";
 /// Written on every record as `enforcement`: what stood behind the decision.
 /// `hook` is a hook reading the text of a tool call, which is advisory and
 /// parser-based: it can refuse what it can see and cannot stop what it cannot.
-/// This constant is what every hook record carries. The sandbox broker writes
-/// `sandbox`, and `veil exec` outside a sandbox writes `direct`, through
-/// [`append_audit_record_with_enforcement`]. A record without the key, written
-/// before it existed, was a hook decision: that was the only kind.
+/// This constant is what a hook record carries, unless `veil sandbox` confines
+/// the hook: then it says `sandbox` ([`hook_enforcement`]). The sandbox broker
+/// writes `sandbox` too, and `veil exec` outside a sandbox writes `direct`,
+/// through [`append_audit_record_with_enforcement`]. A record without the key,
+/// written before it existed, was a hook decision: that was the only kind.
 pub const ENFORCEMENT: &str = "hook";
+
+/// The `enforcement` of a hook record written by this process.
+pub fn hook_enforcement() -> &'static str {
+    if marker::confines_this_process() {
+        marker::SANDBOX
+    } else {
+        ENFORCEMENT
+    }
+}
 
 /// The audit log is rotated when it reaches this size...
 pub const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
@@ -77,8 +89,9 @@ impl AuditRecord {
     }
 
     /// Serialize a record with the enforcement boundary that actually made
-    /// the decision. Hook callers keep using [`Self::to_json_value`]; broker
-    /// decisions identify the OS sandbox explicitly.
+    /// the decision. [`Self::to_json_value`] says `hook` whatever the process;
+    /// the functions that append for a hook ask [`hook_enforcement`], and the
+    /// broker names its own.
     pub fn to_json_value_with_enforcement(&self, enforcement: &str) -> Value {
         json!({
             "schema_version": SCHEMA_VERSION,
@@ -127,7 +140,7 @@ pub fn append_default_audit_record(record: &AuditRecord) -> io::Result<PathBuf> 
 }
 
 pub fn append_audit_record(path: &Path, record: &AuditRecord) -> io::Result<()> {
-    append_audit_record_with_enforcement(path, record, ENFORCEMENT)
+    append_audit_record_with_enforcement(path, record, hook_enforcement())
 }
 
 pub fn append_audit_record_with_enforcement(
@@ -178,7 +191,7 @@ pub fn append_audit_record_rotating(
     max_bytes: u64,
     keep: usize,
 ) -> io::Result<()> {
-    append_audit_record_rotating_with_enforcement(path, record, ENFORCEMENT, max_bytes, keep)
+    append_audit_record_rotating_with_enforcement(path, record, hook_enforcement(), max_bytes, keep)
 }
 
 pub fn append_audit_record_rotating_with_enforcement(

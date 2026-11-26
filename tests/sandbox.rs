@@ -1513,6 +1513,239 @@ fn a_launch_that_ignores_interrupts_hands_that_to_the_command() {
     assert!(output.status.success(), "{context}");
 }
 
+/// A tool call on `protected.txt`, which the hook refuses and so records.
+#[cfg(unix)]
+fn refused_read(root: &Path) -> String {
+    serde_json::json!({
+        "session_id": "enforcement",
+        "cwd": root,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": { "file_path": root.join("protected.txt") },
+    })
+    .to_string()
+}
+
+/// The `enforcement` of every record in the audit log under `home`.
+#[cfg(unix)]
+fn recorded_enforcement(home: &Path) -> Vec<String> {
+    fs::read_to_string(home.join(".cmdrvl/logs/veil/audit.jsonl"))
+        .expect("audit log")
+        .lines()
+        .map(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).expect("audit JSON");
+            record["enforcement"]
+                .as_str()
+                .expect("enforcement")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Run `command` as the hook on a refused read.
+#[cfg(unix)]
+fn run_hook(mut command: Command, root: &Path, context: &str) {
+    use std::io::Write;
+
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the hook should start");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(refused_read(root).as_bytes())
+        .expect("payload");
+    let output = child.wait_with_output().expect("the hook should end");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "{context}: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn the_hook_and_doctor_say_sandbox_inside_veil_sandbox() {
+    // `rm` is expected to fail; `mark` is where the launcher leaves its marker
+    let script = r#"
+veil=$1 payload=$2
+mark="${VEIL_BROKER_SOCKET%.sock}.marker"
+echo "VARIABLE=$VEIL_ENFORCEMENT"
+printf '%s' "$payload" | "$veil" >/dev/null
+"$veil" doctor --json > doctor.json
+"$veil" doctor | /usr/bin/grep 'enforcement:'
+/bin/cat "$mark" 2>/dev/null && echo MARKER_OPENED
+/bin/rm -f "$mark" 2>/dev/null
+[ -f "$mark" ] && echo MARKER_THERE
+# without the variable, nothing is claimed
+/usr/bin/env -u VEIL_ENFORCEMENT "$veil" doctor | /usr/bin/grep 'enforcement:'
+exit 0
+"#;
+    let (root, home) = launch_fixture();
+    let output = launcher(&root, &home)
+        .args(["--", "/bin/sh", "-c", script, "sh"])
+        .args([env!("CARGO_BIN_EXE_veil"), &refused_read(&root)])
+        .output()
+        .expect("veil should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let context = format!(
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(output.status.success(), "{context}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "VARIABLE=sandbox",
+            "  enforcement: sandbox (macOS Seatbelt confines this process; hook decisions stay parser-based)",
+            "MARKER_THERE",
+            "  enforcement: hook-only (advisory; parser-based)",
+        ],
+        "{context}"
+    );
+    assert_eq!(recorded_enforcement(&home), ["sandbox"], "{context}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("doctor.json")).expect("doctor report"))
+            .expect("doctor JSON");
+    assert_eq!(report["enforcement"]["mode"], "sandbox", "{report}");
+    assert_eq!(report["enforcement"]["sandbox"], true, "{report}");
+    assert_eq!(session_sockets(&home), Vec::<PathBuf>::new(), "{context}");
+}
+
+/// Anyone can set `VEIL_ENFORCEMENT`, and name a socket.
+#[cfg(unix)]
+#[test]
+fn the_variable_alone_does_not_make_veil_say_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for case in [
+        "the variable alone",
+        "a socket with no marker beside it",
+        "a marker anyone may open",
+        "a marker without read permission",
+    ] {
+        let root = fixture();
+        let home = root.join("home");
+        fs::write(root.join("protected.txt"), "private\n").expect("protected");
+        let marker = root.join("veil-broker-forged.marker");
+        if case.starts_with("a marker") {
+            fs::write(&marker, "").expect("marker");
+        }
+        if case == "a marker without read permission" {
+            fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).expect("mode");
+        }
+        let claiming = || {
+            let mut command = veil(&root);
+            command
+                .env("VEIL_PROTECTED", "protected.txt")
+                .env("VEIL_ENFORCEMENT", "sandbox")
+                .env_remove("VEIL_BROKER_SOCKET");
+            if case != "the variable alone" {
+                command.env("VEIL_BROKER_SOCKET", root.join("veil-broker-forged.sock"));
+            }
+            command
+        };
+
+        run_hook(claiming(), &root, case);
+        assert_eq!(recorded_enforcement(&home), ["hook"], "{case}");
+        let output = claiming()
+            .args(["doctor", "--json"])
+            .output()
+            .expect("doctor should run");
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("doctor JSON");
+        assert_eq!(report["enforcement"]["mode"], "hook-only", "{case}");
+        assert_eq!(report["enforcement"]["sandbox"], false, "{case}");
+    }
+}
+
+/// Under a profile of the test's own, which closes one file: what the marker has
+/// to be, one condition at a time.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_refusal_borrowed_some_other_way_is_not_the_marker() {
+    use std::os::unix::fs::symlink;
+
+    for (case, expected) in [
+        // the limit: a process that confines itself like this is believed
+        ("an empty marker that cannot be opened", "sandbox"),
+        ("a link to a file that cannot be opened", "hook"),
+        ("such a marker with a second name", "hook"),
+        ("such a marker that holds something", "hook"),
+        ("a socket the launcher would not name", "hook"),
+        ("a socket named from the working directory", "hook"),
+        ("the variable saying something else", "hook"),
+    ] {
+        let root = fixture();
+        let home = root.join("home");
+        fs::write(root.join("protected.txt"), "private\n").expect("protected");
+        let stem = if case == "a socket the launcher would not name" {
+            "other"
+        } else {
+            "veil-broker-forged"
+        };
+        let marker = root.join(format!("{stem}.marker"));
+        let mut closed = marker.clone();
+        match case {
+            "a link to a file that cannot be opened" => {
+                closed = root.join("elsewhere");
+                fs::write(&closed, "").expect("target");
+                symlink(&closed, &marker).expect("link");
+            }
+            "such a marker with a second name" => {
+                fs::write(&marker, "").expect("marker");
+                fs::hard_link(&marker, root.join("second-name")).expect("second name");
+            }
+            "such a marker that holds something" => fs::write(&marker, "x").expect("marker"),
+            _ => fs::write(&marker, "").expect("marker"),
+        }
+        let profile = format!(
+            "(version 1)(allow default)(deny file-read-data (literal \"{}\"))",
+            closed.display()
+        );
+        // the control: under this profile the marker's name does not open
+        let opened = sandbox_exec(
+            &profile,
+            &root,
+            "/bin/cat",
+            &[marker.to_str().expect("path")],
+        );
+        assert!(
+            String::from_utf8_lossy(&opened.stderr).contains("Operation not permitted"),
+            "{case}: {opened:?}"
+        );
+
+        let socket = if case == "a socket named from the working directory" {
+            PathBuf::from(format!("{stem}.sock"))
+        } else {
+            root.join(format!("{stem}.sock"))
+        };
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        isolate(&mut command, &root);
+        command
+            .args(["-p", &profile, env!("CARGO_BIN_EXE_veil")])
+            .env("VEIL_PROTECTED", "protected.txt")
+            .env("VEIL_BROKER_SOCKET", socket)
+            .env(
+                "VEIL_ENFORCEMENT",
+                if case == "the variable saying something else" {
+                    "hook"
+                } else {
+                    "sandbox"
+                },
+            );
+
+        run_hook(command, &root, case);
+        assert_eq!(recorded_enforcement(&home), [expected], "{case}");
+    }
+}
+
 /// A client that speaks the broker protocol itself, so that only reaching the
 /// broker is in question. It tries one broker's socket under several names and
 /// prints what each connection got back.
@@ -2120,10 +2353,13 @@ fn broker_exits_when_its_launcher_is_killed() {
         })
     };
 
-    assert!(wait_for(1), "the session socket should appear");
+    assert!(wait_for(2), "the session socket and marker should appear");
     launcher.kill().expect("launcher should be killed");
     launcher.wait().expect("launcher should be reaped");
-    assert!(wait_for(0), "the broker should remove its socket and exit");
+    assert!(
+        wait_for(0),
+        "the broker should remove its socket and the marker, and exit"
+    );
 }
 
 #[cfg(target_os = "macos")]

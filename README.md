@@ -48,7 +48,9 @@ ALLOW:  Read tool on a report `veil exec` registered → known by its bytes, not
 veil is a hook. It reads the text of a tool call before it runs and decides from
 the paths that text names. That is **hook-only** enforcement: advisory and
 parser-based. `veil doctor` says `enforcement: hook-only (advisory;
-parser-based)` and every audit record carries `"enforcement": "hook"`. It makes
+parser-based)` and a hook's audit record carries `"enforcement": "hook"`; both
+say `sandbox` where `veil sandbox` confines the process
+([how veil tells](#sandboxed-commands-macos)). veil makes
 direct reads and the common indirect ones hard; it does not make them
 impossible, because anything it cannot see in the text of a command it cannot
 stop. On macOS, `veil sandbox -- <command>` can also confine a command with an
@@ -105,6 +107,25 @@ judges the tool itself, raw-value flags included. That holds for the word
 `veil`, found on `PATH` as a bare tool name is, or the path of the running veil;
 another program named `veil` gets nothing, and `veil exec` of anything else is
 judged as before.
+
+`veil sandbox --shell` starts `$SHELL` (`/bin/sh` where that is unset or empty)
+under the same profile, for checking by hand. `--profile-out <file>` writes the
+profile being applied to a new file: it does not overwrite one, and nothing is
+run if it cannot write. `veil sandbox` exits with the command's status, or with
+128 plus the signal's number where a signal ended the command. It leaves Ctrl-C
+and Ctrl-\ to the command. It does not pass on a signal sent to it alone, such
+as `SIGTERM`, and what becomes of the command then has not been tested.
+
+The command has `VEIL_ENFORCEMENT=sandbox` in its environment, and there a
+hook's audit record and `veil doctor` say `sandbox`. Anyone can set a variable,
+so veil does not take its word. The launcher also leaves an empty marker file
+beside its broker's socket, and the profile does not let it be opened. veil says
+`sandbox` only on macOS, when the variable says so, the marker of the session
+that `VEIL_BROKER_SOCKET` names is there, and opening it fails with "operation
+not permitted", which a file's permissions do not cause. That shows a policy on
+the process closes the file, **not that veil's profile is in force**: a process
+that puts itself under a profile of its own that does this is believed. A hook's
+decision is made from the text of the call either way.
 
 Seatbelt rules name paths, so the profile also keeps protected content from
 getting a name the rules do not cover. The confined command cannot rename,
@@ -935,9 +956,11 @@ own, `reason_class: redirect_write`.
 - **Enforcement.** `"enforcement": "hook"` means a hook that read the text of a
   tool call made the decision, which is advisory and parser-based (see
   [What veil stops and what it does not](#what-veil-stops-and-what-it-does-not)).
-  A hook writes it even inside `veil sandbox`. The sandbox broker writes
-  `sandbox`, and `veil exec` outside a sandbox writes `direct`. A record without
-  the key was a hook decision: that was the only kind.
+  A hook that `veil sandbox` confines writes `sandbox` (see
+  [Sandboxed commands](#sandboxed-commands-macos) for how it tells, and what
+  that does not show). The sandbox broker writes `sandbox` too, with
+  `origin: broker`, and `veil exec` outside a sandbox writes `direct`. A record
+  without the key was a hook decision: that was the only kind.
 - **Whole lines.** A record is written with a single `write`, so hooks running at
   once cannot write into each other's lines. A log from an older veil can hold
   lines where that happened.

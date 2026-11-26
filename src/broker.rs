@@ -25,7 +25,7 @@ use crate::audit::{
 use crate::broker_output::{BrokerOutputScanner, MAX_BROKER_OUTPUT_BYTES};
 use crate::config::{self, Config};
 use crate::derived::{self, OutTargets, Sources, VeilState, Written};
-use crate::sandbox::seatbelt;
+use crate::sandbox::{marker, seatbelt};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024;
@@ -549,10 +549,11 @@ fn serve(socket: &Path, context: BrokerContext) -> io::Result<()> {
 
 /// The launcher holds the other end of the broker's standard input and writes
 /// nothing to it. It closes when the launcher goes, however it goes, and then
-/// the broker removes its socket and exits.
+/// the broker removes the session's marker and its socket, and exits.
 fn exit_with_launcher(socket: PathBuf) {
     thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+        let _ = fs::remove_file(marker::beside(&socket));
         let _ = fs::remove_file(socket);
         std::process::exit(0);
     });
