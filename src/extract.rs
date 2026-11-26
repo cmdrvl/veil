@@ -52,6 +52,20 @@ const PYTHON_DIRECT_READ_CALLS: &[&str] = &[
     "genfromtxt",
 ];
 const PYTHON_PATH_READ_METHODS: &[&str] = &["read_text", "read_bytes", "open"];
+/// pandas readers that fetch a string which is a web address. `open` and the
+/// rest open it as a local path.
+const PYTHON_ADDRESS_READ_CALLS: &[&str] = &[
+    "read_csv",
+    "read_table",
+    "read_fwf",
+    "read_json",
+    "read_excel",
+    "read_parquet",
+    "read_feather",
+    "read_orc",
+    "read_stata",
+    "read_xml",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InterpreterKind {
@@ -240,12 +254,17 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
     let simple_commands = decompose_in(command, &env);
     // A script the string writes is read as written, not as it is on disk now.
     scripts.collect_writes(&simple_commands, cwd);
+    scripts.note_text(command);
     let lookup_changed = simple_commands.iter().any(|simple| simple.lookup_changed);
 
     for simple in simple_commands {
         let cwd = simple.cwd.as_deref().unwrap_or(cwd);
 
-        commands.push(command_extraction(&simple, cwd));
+        commands.push(command_extraction(
+            &simple,
+            cwd,
+            scripts.addresses_may_be_local(),
+        ));
         // An interpreter run on a script file: what is in the file is read too.
         script::inspect(&simple, cwd, &env, 0, &mut scripts, &mut commands);
     }
@@ -290,7 +309,13 @@ fn script_stdin<'a>(command: &'a SimpleCommand, args: &'a [String]) -> sed::Stdi
     }
 }
 
-fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction {
+/// `local_addresses`: the call may make a local entry that a web address in
+/// interpreter code would name.
+fn command_extraction(
+    command: &SimpleCommand,
+    cwd: &Path,
+    local_addresses: bool,
+) -> CommandExtraction {
     let assigned_paths = assigned_paths(&command.assigned, cwd);
 
     let Some((program, args)) = command.argv.split_first() else {
@@ -424,6 +449,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             exposure == PathExposure::ReadsContents,
             &candidates,
             cwd,
+            local_addresses,
         );
         (paths, exposure, scans_directories)
     };
@@ -713,13 +739,14 @@ fn argv_paths(
     reads: bool,
     already: &[PathBuf],
     cwd: &Path,
+    local_addresses: bool,
 ) -> Vec<ArgvPath> {
     let mut found: Vec<ArgvPath> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = already.iter().cloned().collect();
     let mut budget = ARGV_FILESYSTEM_BUDGET;
     let mut resolver = ArgvResolver::new(cwd);
 
-    for word in argv_path_words(program, args, named, cwd) {
+    for word in argv_path_words(program, args, named, cwd, local_addresses) {
         let mut resolve = |raw: &str, found: &mut Vec<ArgvPath>| {
             let resolved = budget > 0;
             let path = if resolved {
@@ -765,12 +792,16 @@ struct PathWord {
     certain: bool,
 }
 
-/// Whether `program` takes a web address as one: a web client, or a language
-/// interpreter, whose words are code and arguments. Any other program opens a
-/// word like `https://a.b/x` as a local path if there is one.
-fn takes_web_addresses(program: &str) -> bool {
-    matches!(program, "curl" | "wget" | "gh")
-        || interpreter_kind(program).is_some_and(|kind| kind != InterpreterKind::Shell)
+/// The code a language interpreter is handed in its own words (`-c`, `-e`).
+/// Its other arguments are not code: the program may open any of them.
+fn interpreter_code(program: &str, args: &[String]) -> Vec<String> {
+    let mut code = exec::programs(program, args).inline;
+
+    // Python takes one `-c`; a later one is an argument of the code
+    if interpreter_kind(program) == Some(InterpreterKind::Python) {
+        code.truncate(1);
+    }
+    code
 }
 
 /// The words of a command that may name a path, in order, without
@@ -779,21 +810,26 @@ fn takes_web_addresses(program: &str) -> bool {
 /// each quoted literal inside a longer word (`select * from 'x.csv'`,
 /// `open('x.csv')`). The script handed to a shell is skipped: the decomposer
 /// runs it as commands of its own. `named` are added last, as certain paths.
-/// To a program that [`takes_web_addresses`] one is not a path (bd-ov7); in a
-/// word that holds one among other text, what is left is read piece by piece.
-fn argv_path_words(program: &str, args: &[String], named: &[String], cwd: &Path) -> Vec<PathWord> {
+/// A web address is not a path where a web client takes it as an address
+/// ([`egress::takes_as_address`]) or in an interpreter's inline code, unless
+/// `local_addresses` (bd-ov7). What else such a word holds is read piece by
+/// piece. Everywhere else, a file a client uploads or an interpreter's argument
+/// included, the word is judged as any other.
+fn argv_path_words(
+    program: &str,
+    args: &[String],
+    named: &[String],
+    cwd: &Path,
+    local_addresses: bool,
+) -> Vec<PathWord> {
     let mut words: Vec<PathWord> = Vec::new();
-    let web = takes_web_addresses(command_name(program));
-    // what is left of `text` once its addresses are blanked, when it holds any
-    let blanked = |text: &str| match script::without_web_addresses(text, cwd) {
-        Cow::Owned(rest) if web => Some(rest),
-        _ => None,
+    let code = if local_addresses {
+        Vec::new()
+    } else {
+        interpreter_code(command_name(program), args)
     };
     let mut add = |text: &str| {
         let text = text.trim_start_matches(['@', '<']);
-        if blanked(text).is_some() {
-            return;
-        }
         let shaped = path_shaped(text);
         let plain = is_plain_name(text);
 
@@ -816,7 +852,8 @@ fn argv_path_words(program: &str, args: &[String], named: &[String], cwd: &Path)
         add(program);
     }
 
-    for word in strip_redirection_words(args) {
+    let operands = strip_redirection_words(args);
+    for (index, &word) in operands.iter().enumerate() {
         if word == "--" && !options_ended {
             options_ended = true;
             continue;
@@ -826,7 +863,13 @@ fn argv_path_words(program: &str, args: &[String], named: &[String], cwd: &Path)
             continue;
         }
 
-        let rest = blanked(word);
+        let address = code.iter().any(|text| text == word)
+            || egress::takes_as_address(program, &operands[..index], word);
+        // what is left of an address word once its addresses are blanked
+        let rest = match script::without_web_addresses(word, cwd) {
+            Cow::Owned(rest) if address => Some(rest),
+            _ => None,
+        };
         let pieces: Vec<&str> = match &rest {
             None => vec![word],
             Some(rest) => {
@@ -1836,7 +1879,13 @@ fn extract_python_script_paths(script: &str) -> Vec<String> {
                         && let Some((path, call_end)) =
                             parse_first_python_path_argument(script, after_name + 1)
                     {
-                        paths.push(path);
+                        // a `Path` of an address is a local path
+                        let fetched = PYTHON_ADDRESS_READ_CALLS.contains(&suffix)
+                            && script::is_web_address(&path)
+                            && !script[after_name..call_end].contains("Path");
+                        if !fetched {
+                            paths.push(path);
+                        }
                         index = call_end;
                         continue;
                     }

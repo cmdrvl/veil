@@ -56,6 +56,129 @@ pub(super) fn operand_paths(program: &str, args: &[String]) -> Vec<String> {
     }
 }
 
+/// The short options and long options of a web client that take no value, so the
+/// word after one is an address. An option missing here fails toward judging the
+/// word as a path.
+struct AddressOptions {
+    flags: &'static str,
+    long_flags: &'static [&'static str],
+    /// Options whose value is text or an address, never a file to open: a
+    /// header, a referrer. (`-H @file` is a file, and is told by its `@`.)
+    text_values: &'static [&'static str],
+}
+
+const CURL: AddressOptions = AddressOptions {
+    flags: "sSLfiIkvOgNJRG46#",
+    long_flags: &[
+        "--",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--fail",
+        "--fail-with-body",
+        "--compressed",
+        "--include",
+        "--head",
+        "--insecure",
+        "--verbose",
+        "--globoff",
+        "--get",
+        "--remote-name",
+        "--remote-header-name",
+        "--no-progress-meter",
+        "--progress-bar",
+        "--no-buffer",
+        "--path-as-is",
+        "--http1.1",
+        "--http2",
+        "--ipv4",
+        "--ipv6",
+    ],
+    text_values: &[
+        "--url",
+        "-H",
+        "--header",
+        "-e",
+        "--referer",
+        "-A",
+        "--user-agent",
+    ],
+};
+
+const WGET: AddressOptions = AddressOptions {
+    flags: "qvcNSr",
+    long_flags: &[
+        "--",
+        "-nv",
+        "-nc",
+        "-nd",
+        "-nH",
+        "-np",
+        "--quiet",
+        "--verbose",
+        "--no-verbose",
+        "--spider",
+        "--server-response",
+        "--continue",
+        "--no-clobber",
+        "--content-disposition",
+        "--no-check-certificate",
+        "--recursive",
+        "--no-parent",
+    ],
+    text_values: &["--header", "--referer", "-U", "--user-agent"],
+};
+
+/// `gh api` only: other `gh` commands open the files they are given.
+const GH_API: AddressOptions = AddressOptions {
+    flags: "i",
+    long_flags: &[
+        "--",
+        "--include",
+        "--paginate",
+        "--silent",
+        "--slurp",
+        "--verbose",
+    ],
+    text_values: &["-H", "--header"],
+};
+
+/// Whether `word`, which follows `before` among a web client's arguments, is one
+/// the client takes as an address or as text, never as a local file (bd-ov7).
+pub(super) fn takes_as_address(program: &str, before: &[&str], word: &str) -> bool {
+    let options = match command_name(program) {
+        "curl" => &CURL,
+        "wget" => &WGET,
+        "gh" if before.first() == Some(&"api") => &GH_API,
+        _ => return false,
+    };
+    let previous = before.last().copied();
+
+    if previous.is_some_and(|option| options.text_values.contains(&option)) {
+        return !word.starts_with('@');
+    }
+    // `--url=https://...`, `--header=Referer: https://...`
+    if let Some((option, value)) = word.split_once('=')
+        && option.starts_with("--")
+    {
+        return options.text_values.contains(&option) && !value.starts_with('@');
+    }
+
+    let lower = word.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return false;
+    }
+    previous.is_none_or(|previous| {
+        !previous.starts_with('-')
+            || options.long_flags.contains(&previous)
+            // `-sSL`; `-qO-`, which writes to standard output
+            || previous.strip_prefix('-').is_some_and(|letters| {
+                let letters = letters.strip_suffix("O-").unwrap_or(letters);
+                !letters.is_empty() && letters.chars().all(|letter| options.flags.contains(letter))
+            })
+    })
+}
+
 /// Files an `ftp`, `sftp` or `lftp` script sends: the `put` lines of a
 /// here-document body or a here-string.
 pub(super) fn script_paths(program: &str, script: &str) -> Vec<String> {
