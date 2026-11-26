@@ -471,9 +471,8 @@ fn evaluate_commands(
         if command.has_dynamic_args()
             && !already_denied
             && spine_invocation.is_none()
-            && let Some(mut outcome) = dynamic_outcome(&command_config, command, &context)
+            && let Some(outcome) = dynamic_outcome(&command_config, command, &context)
         {
-            outcome.egress = command.egress && would_deny(&outcome.decision);
             outcomes.push(outcome);
         }
 
