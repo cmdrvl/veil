@@ -1,7 +1,7 @@
 //! bd-29r: any command that names a protected path in its words is judged
 //! against policy, whether or not veil knows the command as a reader, unless the
 //! command is an authorized spine tool. These tests drive the real `veil` binary
-//! with Claude Code `PreToolUse` payloads against real files and directories.
+//! with Claude Code and Grok `PreToolUse` payloads against real files and directories.
 //!
 //! What they do not cover: a path built by the shell (`cat $f`) or read from
 //! standard input by `xargs`, which the dynamic-argument stance judges
@@ -31,6 +31,7 @@ struct Repo {
 struct Verdict {
     action: String,
     reason: Option<String>,
+    output: Value,
 }
 
 impl Verdict {
@@ -85,14 +86,21 @@ fn bash(repo: &Repo, command: &str) -> Verdict {
         "tool_name": "Bash",
         "tool_input": { "command": command },
     });
+    hook(repo, payload)
+}
 
+fn hook(repo: &Repo, payload: Value) -> Verdict {
     let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
         .env("HOME", &repo.root)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_STATE_HOME")
         .env_remove("VEIL_PROTECTED")
+        .env_remove("VEIL_SAFE_PATTERNS")
         .env_remove("VEIL_SPINE_TOOLS")
         .env_remove("VEIL_POLICY")
+        .env_remove("VEIL_AUDIT_LOG")
+        .env_remove("VEIL_AUDIT_PATH")
+        .env_remove("VEIL_DYNAMIC_ARGS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -114,17 +122,73 @@ fn bash(repo: &Repo, command: &str) -> Verdict {
     );
     let decision: Value =
         serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
-    let specific = &decision["hookSpecificOutput"];
+    let specific = decision.get("hookSpecificOutput").unwrap_or(&decision);
 
     Verdict {
-        action: specific["permissionDecision"]
-            .as_str()
-            .expect("decision should carry permissionDecision")
+        action: specific
+            .get("permissionDecision")
+            .or_else(|| specific.get("decision"))
+            .and_then(Value::as_str)
+            .expect("decision should carry a permission decision")
             .to_owned(),
-        reason: specific["permissionDecisionReason"]
-            .as_str()
+        reason: specific
+            .get("permissionDecisionReason")
+            .or_else(|| specific.get("reason"))
+            .and_then(Value::as_str)
             .map(str::to_owned),
+        output: decision,
     }
+}
+
+fn assert_grok_denied(verdict: &Verdict) {
+    assert_eq!(verdict.output["decision"], "deny", "{:#}", verdict.output);
+    assert!(verdict.denied());
+    assert!(
+        verdict
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("blocked by policy")),
+        "unexpected Grok denial reason: {:?}",
+        verdict.reason
+    );
+}
+
+#[test]
+fn dual_key_grok_read_file_denies_target_file_on_real_binary() {
+    let repo = repo("grok-dual-read");
+    let verdict = hook(
+        &repo,
+        json!({
+            "hookEventName": "pre_tool_use",
+            "hook_event_name": "PreToolUse",
+            "sessionId": "grok-session",
+            "session_id": "grok-session",
+            "cwd": repo.root,
+            "toolName": "read_file",
+            "tool_name": "read_file",
+            "toolInput": { "target_file": HOLDINGS },
+            "tool_input": { "target_file": HOLDINGS },
+        }),
+    );
+
+    assert_grok_denied(&verdict);
+}
+
+#[test]
+fn snake_case_grok_terminal_command_denies_protected_read_on_real_binary() {
+    let repo = repo("grok-snake-bash");
+    let verdict = hook(
+        &repo,
+        json!({
+            "session_id": "grok-session",
+            "cwd": repo.root,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "run_terminal_command",
+            "tool_input": { "command": format!("cat {HOLDINGS}") },
+        }),
+    );
+
+    assert_grok_denied(&verdict);
 }
 
 fn audit_records(repo: &Repo) -> Vec<Value> {

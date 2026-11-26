@@ -135,7 +135,7 @@ fn parse_grok_payload(payload: &Value) -> Result<HookInput, HookParseError> {
     };
     let tool_name = required_string(payload, tool_name_field)?;
     let cwd = required_path(payload, "cwd")?;
-    let raw_args = required_json(payload, tool_input_field)?;
+    let raw_args = normalize_grok_read_args(tool_name, required_json(payload, tool_input_field)?)?;
 
     Ok(HookInput {
         protocol: HookProtocol::Grok,
@@ -144,6 +144,31 @@ fn parse_grok_payload(payload: &Value) -> Result<HookInput, HookParseError> {
         cwd,
         session_id: string_field(payload, session_id_field).map(str::to_owned),
         raw_args,
+    })
+}
+
+/// Grok names the path for `read_file` as `target_file`; normalize that
+/// protocol-specific field to the canonical read argument before extraction.
+fn normalize_grok_read_args(tool_name: &str, raw_args: String) -> Result<String, HookParseError> {
+    if !tool_name.eq_ignore_ascii_case("read_file") {
+        return Ok(raw_args);
+    }
+
+    let mut args: Value = serde_json::from_str(&raw_args)
+        .map_err(|error| HookParseError::new(format!("invalid Grok read arguments: {error}")))?;
+    let Some(object) = args.as_object_mut() else {
+        return Ok(raw_args);
+    };
+    if object.contains_key("file_path") || object.contains_key("path") {
+        return Ok(raw_args);
+    }
+    let Some(target_file) = object.remove("target_file") else {
+        return Ok(raw_args);
+    };
+
+    object.insert("file_path".to_owned(), target_file);
+    serde_json::to_string(&args).map_err(|error| {
+        HookParseError::new(format!("could not normalize Grok read arguments: {error}"))
     })
 }
 
@@ -499,7 +524,7 @@ mod tests {
         assert_eq!(parsed.tool, ToolKind::Read);
         assert_eq!(parsed.tool_name, "read_file");
         assert_eq!(parsed.session_id.as_deref(), Some("camel-session"));
-        assert_eq!(parsed.raw_args, r#"{"target_file":"secret.txt"}"#);
+        assert_eq!(parsed.raw_args, r#"{"file_path":"secret.txt"}"#);
     }
 
     #[test]
