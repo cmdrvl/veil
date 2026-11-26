@@ -102,6 +102,13 @@ run an authorized spine tool on a protected file and return what it prints.
 Outside a sandbox, `veil exec` applies the same tool, flag and output checks
 and confines nothing.
 
+Seatbelt rules name paths, so the profile also keeps protected content from
+getting a name the rules do not cover. The confined command cannot rename,
+swap or remove a protected path or **any directory above one** (including the
+project directory itself), and cannot clone any of those directories, because
+macOS checks a directory clone only at its top. These rules leave renames,
+removals and clones of other files and directories alone.
+
 The broker:
 
 - runs only the spine tools it knows by name that the config authorizes, found

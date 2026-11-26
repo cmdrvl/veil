@@ -34,6 +34,15 @@ enum RuleKind {
     Subpath,
 }
 
+impl RuleKind {
+    fn filter(&self) -> &'static str {
+        match self {
+            Self::Literal => "literal",
+            Self::Subpath => "subpath",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct DenyRule {
     path: PathBuf,
@@ -106,17 +115,14 @@ fn compile_with_limit(
 
     let path_rules = rules.len();
     let mut profile = String::from("(version 1)\n(allow default)\n(deny file-link)\n");
-    for rule in rules {
+    for rule in &rules {
         let path = seatbelt_string(&rule.path)?;
-        match rule.kind {
-            RuleKind::Literal => {
-                profile.push_str(&format!("(deny file-read* (literal \"{path}\"))\n"))
-            }
-            RuleKind::Subpath => {
-                profile.push_str(&format!("(deny file-read* (subpath \"{path}\"))\n"))
-            }
-        }
+        profile.push_str(&format!(
+            "(deny file-read* ({} \"{path}\"))\n",
+            rule.kind.filter()
+        ));
     }
+    profile.push_str(&keep_in_place(&rules)?);
 
     Ok(CompiledProfile {
         profile,
@@ -304,20 +310,51 @@ fn add_path(path: &Path, directory_hint: bool, rules: &mut BTreeSet<DenyRule>) -
     } else {
         RuleKind::Literal
     };
-    add_rule(path.clone(), kind, rules)?;
+    add_rule(path.clone(), kind.clone(), rules)?;
 
-    if let Ok(target) = fs::canonicalize(&path)
-        && target != path
-    {
-        let target_kind = if fs::metadata(&target).is_ok_and(|metadata| metadata.is_dir()) {
-            RuleKind::Subpath
-        } else {
-            RuleKind::Literal
+    let target = fs::canonicalize(&path).unwrap_or_else(|_| follow_links(&path));
+    if target != path {
+        let target_kind = match fs::metadata(&target) {
+            Ok(metadata) if metadata.is_dir() => RuleKind::Subpath,
+            Ok(_) => RuleKind::Literal,
+            // nothing there yet: it is what the configured pattern says it is
+            Err(_) => kind,
         };
         add_rule(target, target_kind, rules)?;
     }
 
     Ok(())
+}
+
+/// The name Seatbelt will compare for a path that does not exist yet: every
+/// symlink on the way is followed, including one whose target is missing, and
+/// the parts that do not exist are kept as written. Past 40 links the rest is
+/// kept as written, which is what the kernel refuses to resolve too.
+fn follow_links(path: &Path) -> PathBuf {
+    let mut pending = path
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect::<VecDeque<_>>();
+    let mut resolved = PathBuf::new();
+    let mut followed = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            resolved.pop();
+            continue;
+        }
+        // joining "/" starts again from the root, as an absolute target does
+        let next = resolved.join(&part);
+        match fs::read_link(&next) {
+            Ok(target) if followed < 40 => {
+                followed += 1;
+                for component in target.components().rev() {
+                    pending.push_front(component.as_os_str().to_owned());
+                }
+            }
+            _ => resolved = next,
+        }
+    }
+    resolved
 }
 
 fn add_rule(path: PathBuf, kind: RuleKind, rules: &mut BTreeSet<DenyRule>) -> io::Result<()> {
@@ -336,6 +373,32 @@ fn add_rule(path: PathBuf, kind: RuleKind, rules: &mut BTreeSet<DenyRule>) -> io
 /// evidence pack, a sliced CSV) can put unscanned bytes where the confined
 /// client reads them.
 pub const NO_FILE_WRITES_PROFILE: &str = "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n";
+
+/// A path rule follows a name, not a file. These rules keep protected content
+/// from getting a name the read denials do not cover: no protected path, and no
+/// directory above one, may be renamed, swapped or removed, and no directory
+/// above one may be cloned. macOS checks a `clonefile(2)` of a directory
+/// against that directory alone, and the clone carries everything beneath it.
+fn keep_in_place(rules: &BTreeSet<DenyRule>) -> io::Result<String> {
+    let mut lines = BTreeSet::new();
+    for rule in rules {
+        lines.insert(format!(
+            "(deny file-write-unlink ({} \"{}\"))\n",
+            rule.kind.filter(),
+            seatbelt_string(&rule.path)?
+        ));
+        for ancestor in rule.path.ancestors().skip(1) {
+            let ancestor_text = seatbelt_string(ancestor)?;
+            lines.insert(format!("(deny file-clone (literal \"{ancestor_text}\"))\n"));
+            if ancestor.parent().is_some() {
+                lines.insert(format!(
+                    "(deny file-write-unlink (literal \"{ancestor_text}\"))\n"
+                ));
+            }
+        }
+    }
+    Ok(lines.into_iter().collect())
+}
 
 /// Rules, to append to a compiled profile, that keep the confined process from
 /// changing `files` or anything under `subtrees`. No directory above one of

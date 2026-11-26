@@ -207,6 +207,211 @@ fn generated_profile_denies_target_and_symlink_and_blocks_new_hardlinks() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "private payload\n");
 }
 
+/// The text no confined process may print.
+#[cfg(target_os = "macos")]
+const MOVED_CANARY: &str = "MERIDIAN-VAULT-CONFIDENTIAL";
+
+/// A project at `<fixture>/work/proj` and the profile veil compiles for
+/// `protected`, which is TOML array contents.
+#[cfg(target_os = "macos")]
+fn compiled_project(protected: &str, files: &[(&str, &str)]) -> (PathBuf, String) {
+    let root = fixture();
+    let project = root.join("work/proj");
+    fs::create_dir_all(&project).expect("project directory");
+    for (path, text) in files {
+        let path = project.join(path);
+        fs::create_dir_all(path.parent().expect("a parent")).expect("fixture directory");
+        fs::write(path, text).expect("fixture file");
+    }
+    fs::write(
+        project.join(".veil.toml"),
+        format!("[sensitivity]\nprotected = [{protected}]\n"),
+    )
+    .expect("project policy");
+    let output = veil(&root)
+        .current_dir(&project)
+        .env_remove("VEIL_PROTECTED")
+        .args(["sandbox", "--print-profile"])
+        .output()
+        .expect("veil should compile the profile");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        project,
+        String::from_utf8(output.stdout).expect("profile is UTF-8"),
+    )
+}
+
+/// A path-based read deny says nothing about a file once it has another name.
+/// Renaming it, renaming a directory above it, swapping it with a public file,
+/// and cloning a directory above it (macOS looks only at the top directory of a
+/// clone) each printed a protected file before the profile refused them.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_confined_process_cannot_give_protected_content_a_name_the_profile_allows() {
+    const CLONE: &str = "/usr/bin/python3 -I -c 'import ctypes,sys; sys.exit(ctypes.CDLL(None).clonefile(sys.argv[1].encode(), sys.argv[2].encode(), 0) and 1)'";
+    const SWAP: &str = "/usr/bin/python3 -I -c 'import ctypes,sys; sys.exit(ctypes.CDLL(None).renameatx_np(-2, sys.argv[1].encode(), -2, sys.argv[2].encode(), 2) and 1)'";
+
+    let subtree = r#""data/**""#;
+    let nested_file = r#""a/b/secret.txt""#;
+    let glob = r#""reports/*.secret""#;
+    let cases: Vec<(&str, &str, &str, String)> = vec![
+        (
+            "rename the file",
+            subtree,
+            "data/x.csv",
+            "mv data/x.csv out; cat out".to_owned(),
+        ),
+        (
+            "rename the protected directory",
+            subtree,
+            "data/x.csv",
+            "mv data moved; cat moved/x.csv".to_owned(),
+        ),
+        (
+            "rename the project",
+            subtree,
+            "data/x.csv",
+            "cd .. && mv proj gone; cat gone/data/x.csv".to_owned(),
+        ),
+        (
+            "rename the project's parent",
+            subtree,
+            "data/x.csv",
+            "cd ../.. && mv work gone; cat gone/proj/data/x.csv".to_owned(),
+        ),
+        (
+            "swap with a public file",
+            subtree,
+            "data/x.csv",
+            format!("echo public > pub; {SWAP} data/x.csv pub; cat pub"),
+        ),
+        (
+            "clone the project",
+            subtree,
+            "data/x.csv",
+            format!("{CLONE} ../proj ../copy; cat ../copy/data/x.csv"),
+        ),
+        (
+            "clone the project's parent",
+            subtree,
+            "data/x.csv",
+            format!("{CLONE} ../../work ../../copy; cat ../../copy/proj/data/x.csv"),
+        ),
+        (
+            "clone the project from an open descriptor",
+            subtree,
+            "data/x.csv",
+            "/usr/bin/python3 -I -c 'import ctypes,os; ctypes.CDLL(None).fclonefileat(os.open(\".\", os.O_RDONLY), -2, b\"../copy\", 0)'; cat ../copy/data/x.csv".to_owned(),
+        ),
+        (
+            "rename a directory above a protected file",
+            nested_file,
+            "a/b/secret.txt",
+            "mv a z; cat z/b/secret.txt".to_owned(),
+        ),
+        (
+            "clone a directory above a protected file",
+            nested_file,
+            "a/b/secret.txt",
+            format!("{CLONE} a z; cat z/b/secret.txt"),
+        ),
+        (
+            "rename the directory of a glob match",
+            glob,
+            "reports/q3.secret",
+            "mv reports moved; cat moved/q3.secret".to_owned(),
+        ),
+    ];
+
+    for (name, protected, file, command) in cases {
+        let (project, profile) =
+            compiled_project(protected, &[(file, &format!("{MOVED_CANARY}\n"))]);
+        let output = sandbox_exec(&profile, &project, "/bin/sh", &["-c", &command]);
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!shown.contains(MOVED_CANARY), "{name}: {shown}\n{profile}");
+        assert_eq!(
+            fs::read_to_string(project.join(file)).ok().as_deref(),
+            Some(format!("{MOVED_CANARY}\n").as_str()),
+            "{name}: the protected file should be where it was"
+        );
+    }
+
+    // controls: the same operations on what is not protected still work
+    let (project, profile) = compiled_project(
+        subtree,
+        &[("data/x.csv", "private\n"), ("src/lib.txt", "public\n")],
+    );
+    let command = format!(
+        "set -e; mv src renamed; cat renamed/lib.txt; mkdir d; echo made > d/f; mv d e; cat e/f; \
+         {CLONE} renamed cloned; cat cloned/lib.txt; /bin/cp -c e/f g; cat g; \
+         echo one > p; echo two > q; {SWAP} p q; cat p; rm -r e; echo done"
+    );
+    let output = sandbox_exec(&profile, &project, "/bin/sh", &["-c", &command]);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "public\nmade\npublic\nmade\ntwo\ndone\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Seatbelt compares resolved paths. A protected directory that does not exist
+/// yet has none, so the part of it that does exist has to be resolved.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_protected_path_created_later_under_a_symlinked_directory_is_still_denied() {
+    let root = fixture();
+    let project = root.join("proj");
+    fs::create_dir_all(project.join("real")).expect("real directory");
+    std::os::unix::fs::symlink("real", project.join("linked")).expect("directory symlink");
+    // and a link whose target does not exist yet
+    std::os::unix::fs::symlink("real/absent", project.join("dangling")).expect("dangling link");
+    fs::write(
+        project.join(".veil.toml"),
+        "[sensitivity]\nprotected = [\"linked/later/**\", \"linked/one.key\", \"dangling/**\"]\n",
+    )
+    .expect("project policy");
+    let output = veil(&root)
+        .current_dir(&project)
+        .env_remove("VEIL_PROTECTED")
+        .args(["sandbox", "--print-profile"])
+        .output()
+        .expect("veil should compile the profile");
+    assert!(output.status.success());
+    let profile = String::from_utf8(output.stdout).expect("profile is UTF-8");
+
+    // both appear after the profile was compiled
+    fs::create_dir(project.join("real/later")).expect("later directory");
+    fs::write(project.join("real/later/x.csv"), MOVED_CANARY).expect("later file");
+    fs::write(project.join("real/one.key"), MOVED_CANARY).expect("later literal");
+    fs::create_dir(project.join("real/absent")).expect("link target");
+    fs::write(project.join("real/absent/y.csv"), MOVED_CANARY).expect("file behind the link");
+
+    for path in [
+        "linked/later/x.csv",
+        "real/later/x.csv",
+        "linked/one.key",
+        "real/one.key",
+        "dangling/y.csv",
+        "real/absent/y.csv",
+    ] {
+        let output = sandbox_exec(&profile, &project, "/bin/cat", &[path]);
+        assert!(!output.status.success(), "{path} was readable\n{profile}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains(MOVED_CANARY),
+            "{path}\n{profile}"
+        );
+    }
+}
+
 #[test]
 fn a_denial_inside_a_sandbox_points_at_the_broker() {
     use std::io::Write as _;
