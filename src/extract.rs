@@ -140,6 +140,12 @@ pub struct CommandExtraction {
     /// typed: veil read a script an interpreter was asked to run and these are
     /// the paths in it (bd-1bk).
     pub script: Option<ScriptSource>,
+    /// What the command's words say it writes: the targets of its output
+    /// redirections and the values of words with `=` (`dd of=x`,
+    /// `--output=x`). Only veil's own derived registry and key are checked
+    /// against these (bd-3qw), so a word taken for a target by mistake costs
+    /// nothing.
+    pub write_targets: Vec<PathBuf>,
 }
 
 /// A script file an interpreter runs, read by veil as the text it is (bd-1bk).
@@ -188,6 +194,7 @@ impl CommandExtraction {
             assigned_paths: Vec::new(),
             egress: false,
             script: None,
+            write_targets: Vec::new(),
         }
     }
 
@@ -276,6 +283,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             assigned_paths,
             egress: false,
             script: None,
+            write_targets: Vec::new(),
         };
     };
 
@@ -395,7 +403,51 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         assigned_paths,
         egress: egress::is_egress(program, args),
         script: None,
+        write_targets: write_targets(&command.argv, cwd, home_directory().as_deref()),
     }
+}
+
+/// The paths a command's words say it writes.
+fn write_targets(argv: &[String], cwd: &Path, home: Option<&str>) -> Vec<PathBuf> {
+    let mut targets: Vec<PathBuf> = Vec::new();
+    let mut words = argv.iter().peekable();
+    while let Some(word) = words.next() {
+        let target = match output_redirection(word) {
+            Some("") => words.peek().map(|next| next.as_str()),
+            Some(attached) => Some(attached),
+            None => word.split_once('=').map(|(_, value)| value),
+        };
+        let Some(target) = target.filter(|target| !target.is_empty()) else {
+            continue;
+        };
+        // the shell expands `~` after an operator or an `=`, inside the word
+        let expanded = match (target.strip_prefix('~'), home) {
+            (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+                format!("{home}{rest}")
+            }
+            _ => target.to_owned(),
+        };
+        // not normalised: `..` after a symlink goes where the symlink goes
+        let path = cwd.join(expanded);
+        if !targets.contains(&path) {
+            targets.push(path);
+        }
+    }
+    targets
+}
+
+/// What follows the operator of a word that redirects output (`>`, `>>`, `>|`,
+/// `>&`, `&>`, `<>`, with or without a file descriptor): the target, or nothing
+/// when the target is the next word.
+fn output_redirection(word: &str) -> Option<&str> {
+    let operator = match word.strip_prefix('&') {
+        Some(rest) => rest,
+        None => word.trim_start_matches(|ch: char| ch.is_ascii_digit()),
+    };
+    let rest = operator
+        .strip_prefix("<>")
+        .or_else(|| operator.strip_prefix('>'))?;
+    Some(rest.trim_start_matches(['>', '|', '&']))
 }
 
 /// What is unresolved among the files a reader will open: the words `paths`

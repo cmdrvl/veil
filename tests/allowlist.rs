@@ -53,7 +53,22 @@ fn matcher_can_be_reused_without_rebuilding_pattern_state() {
 
     for _ in 0..32 {
         assert!(matcher.is_safe("README.md"));
-        assert!(matcher.is_safe("shape-report.yaml"));
+        assert!(matcher.is_safe("Cargo.lock"));
         assert!(!matcher.is_safe("secrets.yaml"));
+    }
+}
+
+/// bd-3qw: anyone can name a file `x-report.json`. What a tool produced is
+/// known by its content, from the derived registry.
+#[test]
+fn default_patterns_no_longer_trust_a_report_name() {
+    let matcher = SafePathMatcher::default();
+
+    for name in [
+        "shape-report.json",
+        "shape-report.yaml",
+        "/tmp/veil/exports/client-credentials-report.json",
+    ] {
+        assert!(!matcher.is_safe(name), "{name}");
     }
 }

@@ -72,9 +72,12 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             }
         }
         cli::OperatorCommand::Exec(args) => {
-            let exit_code = veil::broker::run_exec(args.tool, args.args)?;
+            let mut command = args.command.into_iter();
+            let tool = command.next().ok_or("veil exec needs a tool")?;
+            let exit_code = veil::broker::run_exec(tool, command.collect(), args.persist)?;
             Ok(u8::try_from(exit_code).unwrap_or(1))
         }
+        cli::OperatorCommand::Derived(args) => derived_command(&args),
         cli::OperatorCommand::Packs(args) => {
             println!("{}", operator::run_packs(&args)?);
             Ok(0)
@@ -105,6 +108,25 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             let path = hooks::uninstall_default()?;
             println!("Removed veil hooks from {}", path.display());
             Ok(0)
+        }
+    }
+}
+
+/// `veil derived`: read-only reports on the derived registry. `verify` exits 1
+/// for a file that is not registered.
+fn derived_command(args: &cli::DerivedArgs) -> Result<u8, Box<dyn std::error::Error>> {
+    let registry = veil::derived::Registry::from_env()
+        .ok_or("HOME is not set, so there is no derived registry")?;
+    match &args.action {
+        cli::DerivedAction::List(list) => {
+            println!("{}", veil::derived::render_list(&registry, list.json)?);
+            Ok(0)
+        }
+        cli::DerivedAction::Verify(verify) => {
+            let (rendered, registered) =
+                veil::derived::render_verify(&registry, &verify.path, verify.json)?;
+            println!("{rendered}");
+            Ok(u8::from(!registered))
         }
     }
 }

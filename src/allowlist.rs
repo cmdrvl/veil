@@ -15,8 +15,6 @@ pub const DEFAULT_SAFE_PATTERNS: &[&str] = &[
     "docs/**",
     "tests/**",
     ".github/**",
-    "*-report.json",
-    "*-report.yaml",
     "package.json",
     "tsconfig.json",
     "Cargo.toml",

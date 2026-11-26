@@ -123,9 +123,10 @@ enum Hook {
     /// Allowed, and why.
     Allowed { cause: &'static str, leaks: Leak },
     /// The tool is never sent to veil: `veil install` routes `Read`, `Grep`,
-    /// `Bash` and `mcp__.*`. If it were sent, veil would refuse it as an
-    /// unsupported tool. Both halves are asserted; that Claude Code matches a
-    /// plain matcher name exactly is not (it is Claude Code's behaviour).
+    /// `Bash`, `mcp__.*` and the four tools that write files, which no row
+    /// here uses. If it were sent, veil would refuse it as an unsupported tool.
+    /// Both halves are asserted; that Claude Code matches a plain matcher name
+    /// exactly is not (it is Claude Code's behaviour).
     NotRouted { cause: &'static str, leaks: Leak },
 }
 
@@ -2156,6 +2157,45 @@ fn vectors() -> Vec<Vector> {
             "control",
         ),
         row(
+            "tool-read-spoofed-report",
+            AgentTools,
+            Since,
+            other(
+                "Read",
+                r#"{"file_path":"@ROOT@/data/clients/shape-report.json"}"#,
+            ),
+            blocked("direct_read"),
+            SB_BLOCKED,
+            "a protected file's bytes under a tool report's name: the name earns nothing, and only bytes `veil exec` registered are read as derived",
+        ),
+        row(
+            "tool-grep-spoofed-report",
+            AgentTools,
+            Since,
+            other(
+                "Grep",
+                r#"{"pattern":"ssn","path":"@ROOT@/data/clients/shape-report.json","output_mode":"content"}"#,
+            ),
+            blocked("direct_read"),
+            SB_BLOCKED,
+            "",
+        ),
+        row(
+            "tool-read-spoofed-report-unprotected",
+            AgentTools,
+            Since,
+            other(
+                "Read",
+                r#"{"file_path":"@ROOT@/exports/client-credentials-report.json"}"#,
+            ),
+            blocked("direct_read"),
+            Sandbox::Allowed(
+                Evidence::Design,
+                "only a sensitivity pack classifies this file; a path-deny profile covers the configured protected paths",
+            ),
+            "outside every protected path, where the default allowlist used to trust `*-report.json` ahead of the packs",
+        ),
+        row(
             "tool-notebook-read",
             AgentTools,
             Since,
@@ -2272,6 +2312,14 @@ fn fixture_files() -> Vec<(&'static str, Body)> {
     vec![
         (H, text("name,ssn\nada,078-05-1120\n")),
         ("data/clients/other.csv", text("name\nbob\n")),
+        (
+            "data/clients/shape-report.json",
+            text("name,ssn\nada,078-05-1120\n"),
+        ),
+        (
+            "exports/client-credentials-report.json",
+            text("{\"token\": \"abc\"}\n"),
+        ),
         ("data/clients/analysis.ipynb", text("{\"cells\": []}\n")),
         (".env", text("TOKEN=abc\n")),
         ("secret.json", text("{\"k\": \"v\"}\n")),

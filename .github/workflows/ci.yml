@@ -80,6 +80,9 @@ jobs:
       - name: Prove Seatbelt read and hardlink restrictions
         run: cargo test --locked --test sandbox
 
+      - name: Prove the derived registry under Seatbelt
+        run: cargo test --locked --test derived
+
   linux-landlock-sandbox:
     name: linux-landlock-sandbox
     runs-on: ubuntu-latest

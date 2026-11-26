@@ -11,6 +11,14 @@
         "text": "name\nbob\n"
       },
       {
+        "path": "data/clients/shape-report.json",
+        "text": "name,ssn\nada,078-05-1120\n"
+      },
+      {
+        "path": "exports/client-credentials-report.json",
+        "text": "{\"token\": \"abc\"}\n"
+      },
+      {
         "path": "data/clients/analysis.ipynb",
         "text": "{\"cells\": []}\n"
       },
@@ -3138,6 +3146,53 @@
       "sandbox": "**ALLOWED** (design, not run): no protected path involved",
       "tool_input": {
         "file_path": "@ROOT@/notes.md"
+      },
+      "tool_name": "Read"
+    },
+    {
+      "class": "Agent tools (Read, Grep, Glob, Notebook)",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "tool-read-spoofed-report",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "file_path": "@ROOT@/data/clients/shape-report.json"
+      },
+      "tool_name": "Read"
+    },
+    {
+      "class": "Agent tools (Read, Grep, Glob, Notebook)",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "tool-grep-spoofed-report",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "output_mode": "content",
+        "path": "@ROOT@/data/clients/shape-report.json",
+        "pattern": "ssn"
+      },
+      "tool_name": "Grep"
+    },
+    {
+      "class": "Agent tools (Read, Grep, Glob, Notebook)",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
+      },
+      "id": "tool-read-spoofed-report-unprotected",
+      "sandbox": "**ALLOWED** (design, not run): only a sensitivity pack classifies this file; a path-deny profile covers the configured protected paths",
+      "tool_input": {
+        "file_path": "@ROOT@/exports/client-credentials-report.json"
       },
       "tool_name": "Read"
     },

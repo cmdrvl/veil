@@ -11,6 +11,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::allowlist::DEFAULT_SAFE_PATTERNS;
+use crate::audit::ROTATED_FILES;
+use crate::derived;
 use crate::protected_corpus::CorpusLimits;
 use crate::spine::DeniedFlags;
 
@@ -264,6 +266,12 @@ fn load_config_from_paths(
     Ok(config)
 }
 
+/// The directory of the project config that [`load_config`] uses from
+/// `start_dir`, if there is one.
+pub(crate) fn project_directory(start_dir: &Path) -> io::Result<Option<PathBuf>> {
+    Ok(find_project_config(start_dir)?.and_then(|config| config.parent().map(Path::to_path_buf)))
+}
+
 /// Find the nearest project config above `start_dir`. A nested `.veil.toml`
 /// replaces outer project configs; searching includes the filesystem root.
 fn find_project_config(start_dir: &Path) -> io::Result<Option<PathBuf>> {
@@ -479,10 +487,23 @@ impl Config {
 
 fn default_cmdrvl_config_protection_patterns(home: Option<&Path>) -> Vec<String> {
     let root = cmdrvl_root(home);
+    // veil's derived registry and its key (bd-3qw) are protected one file at a
+    // time: the broker's socket is in the same directory and a sandbox has to
+    // reach it.
+    let state_files = std::iter::once(derived::KEY_FILE.to_owned())
+        .chain(std::iter::once(derived::REGISTRY_FILE.to_owned()))
+        .chain((1..=ROTATED_FILES).map(|index| format!("{}.{index}", derived::REGISTRY_FILE)))
+        .map(|file| {
+            root.join("state/veil")
+                .join(file)
+                .to_string_lossy()
+                .replace('\\', "/")
+        });
 
     DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES
         .iter()
         .map(|subtree| protected_subtree_pattern(&root, subtree))
+        .chain(state_files)
         .collect()
 }
 
@@ -502,7 +523,7 @@ fn protected_with_cmdrvl_profile(existing: &[String], replacement: Vec<String>) 
     protected
 }
 
-fn is_cmdrvl_config_protection_pattern(pattern: &str) -> bool {
+pub(crate) fn is_cmdrvl_config_protection_pattern(pattern: &str) -> bool {
     pattern.starts_with(".cmdrvl/")
         || pattern.starts_with("~/.cmdrvl/")
         || pattern.contains("/.cmdrvl/")
@@ -1120,6 +1141,10 @@ mod tests {
             "/tmp/home/.cmdrvl/receipts/**",
             "/tmp/home/.cmdrvl/migrations/**",
             "/tmp/home/.cmdrvl/notices/**",
+            "/tmp/home/.cmdrvl/state/veil/derived.key",
+            "/tmp/home/.cmdrvl/state/veil/derived.jsonl",
+            "/tmp/home/.cmdrvl/state/veil/derived.jsonl.1",
+            "/tmp/home/.cmdrvl/state/veil/derived.jsonl.5",
         ] {
             assert!(
                 config

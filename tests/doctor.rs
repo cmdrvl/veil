@@ -159,11 +159,24 @@ fn veil_install_adds_the_mcp_hook_and_doctor_then_passes() {
         .iter()
         .map(|entry| entry["matcher"].as_str().expect("matcher"))
         .collect();
-    assert_eq!(matchers, ["Read", "Grep", "Bash", "mcp__.*"]);
+    assert_eq!(
+        matchers,
+        [
+            "Read",
+            "Grep",
+            "Bash",
+            "mcp__.*",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit"
+        ]
+    );
 
     let (code, report) = doctor_json(&home);
     assert_eq!(code, Some(0), "{report}");
     assert_eq!(check(&report, "mcp_hook")["status"], "ok", "{report}");
+    assert_eq!(check(&report, "write_guard")["status"], "ok", "{report}");
 
     // installing again changes nothing
     let again = veil_command_for(&home, "claude-code", &[&empty_bin])

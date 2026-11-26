@@ -5,7 +5,7 @@
 
 Enforcement level today: **hook-only** (advisory; parser-based). `veil` reads the text of a tool call before it runs and decides from the paths that text names. It does not sandbox anything, so anything it cannot see in that text it cannot stop.
 
-207 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **154** are blocked, **25** are still ALLOWED and are listed below (15 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
+210 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **157** are blocked, **25** are still ALLOWED and are listed below (15 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
 
 How to read the columns:
 
@@ -320,6 +320,9 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `tool-read-symlink` | `Read {"file_path":"@ROOT@/alias.csv"}` | blocked: direct_read | blocked (design, not run) | found since |  |
 | `tool-read-hardlink` | `Read {"file_path":"@ROOT@/hard.csv"}` | **ALLOWED**: a hardlink is the same file under an unprotected name | **ALLOWED** (measured, ADR B-1): ADR B-1 measured the hardlink read succeeding | found since |  |
 | `tool-read-control` | `Read {"file_path":"@ROOT@/notes.md"}` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control |
+| `tool-read-spoofed-report` | `Read {"file_path":"@ROOT@/data/clients/shape-report.json"}` | blocked: direct_read | blocked (design, not run) | found since | a protected file's bytes under a tool report's name: the name earns nothing, and only bytes `veil exec` registered are read as derived |
+| `tool-grep-spoofed-report` | `Grep {"pattern":"ssn","path":"@ROOT@/data/clients/shape-report.json","output_mode":"content"}` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `tool-read-spoofed-report-unprotected` | `Read {"file_path":"@ROOT@/exports/client-credentials-report.json"}` | blocked: direct_read | **ALLOWED** (design, not run): only a sensitivity pack classifies this file; a path-deny profile covers the configured protected paths | found since | outside every protected path, where the default allowlist used to trust `*-report.json` ahead of the packs |
 | `tool-notebook-read` | `NotebookRead {"notebook_path":"@ROOT@/data/clients/analysis.ipynb"}` | **ALLOWED, never screened** (the tool is not routed to veil): a notebook's cells are its contents | blocked (design, not run) | found since | `veil install` does not route this tool to veil |
 | `tool-glob` | `Glob {"pattern":"data/**/*.csv","path":"@ROOT@"}` | **ALLOWED, never screened** (the tool is not routed to veil): file names only | not addressed: a listing reads the directory, not the file; whether the profile also denies file metadata is not decided here | found since | `veil install` does not route this tool to veil |
 

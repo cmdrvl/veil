@@ -201,7 +201,7 @@ pub fn rotated_path(path: &Path, index: usize) -> PathBuf {
 /// that find the log full, one rotates it and the rest find it small. Without
 /// that, each of the rest would rotate the fresh, nearly empty log as well, and
 /// every one of those pushes the oldest real file out of the `keep` kept.
-fn rotate_if_full(path: &Path, max_bytes: u64, keep: usize) -> io::Result<()> {
+pub(crate) fn rotate_if_full(path: &Path, max_bytes: u64, keep: usize) -> io::Result<()> {
     if !is_full(path, max_bytes)? {
         return Ok(());
     }

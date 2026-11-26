@@ -38,7 +38,7 @@ not the proof layer for that step. `airlock` owns that boundary attestation.
 ALLOW:  shape client_data.csv        → subprocess, output is schema report
 BLOCK:  cat client_data.csv          → raw data would enter prompt
 BLOCK:  Read tool on client_data.csv → raw data would enter prompt
-ALLOW:  Read tool on shape-report.json → derived artifact, safe
+ALLOW:  Read tool on a report `veil exec` registered → known by its bytes, not its name
 ```
 
 ---
@@ -69,7 +69,7 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 207 vectors run against the real binary, **154** are blocked and **25** are still allowed: 15 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 210 vectors run against the real binary, **157** are blocked and **25** are still allowed: 15 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
@@ -83,7 +83,7 @@ Of 207 vectors run against the real binary, **154** are blocked and **25** are s
 | Dynamic and hidden paths | 6 | 6 | 0 / 0 / 0 | 6 / 0 / 0 |
 | Wrappers and prefixes | 7 | 7 | 0 / 0 / 0 | 7 / 0 / 0 |
 | Git | 8 | 2 | 2 / 3 / 0 | 3 / 4 / 0 |
-| Agent tools (Read, Grep, Glob, Notebook) | 7 | 3 | 2 / 0 / 1 | 4 / 1 / 1 |
+| Agent tools (Read, Grep, Glob, Notebook) | 10 | 6 | 2 / 0 / 1 | 6 / 2 / 1 |
 | MCP tools | 5 | 3 | 1 / 0 / 0 | 0 / 0 / 4 |
 | Authorized tools | 1 | 0 | 0 / 0 / 0 | 0 / 0 / 0 |
 
@@ -132,9 +132,12 @@ The sandbox also stops the confined command from changing the tool executables
 the broker runs and the broker's state under `~/.cmdrvl/state/veil/`. Those
 rules name paths, and a hard link made earlier is another path to the same file,
 so `veil sandbox` does not start when a tool the broker would run has more than
-one; replace the tool with a copy of its own. Each output returned is recorded
-by hash in `derived.jsonl` there, and each call is in the audit log with
-`enforcement: sandbox`, `origin: broker`.
+one; replace the tool with a copy of its own. Nor does it start when the derived
+registry or its key (see [Derived Outputs](#derived-outputs)) is a symlink or has
+a second hard link. Each call that returns output adds one record to that
+registry, and each call is in the audit log with `enforcement: sandbox`,
+`origin: broker`. The confined side cannot read the registry or the key, so a
+hook running inside the sandbox allows nothing on their account.
 
 A confined command reaches no broker but its own session's. Another broker
 answers with its own session's files and policy, which this session may deny, so
@@ -204,6 +207,7 @@ veil hooks into Claude Code's `PreToolUse` event for multiple tool types:
 | `Grep` | Content-mode grep exposing file contents, including a search of a directory that holds protected paths |
 | `Bash` | Common shell-reader patterns that would expose file contents directly, including `grep`, `rg`, `ag`, `ack` and `ugrep` content searches, in every command the line would run (see below) |
 | `mcp__.*` | Paths handed to an MCP tool in its arguments, such as a send-mail attachment or an upload path (see MCP Tools below) |
+| `Write`, `Edit`, `MultiEdit`, `NotebookEdit` | One thing: a write to veil's derived registry or its key (see [Derived Outputs](#derived-outputs)). For any other file veil prints nothing, which is no decision, so Claude Code's own permission rules apply |
 
 Treat `veil` as an operator-first guardrail: it blocks direct reads, then points
 you to the configured authorized path for sensitive-file work instead of
@@ -523,8 +527,9 @@ Limits to know about:
   not a path.
 - veil judges what the agent hands the tool, not what the tool does: a tool that
   reads a protected file on its own, without being given its path, is not seen.
-- Only `mcp__*` tools are routed to veil. `WebFetch`, `NotebookRead` and the other
-  built-in tools that are not Read, Grep or Bash are not.
+- Besides `mcp__*`, `veil install` routes Read, Grep, Bash and the four tools
+  that write files. `WebFetch`, `NotebookRead` and the other built-in tools are
+  not routed to veil.
 - Each string that is not rooted costs one `lstat`, so a call with 10,000 such
   strings takes 50 to 75 ms in a debug build; 10,000 distinct rooted paths take
   about 450 ms, because each goes through the full path evaluation.
@@ -619,6 +624,114 @@ release build on the machine it was measured on, and a command that names two
 files takes about 80 µs; with 10,000 patterns the index build brings the 64-file
 command to about 4.5 ms.
 
+### Derived Outputs
+
+A report is safe to read because of what is in it, not what it is called. The
+default allowlist therefore no longer holds `*-report.json` or `*-report.yaml`,
+and an allowlist pattern never opens a file inside a protected path. Instead,
+`veil exec` records the hash of what it produced, and the hook lets a `Read` or
+`Grep` of a file with exactly those bytes through where a protected path or a
+sensitivity pack would otherwise deny it.
+
+```bash
+veil exec shape data/clients/holdings.csv > data/clients/shape.json
+veil exec profile data/clients/holdings.csv --out data/clients/profile.json
+veil derived verify data/clients/shape.json   # exit 0: registered; exit 1: not
+veil derived list                             # add --json for either
+```
+
+`veil derived` is a report for you, behind the same guard preflight as `veil
+audit`. When an agent runs `veil derived verify` on a protected path, the hook
+judges it like any other command that names the path, and denies it.
+
+**What is registered.** Each call that returns output adds one record. The record
+can unlock two things:
+
+- standard output on its own, as a shell redirect saves it;
+- outside a sandbox, each file the tool made under `--out` or `--output`. The
+  path must not have existed before the run, the tool must exit 0 or 1, and one
+  call registers at most 256 files and 64 MiB. Inside a sandbox a brokered tool
+  can write no file.
+
+Each of these is registered only if **all** of the following hold. Otherwise the
+output is still delivered, and `veil exec` says on standard error that it is
+`not registered as derived`, and why.
+
+- It is text of at most 16 MiB, and no output detector flags it.
+- It is not a copy of, and repeats no text of, a file veil would not show. veil
+  compares it with each file named on the command line (or inside a directory
+  named there) that a `Read` would be denied, and with every file under the
+  configured `[sensitivity] protected` patterns. Before comparing, it folds ASCII
+  letters to lower case and collapses runs of whitespace. A shared run of 95
+  characters is always caught; for output under 64 characters, a shared run of
+  24 is. Shorter output is caught when it is a whole copy. A file whose bytes the
+  registry already holds does not count, so one report does not block the next.
+- veil could make that whole comparison. More than 10,000 files or 1 GiB to
+  compare, more than 100,000 directory entries to walk, or a file that changes
+  while the tool runs, registers nothing. In a project with more protected data
+  than that, nothing is registered. A bare name pattern such as `*.nport.xml`
+  covers the whole project, so veil walks all of it (build output and
+  dependencies included) from the directory that holds `.veil.toml`.
+
+The comparison goes by text, so a new report that shares a run of text with a
+protected file veil has *not* registered (an older report another program made,
+say) is not registered either.
+
+**Who can use a record.** Only `Read`, and `Grep` of that one file: not `cat`,
+not a search of a directory, not `veil test`. The file is hashed when the hook
+runs, so one changed byte makes it a different file, and a file over 64 MiB is
+denied as `too_large_to_verify`. A record is usable in the harness session that
+made it (Claude Code gives `veil exec` the id its hooks receive, in
+`CLAUDE_CODE_SESSION_ID`). `veil exec --persist <tool> ...` keeps it for later
+sessions. Where there is no session id, and for calls made through a sandbox
+broker, only `--persist` records can be used by a hook.
+
+**Keeping the registry honest.** A record turns a deny into an allow, so a line
+appended to the registry by hand, by a redirection or by another program does
+nothing: every record carries a MAC under a key in
+`~/.cmdrvl/state/veil/derived.key`, which only its owner may read.
+
+- No policy mode, allowlist pattern or authorized tool opens the registry or the
+  key. The hook denies a `Read`, `Grep`, `Bash` or MCP call that would read
+  either one, or a directory that holds them, including through a glob, a
+  symlink or a hard link. It denies `Write`, `Edit`, `MultiEdit`, `NotebookEdit`
+  and shell redirections that would write them.
+- `veil exec` refuses arguments that reach veil's state directory.
+- A registry or key that is a symlink or has a second hard link, or a key that
+  anyone but its owner can access, allows nothing. `veil exec` then returns no
+  output, and `veil sandbox` does not start.
+- The registry rotates like the audit log: at 10 MiB, keeping five older files.
+  Records in the oldest are forgotten.
+
+An install made before this has no hooks for the four writing tools. `veil
+doctor` reports that as the `write_guard` check until `veil install` is run
+again.
+
+**What stays possible.** The registry is exactly as good as the checks above:
+
+- A tool can put protected values into output in a shape that neither a detector
+  nor the text comparison sees: columns dropped or reordered, values re-encoded
+  or quoted one at a time inside a summary. Printed output of that kind has
+  already reached the agent. **A file written under `--out` has not**, and
+  registering it lets the agent read it. Do not authorize a tool whose options
+  write slices of its input if that matters to you, or deny those options in
+  `[spine.denied_flags]`.
+- Only files named on the command line and files under your `protected` patterns
+  are compared. A file that only a sensitivity pack classifies, or one in veil's
+  built-in `~/.cmdrvl/` paths, is compared only when it is named.
+- Anything that writes files without a veil hook can replace the key and then
+  forge records: another harness, an install without the write hooks, an MCP tool
+  veil is told not to screen, a script that builds the path while it runs, or
+  any process of yours outside the harness. The same ability can edit
+  `.veil.toml` or the harness settings and turn veil off. veil does not guard
+  those two from writes.
+- Session expiry limits how long a record lasts. It is not a security boundary:
+  a command the agent writes can set the variable or pass `--persist`.
+- The hook hashes the file before the harness reads it. A process that changes
+  the file between the two is not caught.
+- `rm`, `touch` and `chmod` on the key or registry are not denied. They can stop
+  records working; they cannot make one.
+
 ### Audit Log
 
 With `audit_log = true` veil appends one line of JSON per path it judged to
@@ -694,7 +807,6 @@ require_dcg = false
 safe_patterns = [
     "*.md", "*.toml", "*.lock",
     "docs/**", "tests/**", ".github/**",
-    "*-report.json", "*-report.yaml",
     "package.json", "tsconfig.json",
     "Cargo.toml", "Cargo.lock",
 ]
@@ -806,10 +918,11 @@ says. Screening the body of an outbound message is a separate surface; see
 
 ### Doctor Mode
 
-`veil doctor` is read-only. It inspects local configuration, the audit path, and
-managed Claude Read/Grep/Bash hook state, and the `mcp__.*` hook that screens MCP
-tool calls, without installing hooks, rewriting
-settings, appending audit records, or using the network.
+`veil doctor` is read-only. It inspects local configuration, the audit path,
+managed Claude Read/Grep/Bash hook state, the `mcp__.*` hook that screens MCP
+tool calls (`mcp_hook`) and the hooks that keep the writing tools off the derived
+registry (`write_guard`), without installing hooks, rewriting settings,
+appending audit records, or using the network.
 
 ```bash
 veil doctor                       # human report
@@ -852,13 +965,18 @@ When a sensitive-file read is blocked:
 ```
 File access attempt (Read/Grep/Bash)
     │
-    ├── Allowlist check → safe pattern? → ALLOW (silent)
+    ├── veil's derived registry or key? → DENY (nothing waives this)
+    │
+    ├── Outside protected paths, and a safe pattern? → ALLOW (silent)
     │
     ├── Protected-dir / sensitivity check
     │       │
     │       ├── Is this a spine tool subprocess? → ALLOW (audit log)
     │       │
     │       └── Direct read into context? → policy default (deny|warn|log)
+    │               │
+    │               └── Would deny a Read or Grep of one file whose bytes
+    │                   `veil exec` registered? → ALLOW (audit log: derived)
     │
     └── Unknown file outside protected dirs → ALLOW
 ```
@@ -871,8 +989,8 @@ File access attempt (Read/Grep/Bash)
 - Operator/domain commands run a harness-aware guard preflight:
   - Under **Claude Code**, they fail closed unless the active Claude `PreToolUse`
     settings contain healthy `veil` Read/Grep/Bash hooks. The `mcp__.*` hook
-    is not a precondition: `veil doctor` reports it, operator commands do not
-    refuse for it.
+    and the hooks for the writing tools are not preconditions: `veil doctor`
+    reports them, operator commands do not refuse for them.
   - Under **Codex, Gemini CLI, Cursor, or a plain shell/CI sandbox**, Claude
     settings are not consulted; veil reports its hook wiring as `unverified`
     rather than blocking.

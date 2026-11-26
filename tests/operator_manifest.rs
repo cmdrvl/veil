@@ -208,6 +208,10 @@ fn planted_bad_manifests_are_rejected() {
 // ---- --schema -------------------------------------------------------------
 
 fn run_hook(home: &Path, payload: &Value) -> Value {
+    serde_json::from_slice(&hook_stdout(home, payload)).expect("hook stdout should be JSON")
+}
+
+fn hook_stdout(home: &Path, payload: &Value) -> Vec<u8> {
     let mut child = veil(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -222,7 +226,7 @@ fn run_hook(home: &Path, payload: &Value) -> Value {
         .expect("payload should be written");
     let output = child.wait_with_output().expect("hook mode should finish");
     assert_eq!(output.status.code(), Some(0), "hook decisions exit 0");
-    serde_json::from_slice(&output.stdout).expect("hook stdout should be JSON")
+    output.stdout
 }
 
 /// Does `value` satisfy the object shape (required keys present, only known keys) of `definition`?
@@ -310,6 +314,15 @@ fn real_hook_decisions_match_the_schema_and_a_bad_one_does_not() {
         }
     }
     assert_eq!(saw_deny, 2, "both protected-path payloads must be denied");
+
+    // a write veil has no say about gets no output at all, which Claude Code
+    // documents as no decision: its own permission rules apply
+    let write = hook_stdout(
+        &home,
+        &json!({"session_id":"s","cwd":cwd,"hook_event_name":"PreToolUse","tool_name":"Write",
+                "tool_input":{"file_path": format!("{cwd}/notes.txt"), "content": "x"}}),
+    );
+    assert_eq!(String::from_utf8_lossy(&write), "");
 
     // Planted negatives: shapes the schema must not accept.
     for bad in [

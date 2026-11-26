@@ -30,6 +30,15 @@ pub fn render_decision(protocol: HookProtocol, decision: &Decision) -> RenderedD
     RenderedDecision { stdout, stderr }
 }
 
+/// No output at all, which Claude Code documents as no decision: its own
+/// permission rules decide the call. Only a Claude Code write tool gets this.
+pub fn render_no_decision() -> RenderedDecision {
+    RenderedDecision {
+        stdout: String::new(),
+        stderr: None,
+    }
+}
+
 fn render_claude_stdout(decision: &Decision) -> String {
     let mut payload = json!({
         "hookSpecificOutput": {

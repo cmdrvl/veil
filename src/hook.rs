@@ -268,6 +268,7 @@ fn normalize_tool_kind(protocol: HookProtocol, name: &str) -> Result<ToolKind, H
             "read" => ToolKind::Read,
             "grep" => ToolKind::Grep,
             "bash" => ToolKind::Bash,
+            "write" | "edit" | "multiedit" | "notebookedit" => ToolKind::Write,
             _ if is_mcp_tool_name(name) => ToolKind::Mcp,
             _ => {
                 return Err(HookParseError::new(format!(

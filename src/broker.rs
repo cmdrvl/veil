@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,12 +16,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::audit::{AuditRecord, append_audit_record_with_enforcement};
 use crate::broker_output::{BrokerOutputScanner, MAX_BROKER_OUTPUT_BYTES};
 use crate::config::{self, Config};
+use crate::derived::{self, OutTargets, Sources, VeilState, Written};
 use crate::sandbox::seatbelt;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -30,6 +31,7 @@ const OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 const MAX_SESSION_CALLS: usize = 64;
 const MAX_ARGUMENTS: usize = 256;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
+const MAX_NOTE_CHARS: usize = 2000;
 pub(crate) const BROKER_SOCKET_ENV: &str = "VEIL_BROKER_SOCKET";
 const BROKER_SESSION_ENV: &str = "VEIL_BROKER_SESSION";
 const DERIVED_TOOLS: &[&str] = &[
@@ -57,6 +59,9 @@ struct BrokerRequest {
     /// be inside the directory the broker was started in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cwd: Option<PathBuf>,
+    /// The derived-registry entry for this call outlives its session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    persist: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +80,9 @@ struct ToolResult {
     stderr: Vec<u8>,
     exit_code: i32,
     error: Option<FrameError>,
+    /// What `veil exec` tells the caller about the derived registry, on its own
+    /// standard error: never part of the tool's output.
+    notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -114,8 +122,14 @@ impl BrokerContext {
             session,
             executables,
             scanner: BrokerOutputScanner::new(),
-            derived_path: state_dir.join("derived.jsonl"),
+            derived_path: state_dir.join(derived::REGISTRY_FILE),
         })
+    }
+
+    /// veil's registry and key, which no brokered tool is handed (bd-3qw): a
+    /// tool told to write there could put the caller's key in place.
+    fn state(&self) -> VeilState {
+        VeilState::at(self.derived_path.parent().unwrap_or(Path::new(".")))
     }
 
     fn process(&self, request: BrokerRequest, enforcement: &str, origin: &str) -> ToolResult {
@@ -147,9 +161,16 @@ impl BrokerContext {
         };
 
         let ran = self.working_directory(&request).and_then(|cwd| {
+            if self.state().is_reached_by(&cwd, &request.argv) {
+                return Err("broker_veil_state_forbidden");
+            }
+            // noted before the tool runs: what it could copy and what it makes
+            let sources = Sources::before(&self.config, &self.cwd, &cwd, &request.argv);
+            let targets = OutTargets::before(&cwd, &request.argv);
             run_bounded(tool_command(executable, enforcement), &request.argv, &cwd)
+                .map(|output| (sources, targets, output))
         });
-        let (stdout, stderr, exit_code) = match ran {
+        let (sources, targets, (stdout, stderr, exit_code)) = match ran {
             Ok(result) => result,
             Err(code) => {
                 if self
@@ -260,37 +281,45 @@ impl BrokerContext {
                     code: "broker_output_denied".to_owned(),
                     findings: Some(details),
                 }),
+                notes: Vec::new(),
             };
         }
 
-        let argv_hash = input_hash.clone();
-        if append_derived(
-            &self.derived_path,
-            &output_hash,
-            &request.tool,
-            &argv_hash,
-            &self.session,
-        )
-        .is_err()
-        {
-            if self
-                .audit(
-                    &request.tool,
-                    &input_hash,
-                    &output_hash,
-                    output_bytes,
-                    "deny",
-                    Some("broker_derived_registry_failed"),
-                    "protected",
-                    enforcement,
-                    origin,
-                )
-                .is_err()
-            {
-                return ToolResult::denied("broker_audit_failed");
+        let record = derived::Record {
+            hash: output_hash.clone(),
+            files: Vec::new(),
+            tool: request.tool.clone(),
+            argv_hash: input_hash.clone(),
+            session: self.session.clone(),
+            persist: request.persist,
+            ts: timestamp(),
+            mac: String::new(),
+        };
+        let notes = match self.register(record, &sources, &targets, &stdout, exit_code) {
+            Ok(notes) => notes,
+            Err(why) => {
+                if self
+                    .audit(
+                        &request.tool,
+                        &input_hash,
+                        &output_hash,
+                        output_bytes,
+                        "deny",
+                        Some("broker_derived_registry_failed"),
+                        "protected",
+                        enforcement,
+                        origin,
+                    )
+                    .is_err()
+                {
+                    return ToolResult::denied("broker_audit_failed");
+                }
+                return ToolResult {
+                    notes: vec![why],
+                    ..ToolResult::denied("broker_derived_registry_failed")
+                };
             }
-            return ToolResult::denied("broker_derived_registry_failed");
-        }
+        };
 
         if self
             .audit(
@@ -314,7 +343,57 @@ impl BrokerContext {
             stderr,
             exit_code,
             error: None,
+            notes,
         }
+    }
+
+    /// Appends the call's one record. Besides the hash of the whole output it
+    /// lists what a Read may later be allowed for: stdout and the files the
+    /// tool made under `--out`, each only if [`Sources::judge`] passes it.
+    /// Returns what to tell the caller about the rest.
+    fn register(
+        &self,
+        mut record: derived::Record,
+        sources: &Sources,
+        targets: &OutTargets,
+        stdout: &[u8],
+        exit_code: i32,
+    ) -> Result<Vec<String>, String> {
+        let registry = derived::Registry::at(self.derived_path.clone());
+        registry.check()?;
+
+        let mut notes = targets.notes.clone();
+        // 0 and 1 are a spine tool's two verdicts; past them it did not finish
+        // and what it left behind is not an output
+        let written = if matches!(exit_code, 0 | 1) {
+            targets.written()
+        } else {
+            if !targets.written().files.is_empty() {
+                notes.push(format!(
+                    "not registered as derived: the tool exited {exit_code}, so nothing it wrote is registered"
+                ));
+            }
+            Written::default()
+        };
+        notes.extend(written.notes.iter().cloned());
+
+        let candidates: Vec<&[u8]> = std::iter::once(stdout)
+            .chain(written.files.iter().map(|(_, bytes)| bytes.as_slice()))
+            .collect();
+        let verdicts = sources.judge(&self.scanner, &registry, &candidates);
+        let names = std::iter::once(None).chain(written.files.iter().map(|(path, _)| Some(path)));
+        for (name, verdict) in names.zip(verdicts) {
+            match (verdict, name) {
+                (Ok(digest), _) => record.files.push(digest),
+                (Err(why), Some(path)) => notes.push(derived::not_registered(path, &why)),
+                // a tool that printed nothing has nothing to be told about
+                (Err(_), None) if stdout.is_empty() => {}
+                (Err(why), None) => notes.push(format!("not registered as derived: stdout: {why}")),
+            }
+        }
+
+        registry.append(record)?;
+        Ok(notes)
     }
 
     /// The directory the tool runs in, with symlinks resolved before it is
@@ -424,6 +503,7 @@ impl ToolResult {
                 code: code.to_owned(),
                 findings: None,
             }),
+            notes: Vec::new(),
         }
     }
 }
@@ -490,6 +570,16 @@ pub fn sandbox_write_denials(
             files.push(fs::canonicalize(parent)?.join(file));
         }
     }
+    // a hard link made before the session is a second name for the registry or
+    // its key that the write denials below do not cover (bd-oao)
+    derived::Registry::at(state_dir.join(derived::REGISTRY_FILE))
+        .check()
+        .map_err(|why| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the sandbox cannot protect veil's derived registry: {why}"),
+            )
+        })?;
 
     seatbelt::write_denials(&files, &[fs::canonicalize(state_dir)?])
 }
@@ -608,18 +698,26 @@ fn handle_connection(mut stream: UnixStream, context: &BrokerContext, limit_reac
 
 /// Send a `veil exec` call through the session broker, or use the same
 /// authorization/scanning path directly when no sandbox session is active.
-pub fn run_exec(tool: String, argv: Vec<String>) -> Result<i32, Box<dyn std::error::Error>> {
+pub fn run_exec(
+    tool: String,
+    argv: Vec<String>,
+    persist: bool,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let request = BrokerRequest {
         tool,
         argv,
         cwd: Some(env::current_dir()?),
+        persist,
     };
     // Direct mode confines nothing, so it has no project directory to hold the
     // client to: the context is loaded where the client stands.
     let result = if let Some(socket) = env::var_os(BROKER_SOCKET_ENV) {
         request_over_socket(&PathBuf::from(socket), &request)?
     } else {
-        let session = format!("direct-{}", std::process::id());
+        // the harness session, when it says: its Reads are what may use this
+        // call's registry entry
+        let session =
+            derived::harness_session().unwrap_or_else(|| format!("direct-{}", std::process::id()));
         let context = BrokerContext::load(session)?;
         context.process(request, "direct", "direct_exec")
     };
@@ -629,11 +727,18 @@ pub fn run_exec(tool: String, argv: Vec<String>) -> Result<i32, Box<dyn std::err
         if let Some(findings) = error.findings {
             eprintln!("detector findings: {}", serde_json::to_string(&findings)?);
         }
+        for note in &result.notes {
+            eprintln!("veil exec: {note}");
+        }
         return Ok(result.exit_code);
     }
 
     io::stdout().write_all(&result.stdout)?;
+    io::stdout().flush()?;
     io::stderr().write_all(&result.stderr)?;
+    for note in &result.notes {
+        eprintln!("veil exec: {note}");
+    }
     Ok(result.exit_code)
 }
 
@@ -679,6 +784,7 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>, &'static 
 }
 
 fn write_result(stream: &mut UnixStream, result: ToolResult) -> io::Result<()> {
+    write_notes(stream, &result.notes)?;
     if result.error.is_some() {
         return write_final(stream, &result);
     }
@@ -716,9 +822,22 @@ fn write_final_code(
     stream.write_all(b"\n")
 }
 
+/// One frame for each note, ahead of the final one, so that no frame grows past
+/// what the client reads.
+fn write_notes(stream: &mut UnixStream, notes: &[String]) -> io::Result<()> {
+    for note in notes {
+        let note: String = note.chars().take(MAX_NOTE_CHARS).collect();
+        serde_json::to_writer(&mut *stream, &json!({"note": note}))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        stream.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 fn read_result(reader: &mut BufReader<UnixStream>) -> io::Result<ToolResult> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let mut notes = Vec::new();
     loop {
         let mut line = Vec::new();
         let read = reader
@@ -759,6 +878,10 @@ fn read_result(reader: &mut BufReader<UnixStream>) -> io::Result<ToolResult> {
             }
             continue;
         }
+        if let Some(note) = frame.get("note").and_then(Value::as_str) {
+            notes.push(note.to_owned());
+            continue;
+        }
 
         let exit_code = frame
             .get("exit_code")
@@ -776,6 +899,7 @@ fn read_result(reader: &mut BufReader<UnixStream>) -> io::Result<ToolResult> {
             stderr,
             exit_code,
             error,
+            notes,
         });
     }
 }
@@ -923,35 +1047,6 @@ fn hash_streams(stdout: &[u8], stderr: &[u8]) -> String {
     boundary_detectors::hash_match(&output)
 }
 
-fn append_derived(
-    path: &Path,
-    output_hash: &str,
-    tool: &str,
-    argv_hash: &str,
-    session: &str,
-) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_private_directory(parent)?;
-    }
-    let record = json!({
-        "hash": output_hash,
-        "tool": tool,
-        "argv_hash": argv_hash,
-        "session": session,
-        "ts": timestamp(),
-    });
-    let mut line = serde_json::to_vec(&record)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    line.push(b'\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(&line)?;
-    file.flush()
-}
-
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     let metadata = fs::symlink_metadata(path)?;
@@ -1086,6 +1181,7 @@ mod properties {
                 tool: "shape".to_owned(),
                 argv: vec![output.clone()],
                 cwd: None,
+                persist: false,
             };
 
             // through the socket framing, which is how output enters a sandbox

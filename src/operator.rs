@@ -1129,6 +1129,7 @@ fn build_doctor_report(
     let posture = hooks::inspect_guard_posture(harness, require_dcg, settings_path, search_path);
     checks.push(hooks_doctor_check(&posture));
     checks.extend(mcp_hook_doctor_check(&posture, mcp_screen));
+    checks.extend(write_guard_doctor_check(&posture));
 
     DoctorReport {
         checks,
@@ -1194,6 +1195,42 @@ fn mcp_hook_doctor_check(posture: &hooks::GuardPosture, screen: bool) -> Option<
                     .to_owned(),
             ),
         },
+    })
+}
+
+/// Whether the tools that write files are hooked, which is what keeps them
+/// from veil's derived registry and its key (bd-3qw). Like `mcp_hook`, it is no
+/// precondition for operator commands, and it is absent where `hooks` already
+/// says veil cannot read the hook configuration.
+fn write_guard_doctor_check(posture: &hooks::GuardPosture) -> Option<DoctorCheck> {
+    let (Some(veil), Some(path)) = (&posture.veil, &posture.settings_path) else {
+        return None;
+    };
+    let name = "write_guard";
+    let unguarded = veil.unguarded_write_tools();
+
+    Some(if unguarded.is_empty() {
+        DoctorCheck {
+            name,
+            status: DoctorStatus::Ok,
+            detail: format!(
+                "{} are hooked in {}, so they cannot write veil's derived registry or its key",
+                hooks::WRITE_MATCHERS.join(", "),
+                path.display()
+            ),
+            remediation: None,
+        }
+    } else {
+        DoctorCheck {
+            name,
+            status: DoctorStatus::ActionNeeded,
+            detail: format!(
+                "no working PreToolUse hook for {} in {}, so veil's derived registry and its key are not kept from those tools",
+                unguarded.join(", "),
+                path.display()
+            ),
+            remediation: Some("run `veil install` to add the managed hook entries".to_owned()),
+        }
     })
 }
 
@@ -1470,6 +1507,10 @@ fn render_robot_docs_guide() -> String {
         "- dcg is optional: set `[policy] require_dcg = true` to make a healthy dcg a hard requirement.",
         "- `veil doctor --json` and `veil doctor triage --json` report the detected harness and `guard_posture`; `veil doctor` and `veil doctor --json` also say `enforcement: hook-only (advisory; parser-based)`, because nothing in veil enforces an OS sandbox. Set `VEIL_HARNESS` (claude-code, codex, gemini-cli, cursor, plain) to override detection.",
         "- `veil doctor`, `veil capabilities --json`, `veil --describe`, `veil robot-docs guide`, `veil install`, and `veil uninstall` remain available for maintenance.",
+        "",
+        "Derived outputs:",
+        "- A report from `veil exec <tool> ...` can be read with Read or Grep even when it is saved in a protected directory: veil knows it by its bytes, not its name. The entry lasts for the harness session; `veil exec --persist` keeps it.",
+        "- Output that repeats text of a protected file is delivered but not registered; veil says why on stderr. `veil derived verify PATH` says whether a file's bytes are registered.",
         "",
         "Composition:",
         "- Use `dcg` to block destructive shell commands.",
@@ -2041,6 +2082,11 @@ fn doctor_capabilities_json_value() -> Value {
             {
                 "name": "mcp_hook",
                 "description": "Inspects the managed Claude `mcp__.*` PreToolUse hook entry that sends MCP tool calls to veil, and its executable resolution. Not required by operator preflight; reported ok when `[mcp] screen = false`.",
+                "writes": false
+            },
+            {
+                "name": "write_guard",
+                "description": "Inspects the managed Claude Write/Edit/MultiEdit/NotebookEdit PreToolUse hook entries that keep those tools from veil's derived registry and its key, and their executable resolution. Not required by operator preflight.",
                 "writes": false
             }
         ],
@@ -2747,7 +2793,11 @@ mod tests {
                       {{ "type": "command", "command": "{}" }}
                     ]
                   }},
-                  {{ "matcher": "mcp__.*", "hooks": [{{ "type": "command", "command": "{}" }}] }}
+                  {{ "matcher": "mcp__.*", "hooks": [{{ "type": "command", "command": "{}" }}] }},
+                  {{ "matcher": "Write", "hooks": [{{ "type": "command", "command": "{}" }}] }},
+                  {{ "matcher": "Edit", "hooks": [{{ "type": "command", "command": "{}" }}] }},
+                  {{ "matcher": "MultiEdit", "hooks": [{{ "type": "command", "command": "{}" }}] }},
+                  {{ "matcher": "NotebookEdit", "hooks": [{{ "type": "command", "command": "{}" }}] }}
                 ]
               }}
             }}"#,
@@ -2755,6 +2805,10 @@ mod tests {
                 executable_path.display(),
                 executable_path.display(),
                 dcg_path.display(),
+                executable_path.display(),
+                executable_path.display(),
+                executable_path.display(),
+                executable_path.display(),
                 executable_path.display()
             ),
         );
@@ -2791,9 +2845,83 @@ mod tests {
                 .iter()
                 .filter(|check| check["status"] == "ok")
                 .count(),
-            4,
-            "config, audit, hooks and mcp_hook"
+            5,
+            "config, audit, hooks, mcp_hook and write_guard"
         );
+    }
+
+    fn write_guard_check(report: &DoctorReport) -> &DoctorCheck {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "write_guard")
+            .expect("a Claude Code report has a write_guard check")
+    }
+
+    #[test]
+    fn doctor_names_the_write_tools_without_a_hook_and_preflight_still_passes() {
+        let repo_root = unique_temp_dir("doctor-no-write-guard");
+        let executable_path = repo_root.join("bin/veil");
+        create_executable(&executable_path);
+        let command = executable_path.display().to_string();
+        // an install made before bd-3qw: nothing for the tools that write
+        let settings_path = settings_with_hooks(&repo_root, &command, Some(&command));
+        let report = |path: &Path| {
+            build_doctor_report(
+                &repo_root,
+                SettingsPathStatus::Resolved(path.to_path_buf()),
+                hooks::Harness::ClaudeCode,
+                None,
+            )
+        };
+
+        let before = report(&settings_path);
+        let check = write_guard_check(&before);
+        assert_eq!(check.status, DoctorStatus::ActionNeeded);
+        assert!(
+            check
+                .detail
+                .contains("Write, Edit, MultiEdit, NotebookEdit"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|remediation| remediation.contains("veil install")),
+            "{:?}",
+            check.remediation
+        );
+        assert_eq!(before.exit_code(), 1);
+        // not a precondition for operator commands
+        let posture = hooks::inspect_guard_posture(
+            hooks::Harness::ClaudeCode,
+            false,
+            Ok(settings_path.clone()),
+            None,
+        );
+        assert!(posture.is_healthy(), "{:?}", posture.blockers());
+
+        // two of the four hooked, one of them with a command that is not there
+        let mut settings: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("settings"))
+                .expect("settings are JSON");
+        let entries = settings["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .expect("hook entries");
+        for (matcher, command) in [("Write", command.as_str()), ("Edit", "/missing/veil")] {
+            entries.push(json!({
+                "matcher": matcher,
+                "hooks": [{"type": "command", "command": command}],
+            }));
+        }
+        fs::write(&settings_path, settings.to_string()).expect("settings");
+
+        let partly = report(&settings_path);
+        let detail = &write_guard_check(&partly).detail;
+        assert!(detail.contains("Edit, MultiEdit, NotebookEdit"), "{detail}");
+        assert!(!detail.contains("Write"), "{detail}");
     }
 
     #[test]

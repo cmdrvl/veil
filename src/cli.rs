@@ -156,12 +156,45 @@ pub struct SandboxArgs {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
-#[command(trailing_var_arg = true)]
+#[command(override_usage = "veil exec [--persist] <TOOL> [ARGS]...")]
 pub struct ExecArgs {
-    #[arg(value_name = "TOOL")]
-    pub tool: String,
-    #[arg(value_name = "ARGS", allow_hyphen_values = true, num_args = 0..)]
-    pub args: Vec<String>,
+    #[arg(
+        long,
+        help = "Let the output stay readable as derived after this session ends"
+    )]
+    pub persist: bool,
+    /// The tool and its arguments. One positional, so that every word from the
+    /// tool's name on is the tool's, one spelled like veil's flag included.
+    #[arg(
+        value_name = "TOOL",
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub command: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct DerivedArgs {
+    #[command(subcommand)]
+    pub action: DerivedAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum DerivedAction {
+    #[command(about = "List the derived registry's records")]
+    List(JsonOutputArgs),
+    #[command(about = "Say whether a file's bytes are registered; exit 0 only if they are")]
+    Verify(DerivedVerifyArgs),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct DerivedVerifyArgs {
+    #[arg(help = "File to hash and look up")]
+    pub path: PathBuf,
+    #[arg(long, help = "Emit machine-readable JSON")]
+    pub json: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
@@ -188,6 +221,8 @@ pub enum OperatorCommand {
     Sandbox(SandboxArgs),
     #[command(about = "Run an authorized metadata tool through the broker")]
     Exec(ExecArgs),
+    #[command(about = "Inspect the registry of derived outputs")]
+    Derived(DerivedArgs),
     #[command(about = "List built-in sensitivity packs")]
     Packs(JsonOutputArgs),
     #[command(about = "Show the merged active configuration")]
@@ -339,11 +374,57 @@ mod tests {
     fn exec_forwards_tool_arguments_in_typed_positions() {
         assert_eq!(
             parse(&["veil", "exec", "shape", "--explicit", "private.csv"]),
-            Dispatch::Operator(OperatorCommand::Exec(ExecArgs {
-                tool: "shape".to_owned(),
-                args: vec!["--explicit".to_owned(), "private.csv".to_owned()],
+            exec(false, &["shape", "--explicit", "private.csv"])
+        );
+    }
+
+    fn exec(persist: bool, command: &[&str]) -> Dispatch {
+        Dispatch::Operator(OperatorCommand::Exec(ExecArgs {
+            persist,
+            command: command.iter().map(|word| (*word).to_owned()).collect(),
+        }))
+    }
+
+    #[test]
+    fn exec_takes_persist_only_before_the_tool() {
+        assert_eq!(
+            parse(&["veil", "exec", "--persist", "shape", "private.csv"]),
+            exec(true, &["shape", "private.csv"])
+        );
+        // after the tool name every word is the tool's, this one included
+        for words in [
+            ["shape", "--persist", "private.csv"],
+            ["shape", "private.csv", "--persist"],
+            ["shape", "--help", "--version"],
+            ["shape", "--", "-x"],
+        ] {
+            assert_eq!(
+                parse(&["veil", "exec", words[0], words[1], words[2]]),
+                exec(false, &words)
+            );
+        }
+        assert!(Cli::try_parse_from(["veil", "exec"]).is_err());
+        assert!(Cli::try_parse_from(["veil", "exec", "--persist"]).is_err());
+    }
+
+    #[test]
+    fn derived_subcommands_list_and_verify() {
+        assert_eq!(
+            parse(&["veil", "derived", "list", "--json"]),
+            Dispatch::Operator(OperatorCommand::Derived(DerivedArgs {
+                action: DerivedAction::List(JsonOutputArgs { json: true }),
             }))
         );
+        assert_eq!(
+            parse(&["veil", "derived", "verify", "report.json"]),
+            Dispatch::Operator(OperatorCommand::Derived(DerivedArgs {
+                action: DerivedAction::Verify(DerivedVerifyArgs {
+                    path: PathBuf::from("report.json"),
+                    json: false,
+                }),
+            }))
+        );
+        assert!(Cli::try_parse_from(["veil", "derived"]).is_err());
     }
 
     #[test]
@@ -425,6 +506,7 @@ mod tests {
             "scan",
             "sandbox",
             "exec",
+            "derived",
             "packs",
             "config",
             "audit",

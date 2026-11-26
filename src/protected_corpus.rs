@@ -567,7 +567,7 @@ fn priority(salt: &[u8; 16], key: &Path) -> u64 {
 /// The literal directory (or file) each absolute pattern starts from, so a
 /// protected tree outside the repo root is walked too. Never the filesystem
 /// root: a pattern like `/*.pem` is not walked from `/`.
-fn absolute_pattern_roots(patterns: &[String]) -> Vec<PathBuf> {
+pub(crate) fn absolute_pattern_roots(patterns: &[String]) -> Vec<PathBuf> {
     let mut roots = BTreeSet::new();
     for pattern in patterns {
         let pattern = pattern.replace('\\', "/");

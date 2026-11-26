@@ -23,7 +23,9 @@
       "veil sandbox --print-profile",
       "veil sandbox --dry-run",
       "veil sandbox -- <command> [args...]",
-      "veil exec <tool> [args...]",
+      "veil exec [--persist] <tool> [args...]",
+      "veil derived list [--json]",
+      "veil derived verify <PATH> [--json]",
       "veil packs [--json]",
       "veil config [--json]",
       "veil audit [--json] [--class <class> | --validate]",
@@ -110,9 +112,22 @@
         { "name": "tool", "type": "string", "position": 0, "required": true, "description": "Configured authorized spine tool basename" },
         { "name": "args", "type": "string[]", "position": 1, "required": false, "description": "Typed tool arguments; never parsed as shell text" }
       ],
+      "options": [
+        { "name": "persist", "flag": "--persist", "type": "flag", "description": "Keep this call's derived-registry entry usable after the harness session ends. Goes before the tool name; a --persist after it belongs to the tool" }
+      ],
       "read_only": false,
       "guard_preflight_required": false,
-      "notes": "Denied raw-output flags, shell metacharacters, unknown tools, oversized requests, and detector findings are refused. Broker calls are bounded and audited with input/output hashes; returned outputs are recorded in the derived registry."
+      "notes": "Denied raw-output flags, shell metacharacters, unknown tools, oversized requests, arguments that reach veil's state directory, and detector findings are refused. Broker calls are bounded and audited with input/output hashes. Each delivered result appends one record to the derived registry. It registers stdout, and any file a direct-mode call newly made under --out or --output, only when the detectors pass it and it repeats no text of a protected file; the rest is reported on stderr as 'not registered as derived'. Output is still delivered when it is not registered."
+    },
+    {
+      "name": "derived",
+      "description": "Report on the derived registry (~/.cmdrvl/state/veil/derived.jsonl): the content hashes veil exec registered, which let a Read or Grep of a file with the same bytes through where a protected-path rule would deny it.",
+      "subcommands": ["list", "verify"],
+      "arguments": [{ "name": "path", "type": "file_path", "position": 0, "required": false, "description": "verify only: the file to hash and look up" }],
+      "options": [{ "name": "json", "flag": "--json", "type": "flag", "description": "Emit machine-readable JSON" }],
+      "read_only": true,
+      "guard_preflight_required": true,
+      "notes": "`derived verify` exits 0 when a record with a valid MAC registers the file's content and 1 otherwise. It does not say whether the current session may use that record. From a hooked session, a Bash call that names a protected path is judged as a read whichever command names it, this one included."
     },
     {
       "name": "packs",
@@ -163,7 +178,7 @@
     },
     {
       "name": "install",
-      "description": "Install the managed veil Read/Grep/Bash PreToolUse hook entries into Claude settings (~/.claude/settings.json, or VEIL_CLAUDE_SETTINGS_PATH).",
+      "description": "Install the managed veil PreToolUse hook entries (Read, Grep, Bash, mcp__.*, Write, Edit, MultiEdit, NotebookEdit) into Claude settings (~/.claude/settings.json, or VEIL_CLAUDE_SETTINGS_PATH). Only Read, Grep and Bash are required by operator preflight.",
       "read_only": false,
       "guard_preflight_required": false
     },
@@ -176,7 +191,7 @@
   ],
   "exit_codes": {
     "0": { "meaning": "success, or a hook allow/deny decision was rendered", "domain": "positive" },
-    "1": { "meaning": "doctor reported an unhealthy state (an error finding), including `doctor --json`, `doctor triage --json` and the `--robot-triage` alias; veil has no other verdict", "domain": "unhealthy" },
+    "1": { "meaning": "doctor reported an unhealthy state (an error finding), including `doctor --json`, `doctor triage --json` and the `--robot-triage` alias; or `derived verify` found the file not registered; veil has no other verdict", "domain": "unhealthy" },
     "2": { "meaning": "usage error, malformed or empty hook payload, configuration error, guard preflight refusal, or a path command (test, explain, scan) that could not produce a decision; under --json the path commands print a veil.path-decision.v1 error document on stdout", "domain": "error" }
   },
   "refusals": [],
@@ -191,7 +206,8 @@
     { "name": "VEIL_SPINE_TOOLS", "description": "Comma-separated [spine] authorized_tools (overrides config files)" },
     { "name": "VEIL_POLICY", "description": "Default policy mode: deny, warn or log" },
     { "name": "VEIL_AUDIT_LOG", "description": "Enable or disable audit logging (true/false)" },
-    { "name": "VEIL_AUDIT_PATH", "description": "Audit log file path" }
+    { "name": "VEIL_AUDIT_PATH", "description": "Audit log file path" },
+    { "name": "CLAUDE_CODE_SESSION_ID", "description": "Set by Claude Code. A direct-mode veil exec records it, and only a Read or Grep from that session uses the entry unless it was made with --persist" }
   ],
   "formats": ["json", "text"],
   "side_effects": {
@@ -199,7 +215,7 @@
     "writes_files": true,
     "network": false,
     "writes_witness": false,
-    "notes": "Hook mode appends one audit record per evaluated path to the audit log when audit_log is enabled; every record carries enforcement: hook (a hook decided, which is advisory and parser-based; no sandbox is enforced). install/uninstall edit Claude settings. config may migrate a legacy user config. All other commands are read-only. veil never writes to the witness ledger."
+    "notes": "Hook mode appends one audit record per evaluated path to the audit log when audit_log is enabled; every record carries enforcement: hook (a hook decided, which is advisory and parser-based; no sandbox is enforced). veil exec appends to the audit log and to the derived registry in ~/.cmdrvl/state/veil/, and creates that registry's MAC key there on first use. install/uninstall edit Claude settings. config may migrate a legacy user config. All other commands are read-only. veil never writes to the witness ledger."
   },
   "pipeline": {
     "upstream": ["dcg"],
@@ -208,7 +224,7 @@
   "hook_mode": {
     "usage": "veil < hook-payload.json",
     "stdin": "Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload JSON",
-    "stdout": "protocol-specific permission decision JSON (see `veil --schema`)",
+    "stdout": "protocol-specific permission decision JSON (see `veil --schema`). For a Claude Code Write, Edit, MultiEdit or NotebookEdit call veil only refuses writes to its derived registry and key; for any other file it prints nothing (no decision)",
     "stderr": "diagnostics only",
     "bare_invocation": "stdin that is a terminal or empty exits 2 immediately with discovery guidance"
   },

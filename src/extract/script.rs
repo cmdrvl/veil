@@ -650,6 +650,7 @@ fn extraction(program: &str, name: &str, source: ScriptSource) -> CommandExtract
         assigned_paths: Vec::new(),
         egress: false,
         script: Some(source),
+        write_targets: Vec::new(),
     }
 }
 

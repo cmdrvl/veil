@@ -124,13 +124,17 @@ fn veil_exec_of_an_authorized_tool_is_judged_as_the_tool() {
         ("shape protected/x.csv < protected/y.csv", "deny"),
     ] {
         let bare = run_hook(&repo_root, &home, tail, false);
-        let through = run_hook(&repo_root, &home, &format!("veil exec {tail}"), false);
         assert_eq!(bare.decision, expected, "`{tail}`: {}", bare.reason);
-        assert_eq!(
-            through.decision, expected,
-            "`veil exec {tail}`: {}",
-            through.reason
-        );
+        // `--persist` is veil's own flag (bd-3qw): it changes nothing about the
+        // tool that runs
+        for exec in ["veil exec", "veil exec --persist"] {
+            let through = run_hook(&repo_root, &home, &format!("{exec} {tail}"), false);
+            assert_eq!(
+                through.decision, expected,
+                "`{exec} {tail}`: {}",
+                through.reason
+            );
+        }
     }
 
     // wrappers in front, and veil spelled as the path of the running binary
@@ -157,6 +161,11 @@ fn veil_exec_authorizes_nothing_the_tool_alone_would_not() {
         "veil exec notatool protected/x.csv",
         "veil exec env cat protected/x.csv",
         "veil exec -- cat protected/x.csv",
+        "veil exec --persist cat protected/x.csv",
+        // only veil's own flag, and only once, comes between `exec` and the tool
+        "veil exec --persist --persist shape protected/x.csv",
+        "veil exec --other shape protected/x.csv",
+        "./tools/veil exec --persist shape protected/x.csv",
         // another program that happens to be called veil gets no authority
         "./tools/veil exec shape protected/x.csv",
         "tools/veil exec shape protected/x.csv",

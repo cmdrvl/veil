@@ -15,10 +15,23 @@ pub(crate) const MCP_MATCHER: &str = "mcp__.*";
 /// guarded, and operator commands refuse to run in one.
 const REQUIRED_MATCHERS: &[&str] = &["Read", "Grep", "Bash"];
 
-/// Every matcher `veil install` writes. The MCP one is not required: an
-/// install made before bd-1wa is guarded as it always was, and `veil doctor`
-/// says that MCP tool calls are not screened until `veil install` is run again.
-const MANAGED_MATCHERS: &[&str] = &["Read", "Grep", "Bash", MCP_MATCHER];
+/// The tools that write files. Their hook keeps them from veil's derived
+/// registry and its key (bd-3qw); veil judges nothing else about them.
+pub(crate) const WRITE_MATCHERS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+/// Every matcher `veil install` writes. Only [`REQUIRED_MATCHERS`] are required:
+/// an install made before bd-1wa or bd-3qw is guarded as it always was, and
+/// `veil doctor` says what is not screened until `veil install` is run again.
+const MANAGED_MATCHERS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Bash",
+    MCP_MATCHER,
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+];
 const LEGACY_VEIL_COMMAND: &str = "$HOME/.local/bin/veil";
 const SETTINGS_OVERRIDE_ENV: &str = "VEIL_CLAUDE_SETTINGS_PATH";
 const HARNESS_OVERRIDE_ENV: &str = "VEIL_HARNESS";
@@ -399,6 +412,20 @@ impl ManagedHooksInspection {
         self.matchers
             .iter()
             .find(|matcher| matcher.matcher == MCP_MATCHER)
+    }
+
+    /// The tools that write files and have no hook that resolves to a program.
+    pub(crate) fn unguarded_write_tools(&self) -> Vec<&'static str> {
+        WRITE_MATCHERS
+            .iter()
+            .copied()
+            .filter(|tool| {
+                !self.matchers.iter().any(|matcher| {
+                    matcher.matcher == *tool
+                        && matches!(matcher.status, ManagedHookStatus::Installed { .. })
+                })
+            })
+            .collect()
     }
 }
 
@@ -848,7 +875,18 @@ mod tests {
         let entries = settings["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse should be an array");
-        assert_eq!(entries.len(), 4, "Read, Grep, Bash and the MCP tools");
+        assert_eq!(
+            entries.len(),
+            8,
+            "Read, Grep, Bash, the MCP tools and the four tools that write files"
+        );
+        for tool in WRITE_MATCHERS {
+            assert!(MANAGED_MATCHERS.contains(tool), "{tool}");
+            assert!(
+                !REQUIRED_MATCHERS.contains(tool),
+                "{tool} must stay optional"
+            );
+        }
 
         for matcher in MANAGED_MATCHERS {
             let entry = entries
@@ -914,7 +952,7 @@ mod tests {
         let entries = settings["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse should remain an array");
-        assert_eq!(entries.len(), 5, "the unrelated Custom entry is kept");
+        assert_eq!(entries.len(), 9, "the unrelated Custom entry is kept");
         assert!(entries.iter().any(|entry| matcher_matches(entry, "Custom")));
     }
 
@@ -949,7 +987,7 @@ mod tests {
         let settings = read_settings(&path);
         assert_eq!(
             settings["hooks"]["PreToolUse"].as_array().map(Vec::len),
-            Some(4),
+            Some(8),
             "install reuses the combined entry instead of adding a second"
         );
     }
@@ -982,7 +1020,7 @@ mod tests {
             .as_array()
             .expect("PreToolUse should remain an array");
 
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 8);
         for matcher in MANAGED_MATCHERS {
             let entry = entries
                 .iter()

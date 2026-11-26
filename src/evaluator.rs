@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::allowlist::{DirectoryScan, SafePathMatcher};
 use crate::config::{Config, DynamicArgsMode, PolicyMode};
+use crate::derived::VeilState;
 use crate::extract::PathExposure;
 use crate::packs::PackRegistry;
 use crate::spine::SpineInvocation;
@@ -22,6 +23,8 @@ const ARGV_PATH_REMEDIATION: &str = "Command names a protected path. Run `veil o
 const DIRECTORY_SEARCH_REMEDIATION: &str = "Content search blocked: this directory holds, or may hold, protected data. Search a narrower directory that holds none, or ask for file names or counts only (Grep output_mode files_with_matches or count; `grep -l` or `grep -c`). Run `veil operator` to discover the authorized spine tools for protected data. Do not look for another way to read it; if no listed tool fits, stop and ask the operator.";
 
 const DYNAMIC_ARGS_REMEDIATION: &str = "Command blocked: an argument cannot be resolved to a path (a variable veil was not given, a `$( )` result, or names read from standard input), so veil cannot show that it stays clear of protected data. Rewrite with a literal path, one that needs no variable, substitution or pipe. If the file is protected, run `veil operator` to discover the authorized spine tools; do not build the path another way to get around this, and if no listed tool fits, stop and ask the operator.";
+
+const VEIL_STATE_REMEDIATION: &str = "veil's derived registry and its key decide which files are derived output, so no tool call may read or change them. `veil derived list` and `veil derived verify <path>` report on them. Do not look for another way in; if they must change, stop and ask the operator.";
 
 /// How many directory entries a content search of one directory makes veil
 /// inspect before it stops vouching for the directory. The hook runs before
@@ -90,6 +93,8 @@ impl EvaluationInput {
 pub struct PolicyMatchers {
     protected: SafePathMatcher,
     allowlist: SafePathMatcher,
+    /// veil's own derived registry and key (bd-3qw); `None` without a home.
+    state: Option<VeilState>,
 }
 
 impl PolicyMatchers {
@@ -97,6 +102,7 @@ impl PolicyMatchers {
         Self {
             protected: SafePathMatcher::from_patterns(config.sensitivity.protected.iter()),
             allowlist: SafePathMatcher::from_patterns(config.allowlist.safe_patterns.iter()),
+            state: VeilState::from_env(),
         }
     }
 
@@ -108,6 +114,14 @@ impl PolicyMatchers {
     /// Whether `directory` is itself inside a `[sensitivity] protected` root.
     pub fn covers_directory(&self, directory: &Path) -> bool {
         self.protected.covers_directory(directory)
+    }
+
+    /// The denial of a command that writes `path`, when that is veil's derived
+    /// registry or its key.
+    pub(crate) fn veil_state_write(&self, path: &Path) -> Option<Decision> {
+        let state = self.state.as_ref()?;
+        (state.holds(path) || state.is_container(path))
+            .then(|| deny_veil_state("this command writes to veil's derived registry or its key"))
     }
 }
 
@@ -194,6 +208,32 @@ where
         return deny_device_path();
     }
 
+    // Ahead of every waiver: no policy mode, allowlist pattern or spine
+    // authorization may open the files that decide what counts as derived.
+    if let Some(decision) = veil_state_decision(input, matchers) {
+        return decision;
+    }
+
+    let decision = evaluate_policy(input, config, matchers, registry, classify);
+    // A read from far enough up reaches them too. This only takes back an
+    // allow: a call the policy denies keeps the policy's reason.
+    if decision.action == DecisionAction::Allow && reads_down_to_veil_state(input, matchers) {
+        return deny_veil_state("veil's derived registry and its key are beneath this directory");
+    }
+    decision
+}
+
+/// What the configured policy and the packs say about a path.
+fn evaluate_policy<F>(
+    input: &EvaluationInput,
+    config: &Config,
+    matchers: &PolicyMatchers,
+    registry: &PackRegistry,
+    classify: F,
+) -> Decision
+where
+    F: FnOnce(bool) -> Result<Option<SensitivityResult>, EvaluationFailure>,
+{
     let directory_sensitive = matchers.is_protected(&input.path);
 
     // A content search of a directory reads every file beneath it, so it is a
@@ -338,6 +378,50 @@ where
     }
 
     allow_silent()
+}
+
+/// The decision for a path that reaches veil's derived registry or its key.
+/// Commands that only name files or count them are left alone: removing or
+/// re-moding the key leaves nothing readable, only nothing registered.
+fn veil_state_decision(input: &EvaluationInput, matchers: &PolicyMatchers) -> Option<Decision> {
+    if input.exposure != PathExposure::ReadsContents {
+        return None;
+    }
+    let state = matchers.state.as_ref()?;
+    let reason = if state.holds(&input.path) {
+        "this is veil's derived registry or its key"
+    } else if state.is_container(&input.path) {
+        "this directory holds veil's derived registry and its key"
+    } else {
+        return None;
+    };
+    Some(deny_veil_state(reason))
+}
+
+/// Whether a call reads everything beneath a directory that has veil's state
+/// somewhere under it: a content search or a command that carries whole trees,
+/// and an authorized spine tool, which may walk any directory it is given.
+fn reads_down_to_veil_state(input: &EvaluationInput, matchers: &PolicyMatchers) -> bool {
+    input.exposure == PathExposure::ReadsContents
+        && (input.spine_invocation.is_some() || (input.scan_directories && input.path.is_dir()))
+        && matchers
+            .state
+            .as_ref()
+            .is_some_and(|state| state.is_beneath(&input.path))
+}
+
+/// A denial that no `[policy] default` turns into a warning.
+pub(crate) fn deny_veil_state(reason: &str) -> Decision {
+    let access = AccessAssessment::from_clearance(InformationLabel::Protected, Clearance::Derived);
+    Decision {
+        action: access.verdict,
+        label: access.label,
+        clearance: access.clearance,
+        reason: Some(format!("{reason}, which no tool call may read or change")),
+        severity: Some(SensitivitySeverity::Critical),
+        confidence: Some(1.0),
+        remediation: Some(VEIL_STATE_REMEDIATION.to_owned()),
+    }
 }
 
 /// Why a command that is not a recognised reader was blocked for naming a path.
@@ -607,7 +691,7 @@ fn allow_silent() -> Decision {
     }
 }
 
-fn allow_with_context(reason: String, confidence: Option<f32>) -> Decision {
+pub(crate) fn allow_with_context(reason: String, confidence: Option<f32>) -> Decision {
     Decision {
         action: DecisionAction::Allow,
         label: InformationLabel::Derived,

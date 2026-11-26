@@ -136,6 +136,10 @@ pub enum ToolKind {
     /// JSON veil does not know the meaning of, so every string in them that
     /// names a path is judged (bd-1wa).
     Mcp,
+    /// A tool that writes a file (Write, Edit, MultiEdit, NotebookEdit). veil
+    /// screens it for one thing: whether the file is its own derived registry
+    /// or key (bd-3qw).
+    Write,
     Unknown,
 }
 

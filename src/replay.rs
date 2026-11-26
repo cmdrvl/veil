@@ -153,7 +153,8 @@ fn parse_tool_input(fields: &Value) -> Option<HookInput> {
         "read" => ToolKind::Read,
         "grep" => ToolKind::Grep,
         "bash" => ToolKind::Bash,
-        "mcp" | "unknown" => return None,
+        // a write is judged on where it writes, which replay does not redo
+        "mcp" | "write" | "unknown" => return None,
         _ => return None,
     };
     let raw_args = input.get("raw_args")?.as_str()?;

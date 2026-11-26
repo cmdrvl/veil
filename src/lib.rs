@@ -5,6 +5,7 @@ pub mod audit;
 pub mod broker;
 pub mod broker_output;
 pub mod config;
+pub mod derived;
 pub mod evaluator;
 pub mod extract;
 pub mod hook;
@@ -35,7 +36,7 @@ use extract::{
 };
 use hook::parse_hook_input;
 use packs::PackRegistry;
-use render::{RenderedDecision, render_decision};
+use render::{RenderedDecision, render_decision, render_no_decision};
 use serde_json::{Value, json};
 use spine::detect_spine_argv;
 use types::{Decision, DecisionAction, HookInput, HookProtocol, InformationLabel, ToolKind};
@@ -197,8 +198,11 @@ fn run_with_io<R: Read, W: Write, E: Write>(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
     let rendered = execute_hook_mode(&hook_input)?;
-    stdout.write_all(rendered.stdout.as_bytes())?;
-    stdout.write_all(b"\n")?;
+    // an empty answer is no output, not a blank line
+    if !rendered.stdout.is_empty() {
+        stdout.write_all(rendered.stdout.as_bytes())?;
+        stdout.write_all(b"\n")?;
+    }
 
     if let Some(message) = rendered.stderr.as_deref() {
         stderr.write_all(message.as_bytes())?;
@@ -209,10 +213,68 @@ fn run_with_io<R: Read, W: Write, E: Write>(
     stderr.flush()
 }
 
+/// A tool that writes a file is screened for one thing: whether the file is
+/// veil's derived registry or its key (bd-3qw). The check reads no
+/// configuration, so a broken `.veil.toml` does not turn every write into an
+/// error, the one that would repair it included. Any other file gets no output,
+/// which is no decision: `allow` would tell the harness to skip its own
+/// permission prompt.
+fn guard_write(hook_input: &HookInput) -> RenderedDecision {
+    let refused = written_path(hook_input)
+        .filter(|path| derived::VeilState::from_env().is_some_and(|state| state.holds(path)));
+    let Some(path) = refused else {
+        return render_no_decision();
+    };
+
+    let decision = evaluator::deny_veil_state("this file is veil's derived registry or its key");
+    let mut rendered = render_decision(hook_input.protocol, &decision);
+    if let Ok(config) = load_config(&hook_input.cwd)
+        && config.policy.audit_log
+    {
+        let outcomes = [CandidateOutcome {
+            path,
+            decision,
+            sensitivity: None,
+            origin: Origin::Top,
+            reason_class: ReasonClass::ArgvPath,
+            egress: false,
+        }];
+        if let Err(error) = append_audit_records(
+            &config.policy.audit_path,
+            hook_input,
+            &outcomes,
+            config.policy.audit_inputs,
+        ) {
+            append_stderr_line(&mut rendered, format!("Audit logging failed: {error}"));
+        }
+    }
+    rendered
+}
+
+/// The file a write tool names, resolved against the call's directory but not
+/// normalised: `..` after a symlink goes where the symlink goes.
+fn written_path(hook_input: &HookInput) -> Option<PathBuf> {
+    let arguments: Value = serde_json::from_str(&hook_input.raw_args).ok()?;
+    let named = ["file_path", "notebook_path"]
+        .iter()
+        .find_map(|field| arguments.get(*field).and_then(Value::as_str))?;
+    let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
+    let expanded = match (named.strip_prefix('~'), home) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{home}{rest}")
+        }
+        _ => named.to_owned(),
+    };
+    Some(hook_input.cwd.join(expanded))
+}
+
 fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
+    if hook_input.tool == ToolKind::Write {
+        return Ok(guard_write(hook_input));
+    }
     let config = load_config(&hook_input.cwd)?;
     let registry = PackRegistry::with_built_ins();
-    let outcomes = if hook_input.tool == ToolKind::Mcp {
+    let mut outcomes = if hook_input.tool == ToolKind::Mcp {
         if config.mcp.screens(&hook_input.tool_name) {
             evaluate_mcp(hook_input, &config, &registry)
         } else {
@@ -222,6 +284,7 @@ fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
         let commands = extract_commands(hook_input);
         evaluate_commands(hook_input, &config, &registry, &commands)
     };
+    apply_derived_registry(hook_input, &mut outcomes);
     let mut decision = select_decision(&outcomes);
     if std::env::var_os(broker::BROKER_SOCKET_ENV).is_some() {
         point_at_broker(&mut decision);
@@ -253,6 +316,62 @@ fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
     }
 
     Ok(rendered)
+}
+
+/// A Read or Grep of a file that would be refused is allowed when the file's
+/// bytes are a registered derived output (bd-3qw). Only the live hook asks:
+/// `veil test` and audit replay judge the path and say nothing of the registry.
+/// Nothing else is looked up, since a command can do more with a file than
+/// show it.
+fn apply_derived_registry(hook_input: &HookInput, outcomes: &mut [CandidateOutcome]) {
+    if !matches!(hook_input.tool, ToolKind::Read | ToolKind::Grep) {
+        return;
+    }
+    let (Some(registry), Some(state)) = (
+        derived::Registry::from_env(),
+        derived::VeilState::from_env(),
+    ) else {
+        return;
+    };
+
+    for outcome in outcomes
+        .iter_mut()
+        .filter(|outcome| would_deny(&outcome.decision))
+    {
+        // the refusal of veil's own files is not one the registry can lift
+        if state.holds(&outcome.path) {
+            continue;
+        }
+        let note = match registry.lookup(&outcome.path, hook_input.session_id.as_deref()) {
+            derived::Lookup::Derived(record) => {
+                let lasts = if record.persist {
+                    "persisted"
+                } else {
+                    "this session"
+                };
+                outcome.decision = evaluator::allow_with_context(
+                    format!(
+                        "derived: output of `{}` registered by veil exec ({lasts})",
+                        record.tool
+                    ),
+                    Some(1.0),
+                );
+                continue;
+            }
+            derived::Lookup::NotRegistered => continue,
+            derived::Lookup::OtherSession => "the file is registered as derived output of another session; only `veil exec --persist` entries outlive their session".to_owned(),
+            derived::Lookup::TooLarge => format!(
+                "too_large_to_verify: veil hashes at most {} MiB to look a file up in its derived registry",
+                derived::MAX_VERIFY_BYTES / (1024 * 1024)
+            ),
+            derived::Lookup::Refused(why) => {
+                format!("veil's derived registry unlocks nothing: {why}")
+            }
+        };
+        if let Some(reason) = outcome.decision.reason.as_mut() {
+            reason.push_str(&format!(" ({note})"));
+        }
+    }
 }
 
 pub(crate) fn evaluate_for_replay(
@@ -292,8 +411,9 @@ fn extract_commands(hook_input: &HookInput) -> Vec<CommandExtraction> {
         ToolKind::Bash => command_from_raw_args(&hook_input.raw_args)
             .map(|command| extract_bash_commands(&command, &hook_input.cwd))
             .unwrap_or_default(),
-        // an MCP call has no commands: `evaluate_mcp` judges its arguments
-        ToolKind::Mcp | ToolKind::Unknown => Vec::new(),
+        // an MCP call has no commands: `evaluate_mcp` judges its arguments. A
+        // write reads nothing: `guard_write` judges where it writes.
+        ToolKind::Mcp | ToolKind::Write | ToolKind::Unknown => Vec::new(),
     }
 }
 
@@ -408,6 +528,21 @@ fn evaluate_commands(
         }
 
         let first_outcome = outcomes.len();
+
+        // No command writes veil's derived registry or its key, whatever it
+        // does with what it reads (bd-3qw): `echo` only names its words, but
+        // `echo x >derived.key` replaces the key.
+        outcomes.extend(command.write_targets.iter().filter_map(|target| {
+            Some(CandidateOutcome {
+                path: target.clone(),
+                decision: matchers.veil_state_write(target)?,
+                sensitivity: None,
+                origin: command.origin,
+                reason_class: ReasonClass::ArgvPath,
+                egress: false,
+            })
+        }));
+
         let spine_invocation = detect_spine(hook_input, config, command);
         let mut candidates = command.candidates.clone();
 
@@ -848,6 +983,7 @@ fn audit_tool_input(hook_input: &HookInput) -> Value {
             ToolKind::Grep => "grep",
             ToolKind::Bash => "bash",
             ToolKind::Mcp => "mcp",
+            ToolKind::Write => "write",
             ToolKind::Unknown => "unknown",
         },
         "tool_name": hook_input.tool_name,
@@ -871,7 +1007,7 @@ fn audit_tool_name(hook_input: &HookInput) -> String {
         ToolKind::Read => "Read".to_owned(),
         ToolKind::Grep => "Grep".to_owned(),
         ToolKind::Bash => "Bash".to_owned(),
-        ToolKind::Mcp => hook_input.tool_name.clone(),
+        ToolKind::Mcp | ToolKind::Write => hook_input.tool_name.clone(),
         ToolKind::Unknown => "Unknown".to_owned(),
     }
 }

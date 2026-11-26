@@ -106,21 +106,29 @@ pub fn detect_spine_argv(
     })
 }
 
-/// `veil exec TOOL ARGS...` runs TOOL through the broker, so when TOOL is an
-/// authorized spine tool the command is judged as `TOOL ARGS...` (bd-fxa).
-/// Anything else is still judged as a command named `veil`.
+/// `veil exec [--persist] TOOL ARGS...` runs TOOL through the broker, so when
+/// TOOL is an authorized spine tool the command is judged as `TOOL ARGS...`
+/// (bd-fxa). `--persist` is veil's own flag (bd-3qw). Anything else is still
+/// judged as a command named `veil`.
 fn through_veil_exec<'a>(
     argv: &'a [String],
     authorized_tools: &[String],
     cwd: &Path,
 ) -> &'a [String] {
-    match argv {
-        [program, subcommand, tool, ..]
+    let [program, subcommand, rest @ ..] = argv else {
+        return argv;
+    };
+    let from_tool = match rest {
+        [flag, after @ ..] if flag == "--persist" => after,
+        _ => rest,
+    };
+    match from_tool {
+        [tool, ..]
             if subcommand == "exec"
                 && authorized_tool_name(tool, authorized_tools).is_some()
                 && names_this_veil(program, cwd) =>
         {
-            &argv[2..]
+            from_tool
         }
         _ => argv,
     }
