@@ -1072,6 +1072,239 @@ exit 1
     }
 }
 
+/// A process this test started, outside any sandbox. It is killed and reaped
+/// however the test ends.
+#[cfg(target_os = "macos")]
+struct Outsider(std::process::Child);
+
+#[cfg(target_os = "macos")]
+impl Drop for Outsider {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The broker, the launcher and everything else the user runs are outside the
+/// sandbox, and the confined command must not be able to stop or kill them.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_confined_command_signals_only_processes_in_its_own_sandbox() {
+    use std::os::unix::process::CommandExt;
+
+    let root = fixture();
+    let home = short_home();
+    fs::write(root.join("protected.txt"), "private\n").expect("protected");
+    fs::write(
+        root.join(".veil.toml"),
+        "[sensitivity]\nprotected = [\"protected.txt\"]\n[spine]\nauthorized_tools = [\"shape\"]\n",
+    )
+    .expect("project policy");
+    create_executable(&root.join("bin/shape"), "#!/bin/sh\necho '{\"rows\":1}'\n");
+    let path = std::env::join_paths([
+        root.join("bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+    ])
+    .expect("fixture PATH");
+    let mut outsider = Outsider(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("outside process"),
+    );
+
+    // `kill 0` signals the whole process group, which holds the launcher and
+    // the broker as well as this shell
+    let script = r#"
+veil=$1 outsider=$2
+for signal in 0 STOP TERM KILL; do
+  kill -$signal "$outsider" 2>/dev/null && echo "OUTSIDER_$signal"
+done
+kill -0 $$ && echo SELF
+/bin/sleep 5 & child=$!
+kill -TERM $child && echo CHILD
+wait $child 2>/dev/null
+/bin/sh -c '/bin/sleep 5 & echo $! > grandchild.pid; wait' &
+for attempt in 1 2 3 4 5 6 7 8 9 10; do [ -s grandchild.pid ] && break; /bin/sleep 0.1; done
+kill -TERM "$(/bin/cat grandchild.pid)" && echo GRANDCHILD
+wait 2>/dev/null
+trap '' TERM
+kill -TERM 0
+/bin/sleep 0.5
+echo "BROKER: $("$veil" exec shape protected.txt 2>&1)"
+"#;
+    // its own group, so that `kill 0` can reach nothing this test did not start
+    let output = veil(&root)
+        .args(["sandbox", "--", "/bin/sh", "-c", script, "sh"])
+        .arg(env!("CARGO_BIN_EXE_veil"))
+        .arg(outsider.0.id().to_string())
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("VEIL_PROTECTED", "protected.txt")
+        .process_group(0)
+        .output()
+        .expect("veil should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let context = format!(
+        "status: {:?}\nstdout: {stdout}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        stdout, "SELF\nCHILD\nGRANDCHILD\nBROKER: {\"rows\":1}\n",
+        "{context}"
+    );
+    assert!(output.status.success(), "{context}");
+    assert_eq!(outsider.0.try_wait().expect("outsider status"), None);
+    let state = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &outsider.0.id().to_string()])
+        .output()
+        .expect("ps should run");
+    let state = String::from_utf8_lossy(&state.stdout);
+    assert!(!state.trim().is_empty() && !state.contains('T'), "{state}");
+}
+
+/// An application that LaunchServices starts is not in the sandbox.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_confined_command_cannot_start_an_application_outside_the_sandbox() {
+    let root = fixture();
+    fs::write(root.join("protected-alias.txt"), "private\n").expect("protected");
+    let application = |name: &str| {
+        let bundle = root.join(format!("{name}.app"));
+        let marker = root.join(format!("{name}.started"));
+        create_executable(
+            &bundle.join("Contents/MacOS/probe"),
+            &format!("#!/bin/sh\n/usr/bin/touch '{}'\n", marker.display()),
+        );
+        let identifier = format!(
+            "com.cmdrvl.veil-test.{name}.{}.{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        // no window, no Dock icon
+        fs::write(
+            bundle.join("Contents/Info.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n\
+                 <key>CFBundleExecutable</key><string>probe</string>\n\
+                 <key>CFBundleIdentifier</key><string>{identifier}</string>\n\
+                 <key>CFBundlePackageType</key><string>APPL</string>\n\
+                 <key>LSBackgroundOnly</key><true/>\n\
+                 </dict></plist>\n"
+            ),
+        )
+        .expect("Info.plist");
+        (bundle, marker)
+    };
+    let appears = |marker: &Path, within: u64| {
+        (0..within * 10).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            marker.exists()
+        })
+    };
+
+    // the control: without the sandbox this really does start the application
+    let (control, control_marker) = application("control");
+    let started = std::time::Instant::now();
+    let status = Command::new("/usr/bin/open")
+        .args(["-g", "-n"])
+        .arg(&control)
+        .status()
+        .expect("open should run");
+    assert!(status.success(), "the control could not start: {status}");
+    assert!(appears(&control_marker, 30), "the control never started");
+    let needed = started.elapsed().as_secs();
+
+    let (confined, confined_marker) = application("confined");
+    let output = veil(&root)
+        .args(["sandbox", "--", "/usr/bin/open", "-g", "-n"])
+        .arg(&confined)
+        .env("HOME", short_home())
+        .output()
+        .expect("veil should run");
+    assert!(
+        !appears(&confined_marker, (needed * 3).max(5)),
+        "the application ran outside the sandbox"
+    );
+    assert!(!output.status.success(), "{output:?}");
+}
+
+/// A tmux server outside the sandbox runs whatever a client asks it to, and
+/// agents are often started inside one, which names it in `$TMUX`. A listener
+/// of this test's own stands in for the server, at each place tmux puts one.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_confined_command_cannot_reach_a_tmux_server() {
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+
+    let root = fixture();
+    let home = short_home();
+    let named = short_home();
+    let custom = short_home();
+    fs::write(root.join("protected-alias.txt"), "private\n").expect("protected");
+    let serve = |socket: &Path| {
+        fs::create_dir_all(socket.parent().expect("parent")).expect("socket directory");
+        let listener = UnixListener::bind(socket).expect("listener");
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.write_all(b"served\n");
+            }
+        });
+        socket.to_path_buf()
+    };
+
+    // where tmux listens by default, under a user number nobody has
+    let default_directory = PathBuf::from(format!(
+        "/private/tmp/tmux-{}{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .subsec_nanos()
+    ));
+    let sockets = [
+        serve(&default_directory.join("default")),
+        // under $TMUX_TMPDIR
+        serve(&named.join("tmux-501/other")),
+        // wherever $TMUX says the server this session is in listens
+        serve(&custom.join("run/server.sock")),
+        // the control: another program's socket stays reachable
+        serve(&home.join("unrelated.sock")),
+    ];
+
+    let script = r#"
+ask() { answer=$(/usr/bin/nc -U "$1" </dev/null 2>/dev/null); echo "${answer:-refused}"; }
+for socket in "$@"; do ask "$socket"; done
+# a rule follows a name: neither a socket nor anything above it may be renamed
+for original in "$1" "$2" "$3"; do
+  directory=$(/usr/bin/dirname "$original")
+  /bin/mv "$original" "$original.moved" 2>/dev/null && ask "$original.moved"
+  /bin/mv "$directory" "$directory.moved" 2>/dev/null && ask "$directory.moved/$(/usr/bin/basename "$original")"
+  above=$(/usr/bin/dirname "$directory")
+  /bin/mv "$above" "$above.moved" 2>/dev/null && echo "MOVED $above"
+done
+"#;
+    let output = veil(&root)
+        .args(["sandbox", "--", "/bin/sh", "-c", script, "sh"])
+        .args(&sockets)
+        .env("HOME", &home)
+        .env("TMUX_TMPDIR", &named)
+        .env("TMUX", format!("{},4242,0", sockets[2].display()))
+        .output()
+        .expect("veil should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let context = format!(
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(stdout, "refused\nrefused\nrefused\nserved\n", "{context}");
+}
+
 /// The broker must not outlive its launcher, even one that is killed outright
 /// and so runs no cleanup.
 #[cfg(target_os = "macos")]

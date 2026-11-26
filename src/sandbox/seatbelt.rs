@@ -7,8 +7,10 @@
 //! again. Symlink spellings and resolved targets are both denied.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::allowlist::SafePathMatcher;
@@ -62,7 +64,71 @@ pub fn compile(config: &Config, project_root: &Path) -> io::Result<CompiledProfi
             Path::new("/"),
         )?)?);
     }
+    compiled.profile.push_str(&outside_denials(
+        std::env::var_os("TMUX").as_deref(),
+        std::env::var_os("TMUX_TMPDIR").as_deref(),
+    )?);
     Ok(compiled)
+}
+
+/// The profile allows what it does not name, and some of that acts outside the
+/// sandbox. These rules close ways found open: signalling a process that is
+/// not in it, asking LaunchServices (as `open` does) to start an application,
+/// and asking a tmux server to run a command. Apple events are refused as
+/// well; no test sends one, because that can raise a permission dialog.
+///
+/// `tmux` is `$TMUX`, which starts with the socket of the server this session
+/// is in, and `tmux_tmpdir` is `$TMUX_TMPDIR`, where tmux makes its sockets
+/// instead of in `/tmp`. A server listening anywhere else is not covered.
+fn outside_denials(tmux: Option<&OsStr>, tmux_tmpdir: Option<&OsStr>) -> io::Result<String> {
+    let mut rules = String::from(
+        "(deny signal)\n\
+         (allow signal (target same-sandbox))\n\
+         (deny lsopen)\n\
+         (deny appleevent-send)\n",
+    );
+
+    // tmux keeps its sockets in a directory named `tmux-<user number>`
+    let mut sockets = vec![String::from(
+        r##"(regex #"^/private/tmp/tmux-[0-9]+(/|$)")"##,
+    )];
+    if let Some(directory) = tmux_tmpdir.and_then(|path| fs::canonicalize(path).ok()) {
+        sockets.push(format!(
+            "(require-all (subpath \"{}\") (regex #\"/tmux-[0-9]+(/|$)\"))",
+            seatbelt_string(&directory)?
+        ));
+        for above in directory.ancestors().filter(|path| path.parent().is_some()) {
+            rules.push_str(&format!(
+                "(deny file-write-unlink (literal \"{}\"))\n",
+                seatbelt_string(above)?
+            ));
+        }
+    }
+    for filter in sockets {
+        // a rule names a path, so the socket must also keep its name
+        rules.push_str(&format!(
+            "(deny network-outbound {filter})\n(deny file-write* {filter})\n"
+        ));
+    }
+
+    // `path,server process,session`
+    if let Some(value) = tmux
+        && let Some(socket) = value.as_bytes().rsplitn(3, |byte| *byte == b',').nth(2)
+    {
+        let socket = Path::new(OsStr::from_bytes(socket));
+        if let (Some(parent), Some(name)) = (socket.parent(), socket.file_name())
+            && let Ok(parent) = fs::canonicalize(parent)
+        {
+            let socket = parent.join(name);
+            rules.push_str(&format!(
+                "(deny network-outbound (literal \"{}\"))\n",
+                seatbelt_string(&socket)?
+            ));
+            rules.push_str(&write_denials(&[socket], &[])?);
+        }
+    }
+
+    Ok(rules)
 }
 
 /// veil's settings are under `~/.cmdrvl/config`, which is protected by default,
