@@ -66,15 +66,15 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 168 vectors run against the real binary, **120** are blocked and **31** are still allowed: 21 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 207 vectors run against the real binary, **152** are blocked and **27** are still allowed: 17 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
 | Direct readers | 10 | 9 | 0 / 0 / 0 | 9 / 0 / 0 |
-| Other readers and tools | 60 | 44 | 5 / 0 / 2 | 50 / 0 / 1 |
+| Other readers and tools | 70 | 53 | 3 / 0 / 2 | 57 / 0 / 1 |
 | Shell indirection | 12 | 12 | 0 / 0 / 0 | 12 / 0 / 0 |
 | Copies and aliases | 10 | 8 | 2 / 0 / 0 | 7 / 3 / 0 |
-| Interpreters and scripts | 16 | 8 | 7 / 0 / 0 | 15 / 0 / 0 |
+| Interpreters and scripts | 45 | 31 | 5 / 0 / 0 | 36 / 0 / 0 |
 | Egress | 17 | 13 | 2 / 0 / 0 | 15 / 0 / 0 |
 | Content search | 9 | 5 | 0 / 0 / 4 | 7 / 0 / 2 |
 | Dynamic and hidden paths | 6 | 6 | 0 / 0 / 0 | 6 / 0 / 0 |
@@ -281,10 +281,11 @@ Limits to know about:
 judges it. `python3 read.py` does not, so veil reads `read.py` and judges what is
 in it. A script operand is found for `python`, `node`, `nodejs`, `bun`, `deno`,
 `ruby`, `perl`, `Rscript`, `bash`, `sh` and `zsh` (also versioned, `python3.12`),
-for `source` and `.`, for the `-f` and `--file` files of `sed` and `gsed` and the
-`-f` file of `jq`, for a
+for `source` and `.`, for the `-f` and `--file` files of `sed` and `gsed`, the
+`-f` file of `jq` and the `-f` and `--file` files of `awk`, `gawk`, `mawk` and
+`nawk`, for a
 file run by name (`./tools/read.py`, when its first line names an interpreter or
-is `#!/usr/bin/sed -f`), for a file the wrapper in `uv run read.py`,
+is `#!/usr/bin/sed -f` or `#!/usr/bin/awk -f`), for a file the wrapper in `uv run read.py`,
 `poetry run`, `pdm run` or `deno run` runs, for a Python directory (its
 `__main__.py`) and for a script on standard input from a file (`python3 <
 read.py`). Options before the script (`python3 -W ignore -u read.py`) are
@@ -300,6 +301,36 @@ What is judged depends on the language:
   `f"{BASE}/x.csv"` and `` `${BASE}/x.csv` `` (with `BASE` assigned a literal
   once), and the same for the Node `path.join`, Ruby `File.join` and R
   `file.path` forms.
+- The commands a program runs (`python3 -c "import os; os.system('cat .env')"`,
+  `perl -e 'print \`cat .env\`'`, `awk 'BEGIN{system("cat .env")}'`): a call
+  that hands a string to the shell or to exec is found in the code of `-c` and
+  `-e`, an awk program (and its `-f` file), a program read from a here-document
+  or here-string, and a script file. For Python these are `os.system`,
+  `os.popen`, `subprocess.run`, `call`, `check_output` and `Popen`, `os.exec*`
+  and `os.spawn*`; for Node (and bun, deno) `child_process.exec`, `execSync`,
+  `spawn`, `execFile`, `Bun.spawn`, `` Bun.$`...` `` and `Deno.Command`; for Perl
+  `system`, `exec`, backticks, `qx` and a `open` with a pipe in its file name; for
+  Ruby `system`, `exec`, `spawn`, backticks, `%x`, `IO.popen` and `Open3`; for R
+  `system`, `system2`, `shell` and `pipe`; for awk `system()`, `"cmd" |
+  getline` and `print | "cmd"`. The string, or the argument list, is run back
+  through the same steps as a Bash command, so `cat .env` in it is a direct read,
+  `sh -c '...'` in it is followed, and `grep -r x data` in it is a content
+  search of `data`. A string made of literals is read whole (`'cat ' + '.env'`,
+  adjacent strings, `\x2e`). What the program builds at run time is judged as far
+  as it can be. In an argument list (`["git", "show", rev]`, `spawn("cat",
+  args)`) no shell reads the words, so a word the program computes is one
+  unresolved word of that command, judged as `git show $rev` typed is: `cat
+  $f` is denied and `git show $rev` is not (see Dynamic Arguments). A shell string
+  with a part the program computes (`"cat " + name`, an f-string, a `%` format,
+  `sys.argv[1]`) can become anything a shell reads, `; cat .env` included, and a
+  program that is itself computed is not known; both are refused like a word veil
+  cannot resolve, under `[policy] dynamic_args`, in a program on the command line
+  or in a here-document. A script file that does the same is not refused, as the
+  unresolved words of a shell script are not: scripts are full of them, and only
+  what a person typed is held to the stance. Its literal commands are judged. A
+  program that starts a program that starts a program, more than three levels
+  deep, is reported as text veil cannot analyse, as a shell string nested that
+  deep is.
 - Shell scripts: the text is run back through the same steps as a Bash
   command, so each command in it is judged, and a script it runs is read in
   turn. A word a shell script expands (`"$1"`, `"$SRC"`) is not judged; the
@@ -336,8 +367,13 @@ airtight. It does not see:
 - a path built at run time: from the environment, a file, user input, a network
   call or a module the script imports (imports are not followed, except a jq
   program's `import` and `include`);
+- a command a program reaches another way than the calls above
+  (`getattr(os, "system")`, an alias such as `from os import system as run`,
+  `eval`), or one it takes from a file or the network;
 - a script that arrives through a pipe (`cat read.py | python3`), a module run
   with `-m`, a zip, a `.pyc` or any binary;
+- a script piped into a shell, which is no program of an interpreter
+  (`echo 'cat .env' | sh`, `awk '{print "cat .env" | "sh"}'`);
 - a script written by an earlier command of the same line (it does not exist
   when veil looks), or changed between the hook and the run;
 - a directory entry point other than a Python `__main__.py`.
@@ -468,6 +504,19 @@ word counts, and teaching it each command's grammar is how that number falls.
 The history is one machine's, replayed against a scratch home with the default
 configuration, so read it as the cost on that history and not a prediction for
 another.
+
+The commands a program runs were measured the same way, on the 18,302
+distinct commands in that history that start python, node, bun, deno, perl, ruby,
+Rscript or awk. The previous release allowed 11,780 of them; 77 (0.65%) are
+denied now and none that was denied is allowed. By cause: 38 a program or a whole
+command the program builds at run time (`subprocess.run(cmd)`, a program held in
+a variable), 24 a program the command runs that is itself a script veil reads and
+cannot analyse (typing that command was denied already), 8 `aws` and 1 `git`
+given a word the program computes, and 6 Perl `exec @ARGV`. A script file is not
+held to the same stance, and the measurement is why: of 922 Python files under one
+checkout tree that run a subprocess or `os` call, 721 (78.2%) would be denied if
+they were treated as a program typed on the command line, nearly all for a
+command held in a variable. Typed programs are short; files are not.
 
 An `export` (or `declare -x`) of a protected path is judged as naming it: the
 value reaches every program after it, and veil does not read what they do with it.

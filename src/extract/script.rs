@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ArgvPath, ArgvResolver, CommandExtraction, InterpreterKind, Origin, PathExposure, SUBSTITUTION,
-    ScriptSource, ShellEnv, SimpleCommand, command_extraction, command_name, decompose_in,
+    ScriptSource, ShellEnv, SimpleCommand, command_extraction, command_name, decompose_in, exec,
     extract_interpreter_script_paths, home_directory, ignorable_system_path, interpreter_kind,
     is_plain_name, jq, lexical_path, normalize_candidates, path_shaped, sed,
     strip_redirection_words,
@@ -88,6 +88,8 @@ pub(super) fn inspect(
         inspect_sed(&run, cwd, depth, scripts, out);
     }
     inspect_jq(command, cwd, depth, scripts, out);
+    inspect_inline(command, cwd, env, depth, scripts, out);
+    inspect_awk(command, cwd, env, depth, scripts, out);
 
     let Some(run) = find_script(command, cwd) else {
         return;
@@ -111,7 +113,7 @@ pub(super) fn inspect(
             let candidates =
                 normalize_candidates(extract_interpreter_script_paths(run.kind, &text), cwd);
             let argv_paths = path_words(run.kind, &text, &candidates, cwd);
-            let mut found = extraction(&run.program, &run.name, source);
+            let mut found = extraction(&run.program, &run.name, source.clone());
 
             if !candidates.is_empty() {
                 found.exposure = PathExposure::ReadsContents;
@@ -120,6 +122,194 @@ pub(super) fn inspect(
             found.argv_paths = argv_paths;
             found.argv_exposure = PathExposure::ReadsContents;
             out.push(found);
+
+            // the commands the file hands to the shell, as if they were typed (bd-5iy)
+            if let Some(language) = language_of(run.kind) {
+                for line in exec::find(language, &text).commands {
+                    shell_commands(&line, &source, cwd, env, depth, scripts, out);
+                }
+            }
+        }
+    }
+}
+
+fn language_of(kind: InterpreterKind) -> Option<exec::Language> {
+    match kind {
+        InterpreterKind::Python => Some(exec::Language::Python),
+        InterpreterKind::Node => Some(exec::Language::Node),
+        InterpreterKind::Perl => Some(exec::Language::Perl),
+        InterpreterKind::Ruby => Some(exec::Language::Ruby),
+        InterpreterKind::R => Some(exec::Language::R),
+        InterpreterKind::Shell => None,
+    }
+}
+
+// ---- command strings inside a program (bd-5iy) ------------------------------------
+
+/// The programs `command` hands an interpreter in its own text: the code of `-c`
+/// and `-e`, an awk program, or the here-document or here-string the interpreter
+/// reads as its program.
+fn inline_programs(command: &SimpleCommand) -> (Option<exec::Language>, Vec<String>) {
+    let Some((program, args)) = command.argv.split_first() else {
+        return (None, Vec::new());
+    };
+    let name = command_name(program);
+    let found = exec::programs(name, args);
+    let Some(language) = found.language else {
+        return (None, Vec::new());
+    };
+    let mut texts = found.inline;
+
+    if texts.is_empty()
+        && let Some(kind) = interpreter_kind(name)
+        && script_operand(kind, name, args) == Operand::Stdin
+    {
+        if let Some(body) = &command.heredoc_body {
+            texts.push(body.clone());
+        } else if let Some(position) = args.iter().position(|arg| arg == "<<<")
+            && let Some(text) = args.get(position + 1)
+        {
+            texts.push(text.clone());
+        }
+    }
+    (Some(language), texts)
+}
+
+/// The first call in the program a command runs that hands the shell a command
+/// built at run time, as the program wrote it.
+pub(super) fn inline_refusal(command: &SimpleCommand) -> Option<String> {
+    let (language, texts) = inline_programs(command);
+    let language = language?;
+
+    texts
+        .iter()
+        .find_map(|text| exec::find(language, text).refused)
+}
+
+/// The commands the program in a command's own text runs, each judged as if it
+/// had been typed, and the scripts those run. What a program builds at run time
+/// is refused by [`inline_refusal`], not here.
+fn inspect_inline(
+    command: &SimpleCommand,
+    cwd: &Path,
+    env: &ShellEnv,
+    depth: usize,
+    scripts: &mut Scripts,
+    out: &mut Vec<CommandExtraction>,
+) {
+    let (language, texts) = inline_programs(command);
+    let Some(language) = language else {
+        return;
+    };
+    if depth >= MAX_DEPTH {
+        // A program nested past the levels veil follows is as unknown as text it
+        // cannot parse: it is reported opaque, as the decomposer reports a shell
+        // string nested too deep, never read as running nothing.
+        if texts
+            .iter()
+            .any(|text| !exec::find(language, text).commands.is_empty())
+        {
+            let mut found = command_extraction(command, cwd);
+
+            found.origin = Origin::Wrapper;
+            found.opaque = true;
+            out.push(found);
+        }
+        return;
+    }
+
+    for text in texts {
+        for line in exec::find(language, &text).commands {
+            typed_commands(&line, cwd, env, depth, scripts, out);
+        }
+    }
+}
+
+/// A command line a program hands the shell, as `extract_bash_commands` would
+/// extract it. It is part of what was typed, so a word veil cannot resolve in it
+/// is judged as it would be there.
+fn typed_commands(
+    line: &str,
+    cwd: &Path,
+    env: &ShellEnv,
+    depth: usize,
+    scripts: &mut Scripts,
+    out: &mut Vec<CommandExtraction>,
+) {
+    let inner_env = ShellEnv {
+        cwd: Some(cwd.to_path_buf()),
+        home: env.home.clone(),
+    };
+
+    for inner in decompose_in(line, &inner_env) {
+        let inner_cwd = inner.cwd.as_deref().unwrap_or(cwd);
+        let mut found = command_extraction(&inner, inner_cwd);
+
+        // run by the interpreter, as `sh -c` runs its string. Text veil cannot
+        // analyse comes back opaque from `command_extraction`.
+        found.origin = Origin::Wrapper;
+        out.push(found);
+
+        if !inner.is_opaque() {
+            inspect(&inner, inner_cwd, env, depth + 1, scripts, out);
+        }
+    }
+}
+
+/// The program files of an awk command: `awk -f read.awk`, or `./read.awk` with
+/// `#!/usr/bin/awk -f` on its first line. What is in them is read as the text of
+/// a script, for the paths it names and the commands it runs.
+fn inspect_awk(
+    command: &SimpleCommand,
+    cwd: &Path,
+    env: &ShellEnv,
+    depth: usize,
+    scripts: &mut Scripts,
+    out: &mut Vec<CommandExtraction>,
+) {
+    let Some((program, args)) = command.argv.split_first() else {
+        return;
+    };
+    let mut names = if exec::is_awk(command_name(program)) {
+        exec::programs(command_name(program), args).files
+    } else {
+        Vec::new()
+    };
+
+    if names.is_empty()
+        && program.contains('/')
+        && usable(program)
+        && shebang_program(&locate(program, cwd)).is_some_and(|name| exec::is_awk(&name))
+    {
+        names.push(program.clone());
+    }
+
+    for name in names.into_iter().filter(|name| usable(name)) {
+        let (path, contents) =
+            read_script(&locate(&name, cwd), InterpreterKind::Shell, depth, scripts);
+        let source = |unread: Option<String>| ScriptSource {
+            name: name.clone(),
+            path: fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
+            run_in: cwd.to_path_buf(),
+            unread,
+        };
+
+        match contents {
+            Contents::Nothing => {}
+            Contents::Unread(why) => out.push(extraction(program, &name, source(Some(why)))),
+            Contents::Text(text) => {
+                let source = source(None);
+                let mut found = extraction(program, &name, source.clone());
+
+                // awk's strings are the double-quoted kind, and `#` starts a comment
+                found.argv_paths = path_words(InterpreterKind::Perl, &text, &[], cwd);
+                found.argv_exposure = PathExposure::ReadsContents;
+                out.push(found);
+
+                for line in exec::find(exec::Language::Awk, &text).commands {
+                    shell_commands(&line, &source, cwd, env, depth, scripts, out);
+                }
+            }
         }
     }
 }

@@ -5,7 +5,7 @@
 
 Enforcement level today: **hook-only** (advisory; parser-based). `veil` reads the text of a tool call before it runs and decides from the paths that text names. It does not sandbox anything, so anything it cannot see in that text it cannot stop.
 
-168 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **120** are blocked, **31** are still ALLOWED and are listed below (21 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 17 are controls that must stay allowed.
+207 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **152** are blocked, **27** are still ALLOWED and are listed below (17 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
 
 How to read the columns:
 
@@ -19,7 +19,7 @@ How to read the columns:
 
 These are listed, not hidden. They are grouped by what they let out, because a file listing and a `git push` are not the same thing.
 
-### Contents can get out (21)
+### Contents can get out (17)
 
 The contents of a protected file can get out this way.
 
@@ -28,15 +28,11 @@ The contents of a protected file can get out this way.
 | `sqlite3 :memory: ".import data/clients/holdings.csv t" "select * from t"` | the path is inside one quoted `.import` argument, which veil let through | blocked (design, not run) |
 | `printf 'r .env\n' > tmp.sed; sed -f tmp.sed notes.md` | the script file does not exist when veil looks, and veil does not judge text written to an unprotected file | blocked (design, not run) |
 | `printf 'print(open(".env").read())\n' > tmp.py; python3 tmp.py` | the script file does not exist when veil looks: the same limit for every interpreter (bd-1bk) | blocked (design, not run) |
-| `awk 'BEGIN{system("cat .env")}'` | the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) |
-| `awk 'BEGIN{"cat .env" \| getline x; print x}'` | the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) |
 | `cat hard.csv` | a hardlink is the same file under another name, and the name is not protected | **ALLOWED** (measured, ADR B-1): ADR B-1 measured the hardlink read succeeding under a literal-path profile |
 | `cat copy.csv` | a copy made earlier is a different, unprotected path: labels do not follow copies | **ALLOWED** (design, not run): the copy is at an unprotected path |
 | `python3 scripts/build_path.py` | the path is built from pieces that never spell a protected name; veil reads scripts as text | blocked (design, not run) |
 | `python3 scripts/encoded_path.py` | the script decodes the path at run time; veil reads scripts as text | blocked (design, not run) |
-| `python3 -c "import os; os.system('cat .env')"` | the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) |
-| `perl -e 'system("cat .env")'` | the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) |
-| `node -e "require('child_process').execSync('cat .env')"` | the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) |
+| `python3 scripts/run_argument.py 'cat .env'` | a script file that runs a command it is given is not refused: scripts are full of them, and only what a person types is held to the dynamic-argument stance (README, Script Files) | blocked (design, not run) |
 | `make read` | the Makefile is not read | blocked (design, not run) |
 | `echo Y2F0IGRhdGEvY2xpZW50cy9ob2xkaW5ncy5jc3YK \| base64 -d \| sh` | the command is decoded at run time | blocked (design, not run) |
 | `curl -K curl.conf` | the config is not read: curl.conf names the file, the command does not | blocked (design, not run) |
@@ -133,8 +129,18 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `sed-control-substitute` | `sed 's/a/b/' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control |
 | `sed-control-text-is-not-a-command` | `sed 's/r .env/x/' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: `r .env` is the pattern of a substitution, not a command; a parser sees that, a text search would not |
 | `awk-getline-file` | `awk 'BEGIN{while((getline l < ".env")>0) print l}'` | blocked: argv_path | blocked (design, not run) | found since | confirmed denied: the quoted literal is found inside the program text |
-| `awk-system-call` | `awk 'BEGIN{system("cat .env")}'` | **ALLOWED**: the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) | found since | `gawk` is the same |
-| `awk-pipe-getline` | `awk 'BEGIN{"cat .env" \| getline x; print x}'` | **ALLOWED**: the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) | found since | `print \| "cmd"` is the same |
+| `awk-system-call` | `awk 'BEGIN{system("cat .env")}'` | blocked: direct_read | blocked (design, not run) | found since | the string is judged as the command `cat .env` it is (bd-5iy); `gawk` is the same |
+| `awk-pipe-getline` | `awk 'BEGIN{"cat .env" \| getline x; print x}'` | blocked: direct_read | blocked (design, not run) | found since | `"cmd" \|& getline` is the same |
+| `awk-print-pipe` | `awk 'BEGIN{print \| "cat .env"}'` | blocked: direct_read | blocked (design, not run) | found since | `printf ... \| "cmd"` is the same |
+| `awk-system-list-of-strings` | `awk 'BEGIN{system("grep -r " "ssn data")}'` | blocked: direct_read | blocked (design, not run) | found since | strings set side by side are one string, as awk reads them; `data` is no path-shaped word, so only reading the string as a command finds it |
+| `awk-system-built` | `awk -v c='cat .env' 'BEGIN{system(c)}'` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since | the command is not a literal, so veil cannot judge it and refuses it, as it does a word it cannot resolve; `dynamic_args = allow` lets it through |
+| `awk-pipe-built` | `awk -v c='cat .env' 'BEGIN{c \| getline x; print x}'` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since |  |
+| `awk-file-system` | `awk -f scripts/sys.awk notes.md` | blocked: argv_path | blocked (design, not run) | found since | scripts/sys.awk holds `system("cat .env")`; an awk program file was not read at all before bd-5iy. Its words are judged first (`.env`), then the command it runs |
+| `awk-file-getline-literal` | `awk -f scripts/read.awk notes.md` | blocked: argv_path | blocked (design, not run) | found since | scripts/read.awk holds `getline line < ".env"`, which is denied on the command line and was not in a file |
+| `awk-file-shebang` | `./scripts/shebang.awk notes.md` | blocked: argv_path | blocked (design, not run) | found since | a file run by name, with `#!/usr/bin/awk -f` on its first line |
+| `awk-control-getline-date` | `awk 'BEGIN{"date" \| getline d; print d}'` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a command string is judged as the command it is; `date` reads nothing protected |
+| `awk-control-pipe-regex` | `awk '/a\|b/ {print $1}' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a `\|` inside a regular expression is no pipe |
+| `awk-control-plain` | `awk '{print $1}' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a program that runs no command |
 | `jq-import-data` | `jq -L . -n 'import "secret" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | reads ./secret.json, a credentials-pack name |
 | `jq-import-default-search` | `jq -n 'import "secret" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | no `-L` at all: jq searches the working directory anyway (measured on jq 1.8.2) |
 | `jq-import-protected-dir` | `jq -L data -n 'import "clients/holdings" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | the file is data/clients/holdings.json, in a protected directory |
@@ -197,9 +203,38 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `script-python-c` | `python3 -c 'print(open("data/clients/holdings.csv").read())'` | blocked: direct_read | blocked (design, not run) | plan class |  |
 | `script-uv-run` | `uv run python -c 'print(open("data/clients/holdings.csv").read())'` | blocked: direct_read | blocked (design, not run) | plan class |  |
 | `script-node-e` | `node -e 'require("fs").readFileSync("data/clients/holdings.csv")'` | blocked: direct_read | blocked (design, not run) | found since |  |
-| `script-python-os-system` | `python3 -c "import os; os.system('cat .env')"` | **ALLOWED**: the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) | found since | the same string as a `cat .env` typed directly is blocked; GNU sed's `e` is refused, these are not |
-| `script-perl-system` | `perl -e 'system("cat .env")'` | **ALLOWED**: the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) | found since | ruby -e is the same |
-| `script-node-exec` | `node -e "require('child_process').execSync('cat .env')"` | **ALLOWED**: the command is a string inside the program, which veil does not judge as a command | blocked (design, not run) | found since |  |
+| `script-python-os-system` | `python3 -c "import os; os.system('cat .env')"` | blocked: direct_read | blocked (design, not run) | found since | the string is judged like a `cat .env` typed directly |
+| `script-python-os-popen` | `python3 -c "import os; print(os.popen('cat .env').read())"` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-python-subprocess-shell` | `python3 -c "import subprocess; subprocess.run('cat .env', shell=True)"` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-python-subprocess-list` | `python3 -c "import subprocess; print(subprocess.check_output(['grep', '-r', 'ssn', 'data']))"` | blocked: direct_read | blocked (design, not run) | found since | an argument list is a command and its arguments; `data` is no path-shaped word, so only reading the list as a command finds it |
+| `script-python-os-exec` | `python3 -c "import os; os.execvp('grep', ['grep', '-r', 'ssn', 'data'])"` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-python-shell-sh-c` | `python3 -c "import subprocess; subprocess.run(['sh', '-c', 'cat .env'])"` | blocked: direct_read | blocked (design, not run) | found since | the shell the program starts is followed like one typed |
+| `script-python-directory-search` | `python3 -c "import os; os.system('grep -r ssn data')"` | blocked: direct_read | blocked (design, not run) | found since | `data` is no path-shaped word, so only reading the string as a command finds it |
+| `script-python-cluster-flag` | `python3 -Bc "import os; os.system('cat .env')"` | blocked: direct_read | blocked (design, not run) | found since | `-Bc` is `-B -c`: the code is found wherever the option stands |
+| `script-python-heredoc` | `python3 - <<'EOF' import os os.system('cat .env') EOF` | blocked: direct_read | blocked (design, not run) | found since | a program read from a here-document is the program the interpreter runs |
+| `script-python-file-shell-out` | `python3 scripts/shell_out.py` | blocked: direct_read | blocked (design, not run) | found since | scripts/shell_out.py holds `os.system("grep -r ssn data")`: a command a script file runs is judged as typed |
+| `script-python-built-command` | `python3 -c "import os; c = 'ca' + 't .env'; os.system(c)"` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since | a name is not followed to its value: veil cannot judge the command, and refuses it as it does a word it cannot resolve |
+| `script-python-command-from-argv` | `python3 -c "import os, sys; os.system(sys.argv[1])" 'cat .env'` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since | the command is given to the program as an argument |
+| `script-python-file-command-from-argv` | `python3 scripts/run_argument.py 'cat .env'` | **ALLOWED**: a script file that runs a command it is given is not refused: scripts are full of them, and only what a person types is held to the dynamic-argument stance (README, Script Files) | blocked (design, not run) | found since | the gap bd-5iy leaves: the same program as `script-python-command-from-argv`, in a file |
+| `script-perl-system` | `perl -e 'system("cat .env")'` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-perl-backticks` | `perl -e 'print `cat .env`'` | blocked: direct_read | blocked (design, not run) | found since | `qx(...)` is the same |
+| `script-perl-pipe-open` | `perl -e 'open(F, "cat .env \|"); print <F>'` | blocked: direct_read | blocked (design, not run) | found since | a file name with a pipe in it is a command |
+| `script-perl-n-flag` | `perl -ne 'system("cat .env")' notes.md` | blocked: direct_read | blocked (design, not run) | found since | `-ne` is `-n -e` |
+| `script-perl-built-command` | `perl -e 'system($ARGV[0])' 'cat .env'` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since |  |
+| `script-ruby-system` | `ruby -e 'system("cat .env")'` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-ruby-backticks` | `ruby -e 'puts `cat .env`'` | blocked: direct_read | blocked (design, not run) | found since | `%x(...)` is the same |
+| `script-node-exec` | `node -e "require('child_process').execSync('cat .env')"` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-node-spawn` | `node -e "require('child_process').spawnSync('grep', ['-r', 'ssn', 'data'], {stdio: 'inherit'})"` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-node-built-command` | `node -e "require('child_process').execSync(process.argv[1])" 'cat .env'` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since |  |
+| `script-r-system` | `Rscript -e 'system("cat .env")'` | blocked: direct_read | blocked (design, not run) | found since |  |
+| `script-control-python-print` | `python3 -c 'print(1)'` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a program that runs no command |
+| `script-control-python-command` | `python3 -c "import os; os.system('ls notes.md')"` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: the command is judged, and reads nothing protected |
+| `script-control-python-list-command` | `python3 -c "import subprocess; subprocess.run(['git', 'status'])"` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: an argument list that names nothing protected |
+| `script-control-python-quoted-call` | `python3 -c "print('os.system(cmd)')"` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a call inside a string is no call |
+| `script-control-node-print` | `node -e 'console.log(1)'` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a program that runs no command |
+| `script-control-node-regex-exec` | `node -e "console.log(/a(b)/.exec('ab'))"` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: `exec` is a method of a regular expression here, not child_process |
+| `script-control-ruby-puts` | `ruby -e 'puts 1'` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a program that runs no command |
+| `script-control-perl-file-open` | `perl -e 'open(F, "<", "notes.md"); print <F>'` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: opening a file is not running a command |
 | `script-bash-file` | `bash scripts/read.sh` | blocked: direct_read | blocked (design, not run) | found since |  |
 | `script-source` | `source scripts/read.sh` | blocked: direct_read | blocked (design, not run) | found since |  |
 | `script-too-large` | `python3 scripts/huge.py` | blocked: script_too_large_to_inspect | blocked (design, not run) | found since | past 256 KiB veil does not read it, and judges it like a copy of its directory |

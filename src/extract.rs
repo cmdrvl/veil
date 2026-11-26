@@ -10,6 +10,7 @@ use crate::types::ToolKind;
 
 mod decompose;
 mod egress;
+mod exec;
 mod expand;
 mod jq;
 mod script;
@@ -339,6 +340,13 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
     {
         unresolved.push(script);
     }
+    // A program that hands the shell a command it builds at run time
+    // (`os.system(cmd)`) is the same: the command it runs cannot be judged
+    // (bd-5iy). The commands it spells out are judged by `script.rs`.
+    let inline_refusal = script::inline_refusal(command);
+    if let Some(call) = &inline_refusal {
+        unresolved.push(call.clone());
+    }
 
     let candidates = normalize_candidates(paths, cwd);
     let exposure = if candidates.is_empty() {
@@ -376,7 +384,9 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         unresolved,
         cwd_unresolved: command.cwd_unresolved,
         opaque: false,
-        dynamic_strict: is_dynamic_strict(program) || command.cwd_unresolved,
+        dynamic_strict: is_dynamic_strict(program)
+            || command.cwd_unresolved
+            || inline_refusal.is_some(),
         assigned_paths,
         egress: egress::is_egress(program, args),
         script: None,
