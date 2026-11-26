@@ -292,7 +292,7 @@ veil hooks into Claude Code's `PreToolUse` event for multiple tool types:
 | `Grep` | Content-mode grep exposing file contents, including a search of a directory that holds protected paths |
 | `Bash` | Common shell-reader patterns that would expose file contents directly, including `grep`, `rg`, `ag`, `ack` and `ugrep` content searches, in every command the line would run (see below) |
 | `mcp__.*` | Paths handed to an MCP tool in its arguments, such as a send-mail attachment or an upload path (see MCP Tools below) |
-| `Write`, `Edit`, `MultiEdit`, `NotebookEdit` | One thing: a write to veil's derived registry or its key (see [Derived Outputs](#derived-outputs)). For any other file veil prints nothing, which is no decision, so Claude Code's own permission rules apply |
+| `Write`, `Edit`, `MultiEdit`, `NotebookEdit` | Two things: a write to veil's derived registry or its key (see [Derived Outputs](#derived-outputs)), and to its [config files](#guarding-the-config-files). For any other file veil prints nothing, which is no decision, so Claude Code's own permission rules apply |
 
 Treat `veil` as an operator-first guardrail: it blocks direct reads, then points
 you to the configured authorized path for sensitive-file work instead of
@@ -578,7 +578,8 @@ This is a check of the command's text, and it does not cover:
   filesystem as it is before the command runs;
 - zsh's `**`, which veil matches one directory deep;
 - `Write` and `Edit` of a protected file, which are judged only for veil's
-  derived registry and key. `tee`, `cp` and `sed -i` are judged when they name
+  derived registry and key and its [config files](#guarding-the-config-files).
+  `tee`, `cp` and `sed -i` are judged when they name
   the path. Given `"$OUT"`, `cp` and `sed -i` are refused for the unresolved
   argument, but `tee` is judged only where the
   [stance](#dynamic-arguments) judges any other command.
@@ -747,8 +748,9 @@ cannot show that nothing in them is protected; the remediation says to send less
 recorded). `[mcp] ignore_tools = ["mcp__crm__*"]` exempts tools whose arguments
 are known not to be paths, by exact name or by a prefix ending in `*`; an entry
 that could never match (one that does not start with `mcp__`) is a config error.
-Like every setting, both can be set in a project `.veil.toml`, which overrides
-the user's.
+A project `.veil.toml` can turn screening on and drop `ignore_tools` entries,
+never the reverse (see
+[What a project config may change](#what-a-project-config-may-change)).
 
 An install made before MCP screening has no `mcp__.*` hook, so MCP tool calls
 never reach veil. `veil doctor` reports that as the `mcp_hook` check (an `error`,
@@ -982,9 +984,10 @@ is exactly as good as the checks above:
 - Anything that writes files without a veil hook can replace the key and then
   forge records: another harness, an install without the write hooks, an MCP tool
   veil is told not to screen, a script that builds the path while it runs, or
-  any process of yours outside the harness. The same ability can edit
-  `.veil.toml` or the harness settings and turn veil off. The hook does not
-  guard those two from writes;
+  any process of yours outside the harness. The same ability can edit veil's
+  config files or the harness settings. The hook refuses the writes of config
+  files that it [can see](#guarding-the-config-files), not the ones it cannot,
+  and does not guard harness settings;
   [Sandboxed commands](#sandboxed-commands-macos) stop writes to `.veil.toml`,
   and not to harness settings.
 - Session expiry limits how long a record lasts. It is not a security boundary:
@@ -1038,8 +1041,14 @@ own, `reason_class: redirect_write`.
 
 ### Configuration
 
+Settings are read in layers: built-in defaults, `/etc/veil/config.toml`,
+`~/.cmdrvl/config/veil/config.toml`, the project `.veil.toml`, then `VEIL_*`
+environment variables. A later layer overrides an earlier one, except that
+[a project file can only tighten](#what-a-project-config-may-change). Below is
+what a user or system file can hold; a project file takes the same keys.
+
 ```toml
-# .veil.toml (project root) or ~/.cmdrvl/config/veil/config.toml
+# ~/.cmdrvl/config/veil/config.toml
 
 [sensitivity]
 # Paths that are sensitive (glob patterns)
@@ -1113,6 +1122,79 @@ denied by default, including `config/`, `secrets/`, guard receipts, Gmail watch
 state, holon doctor runs, receipts, migration records, and deprecation notices.
 That profile is preserved when user, project, or environment protected patterns
 are supplied.
+
+#### What a project config may change
+
+A `.veil.toml` arrives with a repository, and an agent working there is the one
+it is meant to restrain. So it may only tighten what the built-in defaults and
+the system and user files give. Saying the same as they do, or something
+stricter, works as written.
+
+| Key | A project file may |
+|---|---|
+| `sensitivity.protected` | add patterns; a lower layer's patterns stay |
+| `allowlist.safe_patterns` | keep only entries the lower list covers: the same entry, a path or name it matches, or a `dir/**` inside one of its trees |
+| `spine.authorized_tools` | drop tools, written as the lower layer writes them |
+| `spine.denied_flags` | add flags; a key that leaves a lower flag out, `default` included, does not remove it |
+| `policy.default`, `policy.egress` | move toward `deny` (`log`, then `warn`, then `deny`) |
+| `policy.dynamic_args` | move toward `deny` (`allow`, then `warn`, then `deny`) |
+| `policy.audit_log`, `policy.require_dcg`, `mcp.screen` | turn on |
+| `mcp.ignore_tools` | keep only entries a lower entry covers |
+| `protected_corpus.max_files` | raise it |
+| `policy.audit_path`, `policy.audit_inputs`, `protected_corpus.max_bytes`, `max_file_bytes`, `max_walk_entries` | change nothing |
+
+The last row has no stricter direction. Moving the audit log takes it from where
+a person reads it. `audit_inputs = true` keeps the input a reviewer reads and
+`false` keeps raw tool input off the disk. The corpus is filled until a limit is
+reached, skipping files that do not fit, so changing a byte or walk limit either
+way can leave out a file the lower limits include. Only a higher `max_files`
+always keeps everything and adds to it.
+
+What a project file is refused is not dropped silently: the hook says so on
+stderr for each Read, Grep, Bash or MCP call it judges, naming the file and the
+settings, and `veil doctor` reports a `project_config` check until the file no
+longer asks. (Leaving a lower pattern out of `protected` is not reported unless
+the list is empty.) To loosen something, a person puts it in
+`~/.cmdrvl/config/veil/config.toml`, where it applies to every project.
+`/etc/veil/config.toml`, the user file and `VEIL_*` variables keep their full
+power. The one change: a project `egress` no longer holds egress below a
+stricter `VEIL_POLICY`.
+
+#### Guarding the config files
+
+The hook refuses a tool call it can see writing any file named `.veil.toml`, in
+any directory (a nested one replaces the outer one), or veil's user settings:
+`~/.cmdrvl/config/veil/config.toml`, `~/.config/veil/config.toml` and
+`$XDG_CONFIG_HOME/veil/config.toml`. No policy mode lowers the refusal. A person
+edits these files outside the agent session. It covers:
+
+- `Write`, `Edit`, `MultiEdit` and `NotebookEdit`, which stay guarded when a
+  `.veil.toml` does not parse, while other writes are still left alone;
+- redirections, and commands that write, remove, move, link or re-permission
+  such a file (`tee`, `cp`, `mv`, `rm`, `ln`, `dd`, `sed -i`, `sort -o` and the
+  rest), inline code and shell scripts included;
+- symlinks to such a file, dangling ones too; a hard link to the user settings
+  or to a project file in the working directory or above it; globs that spell a
+  config's name; and moving or removing `~/.cmdrvl`, `~/.cmdrvl/config` or a
+  directory that holds the user settings;
+- **any program veil does not know to be a reader, when it names such a file.**
+  veil cannot tell what it does with the name, so `python3 -c` that only reads
+  `.veil.toml` is refused, as is a command whose argument ends in
+  `/.veil.toml`. `cat`, `grep`, `diff`, `sed` without `-i`, `git diff`,
+  `git add`, `git commit` and copying *from* a config are judged as before.
+
+**The limit: neither rule stops a write the hook does not see.** A script in
+another language that opens the file, a program that writes it without being
+given its name, unpacking an archive over it, copying a tree that holds one,
+`git checkout .`, `git switch`, `git pull`, `git clean`, `rm -r` of a directory
+that holds one, names `xargs` reads from standard input, a hard link to a nested
+project file not in force, an MCP tool that writes, and a harness whose write
+tools veil does not know (it handles Claude Code's four) can all change these
+files. The tightening-only rule means such a write cannot take a project below
+the defaults and the system and user settings. **It cannot protect what only the
+project file declares: a write that deletes `.veil.toml`, or rewrites it without
+some of its `protected` patterns, removes that protection.** Patterns you must
+not lose belong in the user or system file.
 
 `veil` configuration intentionally contains no secret-valued fields. Do not put
 API keys, tokens, or cloud secret references in `veil` config files; unknown

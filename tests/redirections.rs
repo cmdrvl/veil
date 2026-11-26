@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -44,11 +46,8 @@ fn repo(label: &str, protected: Option<&str>) -> PathBuf {
     let sensitivity = protected
         .map(|list| format!("[sensitivity]\nprotected = {list}\n\n"))
         .unwrap_or_default();
-    fs::write(
-        root.join(".veil.toml"),
-        format!("{sensitivity}[policy]\naudit_log = false\n"),
-    )
-    .expect("config should be written");
+    fs::write(root.join(".veil.toml"), sensitivity).expect("config should be written");
+    user::write_config(&root, "[policy]\naudit_log = false\n");
 
     root
 }

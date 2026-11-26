@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -54,12 +56,16 @@ fn repo(label: &str, dynamic_args: Option<&str>) -> Repo {
         .unwrap_or_default();
     fs::write(
         root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\n{dynamic}audit_log = true\naudit_path = \"{}\"\n",
-            audit.to_string_lossy().replace('\\', "\\\\")
-        ),
+        "[sensitivity]\nprotected = [\"data/**\"]\n",
     )
     .expect("config should be written");
+    user::write_config(
+        &root,
+        &format!(
+            "[policy]\n{dynamic}audit_log = true\naudit_path = \"{}\"\n",
+            audit.to_string_lossy().replace('\\', "\\\\")
+        ),
+    );
 
     Repo { root, audit }
 }

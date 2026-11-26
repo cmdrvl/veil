@@ -21,6 +21,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 
+#[path = "common/user.rs"]
+mod user;
+
 const VERSION: &str = "veil.path-decision.v1";
 const OPERATOR_JSON: &str = include_str!("../operator.json");
 
@@ -47,9 +50,10 @@ fn repo(label: &str) -> Repo {
     fs::create_dir_all(&home).expect("home dir");
     fs::write(
         root.join(".veil.toml"),
-        "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\ndefault = \"deny\"\naudit_log = false\n",
+        "[sensitivity]\nprotected = [\"data/**\"]\n",
     )
     .expect("config");
+    user::write_config(&home, "[policy]\ndefault = \"deny\"\naudit_log = false\n");
     fs::write(root.join("notes.md"), "notes\n").expect("allowlisted file");
     fs::write(root.join("src/app.rs"), "fn main() {}\n").expect("source file");
     fs::write(

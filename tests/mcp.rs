@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -61,7 +63,8 @@ fn repo(label: &str) -> Repo {
     repo_with(label, "", "")
 }
 
-/// As [`repo`], with extra lines for `[policy]` and extra tables after it.
+/// As [`repo`], with extra lines for `[policy]` and extra tables after it, all
+/// in the user's settings.
 fn repo_with(label: &str, policy_lines: &str, tables: &str) -> Repo {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -81,12 +84,16 @@ fn repo_with(label: &str, policy_lines: &str, tables: &str) -> Repo {
     let audit = root.join("state/audit.jsonl");
     fs::write(
         root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\naudit_log = true\naudit_path = \"{}\"\n{policy_lines}\n{tables}",
-            audit.to_string_lossy().replace('\\', "\\\\")
-        ),
+        "[sensitivity]\nprotected = [\"data/**\"]\n",
     )
     .expect("config should be written");
+    user::write_config(
+        &root,
+        &format!(
+            "[policy]\naudit_log = true\naudit_path = \"{}\"\n{policy_lines}\n{tables}",
+            audit.to_string_lossy().replace('\\', "\\\\")
+        ),
+    );
 
     Repo { root, audit }
 }

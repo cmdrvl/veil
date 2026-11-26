@@ -20,6 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -63,12 +65,14 @@ fn repo(label: &str, policy: &str) -> Repo {
 
     let root = fs::canonicalize(&root).expect("repo root should canonicalize");
     let audit = root.join("state/audit.jsonl");
-    let config = |protected: &str| {
-        format!(
-            "[sensitivity]\nprotected = [\"{protected}\"]\n\n[policy]\naudit_log = true\naudit_path = \"{}\"\n{policy}\n",
+    user::write_config(
+        &root,
+        &format!(
+            "[policy]\naudit_log = true\naudit_path = \"{}\"\n{policy}\n",
             audit.to_string_lossy().replace('\\', "\\\\")
-        )
-    };
+        ),
+    );
+    let config = |protected: &str| format!("[sensitivity]\nprotected = [\"{protected}\"]\n");
     fs::write(root.join(".veil.toml"), config("data/**")).expect("config should be written");
 
     // The nearest `.veil.toml` wins, and this path pattern is relative to the
@@ -779,8 +783,13 @@ fn dynamic_args_allow_does_not_judge_unresolved_arguments_and_leaves_paths_alone
 
 #[test]
 fn the_environment_overrides_the_project_and_the_global_default_still_downgrades() {
-    // project says deny, the environment says allow
+    // user and project say deny, the environment says allow
     let repo_env = repo("env", "dynamic_args = \"deny\"\n");
+    fs::write(
+        repo_env.root.join(".veil.toml"),
+        "[sensitivity]\nprotected = [\"data/**\"]\n[policy]\ndynamic_args = \"deny\"\n",
+    )
+    .expect("project config");
     let verdict = run(
         &repo_env,
         &repo_env.root,

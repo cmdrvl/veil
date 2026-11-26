@@ -463,6 +463,11 @@ fn inspect_sed(
             if !found.candidates.is_empty() {
                 found.exposure = PathExposure::ReadsContents;
             }
+            found.config_writes = super::config_writes::script_file_writes(
+                &named.writes,
+                cwd,
+                super::home_directory().as_deref(),
+            );
             found.argv_paths = named_paths(&named.writes, cwd);
             found.argv_exposure = PathExposure::ReadsContents;
             if named.refused.is_some() {
@@ -656,6 +661,7 @@ fn extraction(program: &str, name: &str, source: ScriptSource) -> CommandExtract
         script: Some(source),
         write_targets: Vec::new(),
         redirect_targets: Vec::new(),
+        config_writes: Vec::new(),
         lookup_changed: false,
     }
 }

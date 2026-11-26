@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -33,8 +35,8 @@ fn unique_dir(label: &str) -> PathBuf {
     ))
 }
 
-/// A repo with `protected/**` protected, auditing off, an isolated HOME, and
-/// the given extra config appended to `.veil.toml`.
+/// A repo with `protected/**` protected, auditing off in an isolated HOME's
+/// settings, and the given extra config appended to `.veil.toml`.
 fn repo(extra_config: &str) -> (PathBuf, PathBuf) {
     let repo_root = unique_dir("repo");
     let home = unique_dir("home");
@@ -45,11 +47,10 @@ fn repo(extra_config: &str) -> (PathBuf, PathBuf) {
     }
     fs::write(
         repo_root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"protected/**\"]\n\n[policy]\naudit_log = false\n\n{extra_config}"
-        ),
+        format!("[sensitivity]\nprotected = [\"protected/**\"]\n\n{extra_config}"),
     )
     .expect("config");
+    user::write_config(&home, "[policy]\naudit_log = false\n");
     (repo_root, home)
 }
 

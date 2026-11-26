@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::{Value, json};
 use spine_rules::contract::{OperatorContract, assert_version_parity, cargo_package_version};
 
+#[path = "common/user.rs"]
+mod user;
+
 const OPERATOR_JSON: &str = include_str!("../operator.json");
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 
@@ -283,9 +286,10 @@ fn real_hook_decisions_match_the_schema_and_a_bad_one_does_not() {
     let home = scratch("hook");
     fs::write(
         home.join(".veil.toml"),
-        "[sensitivity]\nprotected = [\"protected/**\"]\n[policy]\naudit_log = false\n",
+        "[sensitivity]\nprotected = [\"protected/**\"]\n",
     )
     .expect("config should be written");
+    user::write_config(&home, "[policy]\naudit_log = false\n");
     fs::create_dir_all(home.join("protected")).expect("protected dir");
     fs::write(home.join("protected/secret.txt"), "classified").expect("fixture");
     let cwd = home.display().to_string();

@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -58,9 +60,10 @@ impl Fixture {
         .expect("protected file");
         fs::write(
             fixture.project.join(".veil.toml"),
-            "[sensitivity]\nprotected = [\"protected/**\"]\n[policy]\naudit_log = false\n",
+            "[sensitivity]\nprotected = [\"protected/**\"]\n",
         )
         .expect("config");
+        user::write_config(&fixture.home, "[policy]\naudit_log = false\n");
         write_program(
             &fixture.installed.join("shape"),
             "#!/bin/sh\necho shape-report\n",

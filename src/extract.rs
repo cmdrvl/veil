@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::types::ToolKind;
 
+mod config_writes;
 mod decompose;
 mod egress;
 mod exec;
@@ -20,6 +21,7 @@ mod sed;
 mod wrappers;
 mod written;
 
+pub use config_writes::{ConfigWrite, WriteReach};
 pub use decompose::{
     MAX_DEPTH, MAX_SEGMENTS, Origin, STDIN_ARGUMENTS, SUBSTITUTION, ShellEnv, SimpleCommand,
     decompose, decompose_in,
@@ -154,6 +156,9 @@ pub struct CommandExtraction {
     /// the command does with its words (bd-qe9), and a target veil cannot
     /// resolve is judged under `dynamic_args` (bd-bow).
     pub redirect_targets: Vec<RedirectTarget>,
+    /// What the command could write, remove or move, judged against veil's own
+    /// configuration only (bd-02q).
+    pub config_writes: Vec<ConfigWrite>,
     /// The command string changes which program a name runs, so a command in
     /// it gets no spine-tool authority (bd-jn6).
     pub lookup_changed: bool,
@@ -207,6 +212,7 @@ impl CommandExtraction {
             script: None,
             write_targets: Vec::new(),
             redirect_targets: Vec::new(),
+            config_writes: Vec::new(),
             lookup_changed: false,
         }
     }
@@ -306,6 +312,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             script: None,
             write_targets: Vec::new(),
             redirect_targets: redirect_targets(command, cwd),
+            config_writes: Vec::new(),
             lookup_changed: command.lookup_changed,
         };
     };
@@ -354,6 +361,17 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         named.extend(imports.files.iter().cloned());
     }
     let script_writes: &[String] = &named;
+    // what a jq program imports it reads, so only sed's `w` files are written
+    let config_writes = config_writes::config_writes(
+        command_name(program),
+        args,
+        command.heredoc_body.as_deref(),
+        sed_script
+            .as_ref()
+            .map_or(&[][..], |script| script.writes.as_slice()),
+        cwd,
+        home_directory().as_deref(),
+    );
 
     // A reader veil parses names its files exactly, so an unresolved word that
     // is a pattern or an option's value (`grep "$p" file`, `head -n $n file`)
@@ -428,6 +446,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         script: None,
         write_targets: write_targets(&command.argv, cwd, home_directory().as_deref()),
         redirect_targets: redirect_targets(command, cwd),
+        config_writes,
         lookup_changed: command.lookup_changed,
     }
 }

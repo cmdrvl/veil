@@ -18,6 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -68,14 +70,25 @@ fn repo(label: &str) -> Repo {
     let audit = root.join("state/audit.jsonl");
     fs::write(
         root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
-            audit.to_string_lossy().replace('\\', "\\\\")
-        ),
+        "[sensitivity]\nprotected = [\"data/**\"]\n",
     )
     .expect("config should be written");
+    user::write_config(
+        &home_of(&root),
+        &format!(
+            "[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
+            audit.to_string_lossy().replace('\\', "\\\\")
+        ),
+    );
 
     Repo { root, audit }
+}
+
+/// The fixture's home, beside the repo: searches of the repo must not reach it.
+fn home_of(root: &Path) -> PathBuf {
+    let mut name = root.as_os_str().to_owned();
+    name.push("-home");
+    PathBuf::from(name)
 }
 
 fn run_hook(cwd: &Path, tool_name: &str, tool_input: Value) -> Verdict {
@@ -87,7 +100,9 @@ fn run_hook(cwd: &Path, tool_name: &str, tool_input: Value) -> Verdict {
         "tool_input": tool_input,
     });
 
+    // never the home the tests run in: its settings and audit log are real
     let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
+        .env("HOME", home_of(cwd))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

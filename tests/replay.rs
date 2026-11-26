@@ -8,6 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+#[path = "common/user.rs"]
+mod user;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn repo(label: &str) -> PathBuf {
@@ -25,9 +28,10 @@ fn repo(label: &str) -> PathBuf {
     fs::write(root.join("notes.md"), "notes\n").expect("ordinary file");
     fs::write(
         root.join(".veil.toml"),
-        "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\naudit_log = false\n",
+        "[sensitivity]\nprotected = [\"data/**\"]\n",
     )
     .expect("project config");
+    user::write_config(&root, "[policy]\naudit_log = false\n");
     fs::canonicalize(root).expect("repo should canonicalize")
 }
 

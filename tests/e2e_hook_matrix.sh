@@ -121,7 +121,11 @@ for link in fixture["symlinks"]:
     os.symlink(link["target"], repo / link["path"])
 for link in fixture["hardlinks"]:
     os.link(repo / link["target"], repo / link["path"])
-(repo / ".veil.toml").write_text(fixture["config"].replace("@AUDIT@", str(audit_path)))
+(repo / ".veil.toml").write_text(fixture["config"])
+# the fixture is the hook's HOME; only the user's settings may move the audit log
+user_config = repo / ".cmdrvl" / "config" / "veil" / "config.toml"
+user_config.parent.mkdir(parents=True, exist_ok=True)
+user_config.write_text(fixture["user_config"].replace("@AUDIT@", str(audit_path)))
 
 
 def hook_env(extra=None):

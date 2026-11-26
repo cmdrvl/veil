@@ -20,6 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -69,12 +71,16 @@ fn repo(label: &str) -> Repo {
     let audit = root.join("state/audit.jsonl");
     fs::write(
         root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
-            audit.to_string_lossy().replace('\\', "\\\\")
-        ),
+        "[sensitivity]\nprotected = [\"data/**\"]\n",
     )
     .expect("config should be written");
+    user::write_config(
+        &root,
+        &format!(
+            "[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
+            audit.to_string_lossy().replace('\\', "\\\\")
+        ),
+    );
 
     Repo { root, audit }
 }
@@ -517,14 +523,13 @@ fn the_denial_names_the_command_and_the_label_and_is_not_the_direct_read_message
 #[test]
 fn a_warn_policy_lets_the_command_through_and_says_why() {
     let repo = repo("warn");
-    fs::write(
-        repo.root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\ndefault = \"warn\"\naudit_log = true\naudit_path = \"{}\"\n",
+    user::write_config(
+        &repo.root,
+        &format!(
+            "[policy]\ndefault = \"warn\"\naudit_log = true\naudit_path = \"{}\"\n",
             repo.audit.to_string_lossy().replace('\\', "\\\\")
         ),
-    )
-    .expect("config should be rewritten");
+    );
 
     let verdict = bash(&repo, &format!("awk 1 {HOLDINGS}"));
 

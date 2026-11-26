@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 /// Prose with nothing the output detectors flag: only the copy check can tell
 /// that a copy of it is not a derived artifact.
@@ -950,11 +952,16 @@ fn no_tool_call_reads_or_writes_the_key_or_registry() {
 
     for policy in ["deny", "log"] {
         // policy `log` waves protected reads through; it does not wave these
-        fixture.write(
-            ".veil.toml",
-            &format!(
-                "[sensitivity]\nprotected = [\"data/**\"]\n[policy]\ndefault = \"{policy}\"\n"
-            ),
+        user::write_config(
+            &fixture.home(),
+            &format!("[policy]\ndefault = \"{policy}\"\n"),
+        );
+        // the mode is in force: it decides a protected read veil's own files
+        // are no part of
+        assert_eq!(
+            fixture.bash("cat data/ledger.csv").action,
+            if policy == "deny" { "deny" } else { "allow" },
+            "{policy}"
         );
         for command in &commands {
             let verdict = fixture.bash(command);

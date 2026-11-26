@@ -35,6 +35,21 @@ use crate::cli::{
 };
 use crate::hooks;
 
+/// [`config::load_config_reporting`]; unit tests load as the user of a home
+/// inside the fixture, so no real setting decides them.
+fn load_reporting(
+    repo_root: &Path,
+) -> std::io::Result<(Config, Option<config::IgnoredProjectSettings>)> {
+    #[cfg(test)]
+    return config::load_config_in_home(repo_root, &repo_root.join("home"));
+    #[cfg(not(test))]
+    config::load_config_reporting(repo_root)
+}
+
+fn load_config(repo_root: &Path) -> std::io::Result<Config> {
+    load_reporting(repo_root).map(|(config, _)| config)
+}
+
 const RECENT_AUDIT_LIMIT: usize = 20;
 /// veil's own operator.v1 manifest. `--describe` and `capabilities --json`
 /// both print exactly this document.
@@ -180,7 +195,7 @@ pub fn run_config(args: &ConfigArgs) -> Result<String, Box<dyn std::error::Error
 
 pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
-    let config = config::load_config(&repo_root)?;
+    let config = load_config(&repo_root)?;
     if args.validate {
         return render_audit_validation(&config.policy.audit_path, args.json);
     }
@@ -194,7 +209,7 @@ pub fn run_audit(args: &AuditArgs) -> Result<String, Box<dyn std::error::Error>>
 
 pub fn run_replay(args: &ReplayArgs) -> Result<String, Box<dyn std::error::Error>> {
     let repo_root = env::current_dir()?;
-    let config = config::load_config(&repo_root)?;
+    let config = load_config(&repo_root)?;
     let audit_path = args
         .audit
         .as_deref()
@@ -299,7 +314,7 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, Box<dyn std::error::Err
     }
 
     let repo_root = env::current_dir()?;
-    let config = config::load_config(&repo_root)?;
+    let config = load_config(&repo_root)?;
     let compiled = veil::sandbox::seatbelt::compile(&config, &repo_root)?;
 
     if args.print_profile {
@@ -349,7 +364,7 @@ pub fn launch_sandbox(args: &SandboxArgs) -> Result<u8, Box<dyn std::error::Erro
             args.command.clone()
         };
         let project_root = env::current_dir()?;
-        let config = config::load_config(&project_root)?;
+        let config = load_config(&project_root)?;
         let compiled = veil::sandbox::seatbelt::compile(&config, &project_root)?;
         let home = env::var_os("HOME")
             .map(PathBuf::from)
@@ -503,7 +518,7 @@ fn render_config_for_repo(
     repo_root: &Path,
     json_output: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let config = config::load_config(repo_root)?;
+    let config = load_config(repo_root)?;
 
     if json_output {
         Ok(serde_json::to_string_pretty(&config_json(&config))?)
@@ -558,7 +573,7 @@ fn render_doctor_health_for_repo(
 ) -> Result<(String, u8), Box<dyn std::error::Error>> {
     let report = current_doctor_report(repo_root);
     let exit = report.exit_code();
-    let config = config::load_config(repo_root)?;
+    let config = load_config(repo_root)?;
     let rollout_warning = (config.policy.dynamic_args == config::DynamicArgsMode::Warn
         || config.policy.egress_mode() == &PolicyMode::Warn)
         .then(|| {
@@ -615,7 +630,7 @@ fn render_operator_for_repo(
     repo_root: &Path,
     json_output: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let config = config::load_config(repo_root)?;
+    let config = load_config(repo_root)?;
     let guide = build_operator_guide(&config);
 
     if json_output {
@@ -1182,8 +1197,8 @@ fn build_doctor_report(
     let mut require_dcg = false;
     let mut mcp_screen = config::McpConfig::default().screen;
 
-    match config::load_config(repo_root) {
-        Ok(config) => {
+    match load_reporting(repo_root) {
+        Ok((config, ignored)) => {
             require_dcg = config.policy.require_dcg;
             mcp_screen = config.mcp.screen;
             checks.push(DoctorCheck {
@@ -1198,6 +1213,15 @@ fn build_doctor_report(
                 detail: audit_check_detail(&config.policy.audit_path),
                 remediation: None,
             });
+            checks.extend(ignored.map(|ignored| DoctorCheck {
+                name: "project_config",
+                status: DoctorStatus::ActionNeeded,
+                detail: ignored.summary(),
+                remediation: Some(
+                    "remove those settings from the project .veil.toml, or, where you want them, put them in ~/.cmdrvl/config/veil/config.toml yourself"
+                        .to_owned(),
+                ),
+            }));
         }
         Err(error) => checks.push(DoctorCheck {
             name: "config",
@@ -1290,7 +1314,8 @@ fn mcp_hook_doctor_check(posture: &hooks::GuardPosture, screen: bool) -> Option<
 }
 
 /// Whether the tools that write files are hooked, which is what keeps them
-/// from veil's derived registry and its key (bd-3qw). Like `mcp_hook`, it is no
+/// from veil's derived registry and its key (bd-3qw) and from its config files
+/// (bd-02q). Like `mcp_hook`, it is no
 /// precondition for operator commands, and it is absent where `hooks` already
 /// says veil cannot read the hook configuration.
 fn write_guard_doctor_check(posture: &hooks::GuardPosture) -> Option<DoctorCheck> {
@@ -1305,7 +1330,7 @@ fn write_guard_doctor_check(posture: &hooks::GuardPosture) -> Option<DoctorCheck
             name,
             status: DoctorStatus::Ok,
             detail: format!(
-                "{} are hooked in {}, so they cannot write veil's derived registry or its key",
+                "{} are hooked in {}, so they cannot write veil's derived registry, its key or its config files",
                 hooks::WRITE_MATCHERS.join(", "),
                 path.display()
             ),
@@ -1316,7 +1341,7 @@ fn write_guard_doctor_check(posture: &hooks::GuardPosture) -> Option<DoctorCheck
             name,
             status: DoctorStatus::ActionNeeded,
             detail: format!(
-                "no working PreToolUse hook for {} in {}, so veil's derived registry and its key are not kept from those tools",
+                "no working PreToolUse hook for {} in {}, so veil's derived registry, its key and its config files are not kept from those tools",
                 unguarded.join(", "),
                 path.display()
             ),
@@ -1809,7 +1834,7 @@ fn inspect_path(
     repo_root: &Path,
     raw_path: &Path,
 ) -> Result<PathInspection, Box<dyn std::error::Error>> {
-    let config = config::load_config(repo_root)?;
+    let config = load_config(repo_root)?;
     let normalized_path =
         normalize_cli_path(raw_path, repo_root).ok_or_else(|| PathUnnormalizable {
             path: raw_path.display().to_string(),
@@ -2177,7 +2202,7 @@ fn doctor_capabilities_json_value() -> Value {
             },
             {
                 "name": "write_guard",
-                "description": "Inspects the managed Claude Write/Edit/MultiEdit/NotebookEdit PreToolUse hook entries that keep those tools from veil's derived registry and its key, and their executable resolution. Not required by operator preflight.",
+                "description": "Inspects the managed Claude Write/Edit/MultiEdit/NotebookEdit PreToolUse hook entries that keep those tools from veil's derived registry, its key and its config files, and their executable resolution. Not required by operator preflight.",
                 "writes": false
             }
         ],
@@ -2321,6 +2346,15 @@ mod tests {
         fs::write(path, contents).expect("fixture file should be writable");
     }
 
+    /// The settings of the user [`load_reporting`] loads as: where a setting
+    /// that loosens has to be.
+    fn write_user_config(repo_root: &Path, contents: &str) {
+        write_file(
+            &repo_root.join("home/.cmdrvl/config/veil/config.toml"),
+            contents,
+        );
+    }
+
     fn create_executable(path: &Path) {
         write_file(path, "#!/bin/sh\nexit 0\n");
         #[cfg(unix)]
@@ -2392,7 +2426,11 @@ mod tests {
             r#"
             [sensitivity]
             protected = ["data/**"]
-
+            "#,
+        );
+        write_user_config(
+            &repo_root,
+            r#"
             [policy]
             default = "warn"
             audit_log = false
@@ -2460,8 +2498,8 @@ mod tests {
     #[test]
     fn config_output_shows_configured_denied_flags_in_json_and_human_forms() {
         let repo_root = unique_temp_dir("config-denied-flags");
-        write_file(
-            &repo_root.join(".veil.toml"),
+        write_user_config(
+            &repo_root,
             r#"
             [spine.denied_flags]
             default = ["--explicit"]
@@ -2507,8 +2545,8 @@ mod tests {
             "",
             0,
         );
-        write_file(
-            &repo_root.join(".veil.toml"),
+        write_user_config(
+            &repo_root,
             &format!(
                 "[spine]\nauthorized_tools = [\"{}\", \"/definitely/missing/rvl\"]\n",
                 tool_path.display()
@@ -2576,8 +2614,8 @@ mod tests {
             "",
             0,
         );
-        write_file(
-            &repo_root.join(".veil.toml"),
+        write_user_config(
+            &repo_root,
             &format!(
                 "[spine]\nauthorized_tools = [\"{}\", \"/definitely/missing/rvl\"]\n",
                 tool_path.display()
@@ -2609,8 +2647,8 @@ mod tests {
         let repo_root = unique_temp_dir("operator-invalid");
         let tool_path = repo_root.join("bin/broken");
         create_describe_tool(&tool_path, "not json", "", 0);
-        write_file(
-            &repo_root.join(".veil.toml"),
+        write_user_config(
+            &repo_root,
             &format!(
                 "[spine]\nauthorized_tools = [\"{}\"]\n",
                 tool_path.display()
@@ -3148,7 +3186,7 @@ mod tests {
 
         // with `[mcp] screen = false` the hook is not wanted, so its absence is fine
         let off_root = unique_temp_dir("doctor-mcp-screen-off");
-        write_file(&off_root.join(".veil.toml"), "[mcp]\nscreen = false\n");
+        write_user_config(&off_root, "[mcp]\nscreen = false\n");
         let off_settings = settings_with_hooks(&off_root, &command, None);
         let off = build_doctor_report(
             &off_root,

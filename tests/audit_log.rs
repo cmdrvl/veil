@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -57,12 +59,16 @@ fn repo(label: &str) -> Repo {
     let audit = root.join("state/audit.jsonl");
     fs::write(
         root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\naudit_log = true\naudit_path = \"{}\"\n",
-            audit.to_string_lossy().replace('\\', "\\\\")
-        ),
+        "[sensitivity]\nprotected = [\"data/**\"]\n",
     )
     .expect("config should be written");
+    user::write_config(
+        &root,
+        &format!(
+            "[policy]\naudit_log = true\naudit_path = \"{}\"\n",
+            audit.to_string_lossy().replace('\\', "\\\\")
+        ),
+    );
 
     Repo { root, audit }
 }
@@ -256,9 +262,9 @@ fn every_record_says_a_hook_decided_because_nothing_enforces_a_sandbox_yet() {
 #[test]
 fn dynamic_warn_allows_with_warning_and_records_the_counterfactual_denial() {
     let repo = repo("warn-input");
-    let mut config = fs::read_to_string(repo.root.join(".veil.toml")).expect("config");
+    let mut config = fs::read_to_string(user::config_path(&repo.root)).expect("config");
     config.push_str("dynamic_args = \"warn\"\n");
-    fs::write(repo.root.join(".veil.toml"), config).expect("warn config");
+    user::write_config(&repo.root, &config);
 
     let output = spawn_hook(&repo, "cat $UNSET")
         .wait_with_output()
@@ -283,9 +289,9 @@ fn dynamic_warn_allows_with_warning_and_records_the_counterfactual_denial() {
 #[test]
 fn disabling_audit_inputs_hashes_paths_and_omits_replay_input() {
     let repo = repo("no-inputs");
-    let mut config = fs::read_to_string(repo.root.join(".veil.toml")).expect("config");
+    let mut config = fs::read_to_string(user::config_path(&repo.root)).expect("config");
     config.push_str("audit_inputs = false\n");
-    fs::write(repo.root.join(".veil.toml"), config).expect("privacy config");
+    user::write_config(&repo.root, &config);
 
     assert!(hook(&repo, "cat data/clients/holdings.csv"));
     let record = repo.records().pop().expect("audit record");

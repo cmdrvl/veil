@@ -23,6 +23,8 @@ use std::process::{Command, Stdio};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 const H: &str = "data/clients/holdings.csv";
 
@@ -2433,8 +2435,12 @@ fn fixture_files() -> Vec<(&'static str, Body)> {
 const SYMLINKS: &[(&str, &str)] = &[("alias.csv", H)];
 const HARDLINKS: &[(&str, &str)] = &[("hard.csv", H)];
 
-/// The fixture's `.veil.toml`; `@AUDIT@` is the audit log's path.
-const CONFIG: &str = "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\naudit_log = true\naudit_path = \"@AUDIT@\"\n";
+/// The fixture's `.veil.toml`.
+const CONFIG: &str = "[sensitivity]\nprotected = [\"data/**\"]\n";
+
+/// The settings of the user the hook runs as, whose home is the fixture;
+/// `@AUDIT@` is the audit log's path, which only the user may move.
+const USER_CONFIG: &str = "[policy]\naudit_log = true\naudit_path = \"@AUDIT@\"\n";
 
 /// A repo whose `data/**` is protected, with the files the rows name.
 fn fixture() -> (PathBuf, PathBuf) {
@@ -2473,11 +2479,11 @@ fn fixture() -> (PathBuf, PathBuf) {
 
     let root = fs::canonicalize(&root).expect("fixture root should canonicalize");
     let audit = root.join("state/audit.jsonl");
-    fs::write(
-        root.join(".veil.toml"),
-        CONFIG.replace("@AUDIT@", &audit.to_string_lossy().replace('\\', "\\\\")),
-    )
-    .expect("config");
+    fs::write(root.join(".veil.toml"), CONFIG).expect("config");
+    user::write_config(
+        &root,
+        &USER_CONFIG.replace("@AUDIT@", &audit.to_string_lossy().replace('\\', "\\\\")),
+    );
     (root, audit)
 }
 
@@ -2962,6 +2968,7 @@ fn render_json(rows: &[Vector]) -> String {
             "symlinks": links(SYMLINKS),
             "hardlinks": links(HARDLINKS),
             "config": CONFIG,
+            "user_config": USER_CONFIG,
         },
         "vectors": rows,
     }))

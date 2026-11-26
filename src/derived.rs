@@ -285,7 +285,7 @@ fn is_state_file_name(name: &std::ffi::OsStr) -> bool {
 
 /// Paths compared as a filesystem that ignores letter case compares them. On
 /// one that does not, this refuses a few names that are other files.
-fn same_name(one: &Path, other: &Path) -> bool {
+pub(crate) fn same_name(one: &Path, other: &Path) -> bool {
     let mut one = one.components();
     let mut other = other.components();
     loop {

@@ -23,6 +23,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -65,12 +67,16 @@ fn repo(label: &str) -> Repo {
     let audit = root.join("state/audit.jsonl");
     fs::write(
         root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"data/**\"]\n\n[policy]\naudit_log = true\naudit_path = \"{}\"\n",
-            audit.to_string_lossy().replace('\\', "\\\\")
-        ),
+        "[sensitivity]\nprotected = [\"data/**\"]\n",
     )
     .expect("config should be written");
+    user::write_config(
+        &root,
+        &format!(
+            "[policy]\naudit_log = true\naudit_path = \"{}\"\n",
+            audit.to_string_lossy().replace('\\', "\\\\")
+        ),
+    );
 
     Repo { root, audit }
 }
@@ -371,10 +377,9 @@ fn the_egress_denial_says_the_file_is_leaving_and_other_denials_do_not() {
 #[test]
 fn egress_warn_allows_with_warning_and_audits_would_deny_without_softening_reads() {
     let repo = repo("warn");
-    let config_path = repo.root.join(".veil.toml");
-    let mut config = fs::read_to_string(&config_path).expect("config");
+    let mut config = fs::read_to_string(user::config_path(&repo.root)).expect("config");
     config.push_str("egress = \"warn\"\n");
-    fs::write(config_path, config).expect("warn config");
+    user::write_config(&repo.root, &config);
 
     let verdict = bash(&repo, &format!("scp {HOLDINGS} host:/srv/in/"));
     assert!(!verdict.denied(), "{:?}", verdict.reason);

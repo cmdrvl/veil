@@ -11,6 +11,7 @@ pub mod extract;
 pub mod hook;
 mod mcp;
 pub mod packs;
+mod policy_guard;
 pub mod protected_corpus;
 pub mod render;
 pub mod replay;
@@ -26,13 +27,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use allowlist::DIRECTORY_PROBE;
 use audit::{AuditRecord, append_audit_record};
-use config::load_config;
 use evaluator::{
     DynamicReason, EvaluationInput, PolicyMatchers, dynamic_args_decision, evaluate_access_with,
 };
 use extract::{
-    CommandExtraction, Origin, PathExposure, RedirectTarget, STDIN_ARGUMENTS, SUBSTITUTION,
-    ScriptSource, extract_bash_commands, extract_read_or_grep_paths,
+    CommandExtraction, ConfigWrite, Origin, PathExposure, RedirectTarget, STDIN_ARGUMENTS,
+    SUBSTITUTION, ScriptSource, WriteReach, extract_bash_commands, extract_read_or_grep_paths,
 };
 use hook::parse_hook_input;
 use packs::PackRegistry;
@@ -178,14 +178,25 @@ pub fn run() -> Result<u8, Box<dyn Error>> {
     reject_terminal_stdin(stdin.is_terminal())?;
     let mut stdout = io::stdout();
     let mut stderr = io::stderr();
-    run_with_io(stdin.lock(), &mut stdout, &mut stderr)?;
+    run_with_io(
+        stdin.lock(),
+        &mut stdout,
+        &mut stderr,
+        &config::load_config_reporting,
+    )?;
     Ok(0)
 }
+
+/// How the hook reads its policy for a call made in a directory. A parameter so
+/// that tests read a home of their own, never the one they run in.
+type ConfigLoader<'a> =
+    &'a dyn Fn(&Path) -> io::Result<(config::Config, Option<config::IgnoredProjectSettings>)>;
 
 fn run_with_io<R: Read, W: Write, E: Write>(
     mut reader: R,
     stdout: &mut W,
     stderr: &mut E,
+    load: ConfigLoader<'_>,
 ) -> io::Result<()> {
     let mut input = String::new();
     reader.read_to_string(&mut input)?;
@@ -200,7 +211,7 @@ fn run_with_io<R: Read, W: Write, E: Write>(
     let hook_input = parse_hook_input(&input)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
-    let rendered = execute_hook_mode(&hook_input)?;
+    let rendered = execute_hook_mode(&hook_input, load)?;
     // an empty answer is no output, not a blank line
     if !rendered.stdout.is_empty() {
         stdout.write_all(rendered.stdout.as_bytes())?;
@@ -216,21 +227,30 @@ fn run_with_io<R: Read, W: Write, E: Write>(
     stderr.flush()
 }
 
-/// A tool that writes a file is screened for one thing: whether the file is
-/// veil's derived registry or its key (bd-3qw). The check reads no
-/// configuration, so a broken `.veil.toml` does not turn every write into an
-/// error, the one that would repair it included. Any other file gets no output,
-/// which is no decision: the harness's own permission rules apply.
-fn guard_write(hook_input: &HookInput) -> RenderedDecision {
-    let refused = written_path(hook_input)
-        .filter(|path| derived::VeilState::from_env().is_some_and(|state| state.holds(path)));
-    let Some(path) = refused else {
+/// A tool that writes a file is screened for two things: whether the file is
+/// veil's derived registry or its key (bd-3qw), or part of veil's
+/// configuration (bd-02q). Neither check reads a configuration, so a broken
+/// `.veil.toml` neither switches them off nor turns every other write into an
+/// error. Any other file gets no output, which is no decision: the harness's
+/// own permission rules apply.
+fn guard_write(hook_input: &HookInput, load: ConfigLoader<'_>) -> RenderedDecision {
+    let Some(path) = written_path(hook_input) else {
         return render_no_decision();
     };
+    let decision = if derived::VeilState::from_env().is_some_and(|state| state.holds(&path)) {
+        evaluator::deny_veil_state("this file is veil's derived registry or its key")
+    } else {
+        let policy = policy_guard::PolicyFiles::from_env(&hook_input.cwd);
+        if !policy.is_file(&path) && !policy.is_container(&path) {
+            return render_no_decision();
+        }
+        evaluator::deny_veil_config(
+            "this file is part of veil's configuration (a .veil.toml or the user's veil settings), which only a person may change",
+        )
+    };
 
-    let decision = evaluator::deny_veil_state("this file is veil's derived registry or its key");
     let mut rendered = render_decision(hook_input.protocol, &decision);
-    if let Ok(config) = load_config(&hook_input.cwd)
+    if let Ok((config, _)) = load(&hook_input.cwd)
         && config.policy.audit_log
     {
         let outcomes = [CandidateOutcome {
@@ -270,11 +290,14 @@ fn written_path(hook_input: &HookInput) -> Option<PathBuf> {
     Some(hook_input.cwd.join(expanded))
 }
 
-fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
+fn execute_hook_mode(
+    hook_input: &HookInput,
+    load: ConfigLoader<'_>,
+) -> io::Result<RenderedDecision> {
     if hook_input.tool == ToolKind::Write {
-        return Ok(guard_write(hook_input));
+        return Ok(guard_write(hook_input, load));
     }
-    let config = load_config(&hook_input.cwd)?;
+    let (config, ignored) = load(&hook_input.cwd)?;
     let registry = PackRegistry::with_built_ins();
     let mut outcomes = if hook_input.tool == ToolKind::Mcp {
         if config.mcp.screens(&hook_input.tool_name) {
@@ -292,6 +315,10 @@ fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
         point_at_broker(&mut decision);
     }
     let mut rendered = render_decision(hook_input.protocol, &decision);
+    // a loosening that is not applied is said, not silently dropped
+    if let Some(ignored) = ignored {
+        append_stderr_line(&mut rendered, ignored.summary());
+    }
 
     let warned = outcomes
         .iter()
@@ -503,6 +530,41 @@ fn command_from_raw_args(raw_args: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The refusal of the first thing in `command` that would change veil's
+/// configuration, with the path it names.
+fn config_change(
+    policy: &mut policy_guard::PolicyFiles,
+    command: &CommandExtraction,
+) -> Option<(PathBuf, Decision)> {
+    const CHANGES: &str = "this command writes to veil's configuration (a .veil.toml or the user's veil settings), which only a person may change";
+
+    let mut redirected = Vec::new();
+    for target in &command.redirect_targets {
+        match target {
+            RedirectTarget::File(file) => redirected.push(ConfigWrite {
+                path: file.clone(),
+                reach: WriteReach::Tree,
+            }),
+            RedirectTarget::Unresolved(written) => {
+                if policy_guard::names_a_project_config(written) {
+                    return Some((PathBuf::from(written), evaluator::deny_veil_config(CHANGES)));
+                }
+            }
+        }
+    }
+    for write in redirected.iter().chain(&command.config_writes) {
+        let reason = match policy.is_changed_by(write) {
+            Ok(false) => continue,
+            Ok(true) => CHANGES,
+            Err(policy_guard::TooMany) => {
+                "this command writes more files than veil follows, so veil cannot show that it leaves veil's configuration alone, which only a person may change"
+            }
+        };
+        return Some((write.path.clone(), evaluator::deny_veil_config(reason)));
+    }
+    None
+}
+
 /// Evaluates every path of every command. An authorized spine tool authorizes
 /// only the command that names it, so `shape data/a.csv; cat data/b.csv` still
 /// denies the `cat`.
@@ -517,6 +579,8 @@ fn evaluate_commands(
     let matchers = PolicyMatchers::new(config);
     let context = ProtectedContext::new(&hook_input.cwd, registry, &matchers);
     let mut redirect_budget = evaluator::RedirectBudget::default();
+    // built for the first command that could write anything
+    let mut policy_files: Option<policy_guard::PolicyFiles> = None;
     let mut outcomes = Vec::new();
 
     for command in commands {
@@ -689,6 +753,29 @@ fn evaluate_commands(
         // tool (bd-bow).
         if let Some(written) = unresolved_target {
             outcomes.extend(unresolved_target_outcome(config, command, written));
+        }
+
+        // Nor does any command change what veil refuses (bd-02q), whatever the
+        // policy mode: the mode is one of the things being guarded. A command
+        // already denied keeps that reason, but a refused redirect may still
+        // be lifted by the derived registry, so it does not stand in.
+        let denied = outcomes[first_outcome..].iter().any(|outcome| {
+            outcome.reason_class != ReasonClass::RedirectWrite
+                && outcome.decision.action == DecisionAction::Deny
+        });
+        if !denied && (!command.config_writes.is_empty() || !command.redirect_targets.is_empty()) {
+            let policy = policy_files
+                .get_or_insert_with(|| policy_guard::PolicyFiles::from_env(&hook_input.cwd));
+            outcomes.extend(config_change(policy, command).map(|(path, decision)| {
+                CandidateOutcome {
+                    path,
+                    decision,
+                    sensitivity: None,
+                    origin: command.origin,
+                    reason_class: ReasonClass::ArgvPath,
+                    egress: false,
+                }
+            }));
         }
 
         // What came out of a script says which script it was, and that reading
@@ -1159,13 +1246,39 @@ mod tests {
             .map(|pattern| format!("\"{pattern}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        let config = format!(
-            "[sensitivity]\nprotected = [{protected}]\n\n[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
+        let config = format!("[sensitivity]\nprotected = [{protected}]\n");
+        fs::write(repo_root.join(".veil.toml"), config).expect("config should be written");
+
+        // only the user's own settings may say where the audit log goes
+        let user = repo_root.join("home/.cmdrvl/config/veil");
+        fs::create_dir_all(&user).expect("user config directory");
+        let settings = format!(
+            "[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
             audit_path.to_string_lossy().replace('\\', "\\\\")
         );
-
-        fs::write(repo_root.join(".veil.toml"), config).expect("config should be written");
+        fs::write(user.join("config.toml"), settings).expect("user config should be written");
         audit_path
+    }
+
+    /// The hook pipeline under the home [`configure_repo`] made: it neither
+    /// reads nor writes anything of the home the tests run in.
+    fn run_in(
+        repo_root: &Path,
+        input: &str,
+        stdout: &mut Vec<u8>,
+        stderr: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let home = repo_root.join("home");
+        run_with_io(input.as_bytes(), stdout, stderr, &|cwd| {
+            config::load_config_in_home(cwd, &home)
+        })
+    }
+
+    /// For payloads that are refused before any policy is read.
+    fn read_no_config(
+        _: &Path,
+    ) -> io::Result<(config::Config, Option<config::IgnoredProjectSettings>)> {
+        Err(io::Error::other("no config should have been read"))
     }
 
     fn read_audit_records(path: &Path) -> Vec<Value> {
@@ -1211,8 +1324,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        run_with_io(input.as_bytes(), &mut stdout, &mut stderr)
-            .expect("hook pipeline should succeed");
+        run_in(&repo_root, &input, &mut stdout, &mut stderr).expect("hook pipeline should succeed");
 
         assert_eq!(
             String::from_utf8(stdout).expect("stdout should be UTF-8"),
@@ -1259,7 +1371,7 @@ mod tests {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
 
-            run_with_io(input.as_bytes(), &mut stdout, &mut stderr)
+            run_in(&repo_root, &input, &mut stdout, &mut stderr)
                 .expect("hook pipeline should succeed");
 
             let stdout = String::from_utf8(stdout).expect("stdout should be UTF-8");
@@ -1313,8 +1425,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        run_with_io(input.as_bytes(), &mut stdout, &mut stderr)
-            .expect("hook pipeline should succeed");
+        run_in(&repo_root, &input, &mut stdout, &mut stderr).expect("hook pipeline should succeed");
 
         assert_eq!(
             String::from_utf8(stdout).expect("stdout should be UTF-8"),
@@ -1349,6 +1460,7 @@ mod tests {
             br#"{"unexpected":true}"#.as_slice(),
             &mut stdout,
             &mut stderr,
+            &read_no_config,
         )
         .expect_err("invalid hook payload should fail");
 
@@ -1362,7 +1474,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let error = run_with_io("".as_bytes(), &mut stdout, &mut stderr)
+        let error = run_with_io("".as_bytes(), &mut stdout, &mut stderr, &read_no_config)
             .expect_err("empty hook payload should fail");
 
         let message = error.to_string();
@@ -1383,6 +1495,7 @@ mod tests {
             br#"{"cwd":"/tmp","toolName":"view","toolArgs":"not-json"}"#.as_slice(),
             &mut stdout,
             &mut stderr,
+            &read_no_config,
         )
         .expect_err("malformed Copilot toolArgs should fail");
 
@@ -1400,6 +1513,7 @@ mod tests {
             br#"{"cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":"not-json"}"#.as_slice(),
             &mut stdout,
             &mut stderr,
+            &read_no_config,
         )
         .expect_err("malformed snake-case tool_input should fail");
 
@@ -1439,7 +1553,8 @@ mod tests {
             words.push(name);
         }
         let repo_root = fs::canonicalize(&repo_root).expect("canonical root");
-        let config = load_config(&repo_root).expect("config should load");
+        let (config, _) = config::load_config_in_home(&repo_root, &repo_root.join("home"))
+            .expect("config should load");
         let clean = format!("awk 1 {}", words.join(" "));
         let dirty = format!("{clean} data/clients.csv");
 
@@ -1514,17 +1629,13 @@ mod tests {
         let repo_with = |label: &str, count: usize| {
             let repo_root = unique_temp_dir(label);
             fs::create_dir_all(repo_root.join("src")).expect("src dir");
-            let audit_path = repo_root.join("state").join("audit.jsonl");
             let patterns = (0..count)
                 .map(|index| format!("\"zone{index}/**\""))
                 .collect::<Vec<_>>()
                 .join(", ");
             fs::write(
                 repo_root.join(".veil.toml"),
-                format!(
-                    "[sensitivity]\nprotected = [{patterns}]\n\n[policy]\ndefault = \"deny\"\naudit_log = true\naudit_path = \"{}\"\n",
-                    audit_path.to_string_lossy().replace('\\', "\\\\")
-                ),
+                format!("[sensitivity]\nprotected = [{patterns}]\n"),
             )
             .expect("config should be written");
             let mut words = Vec::new();
@@ -1534,7 +1645,8 @@ mod tests {
                 words.push(name);
             }
             let repo_root = fs::canonicalize(&repo_root).expect("canonical root");
-            let config = load_config(&repo_root).expect("config should load");
+            let (config, _) = config::load_config_in_home(&repo_root, &repo_root.join("home"))
+                .expect("config should load");
 
             (repo_root, config, words)
         };

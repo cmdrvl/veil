@@ -602,6 +602,22 @@ pub(crate) fn deny_veil_state(reason: &str) -> Decision {
     }
 }
 
+const VEIL_CONFIG_REMEDIATION: &str = "veil's configuration decides what veil refuses, so a person changes it, outside the agent session. Tell the operator what you wanted to change and why. Do not look for another way in. Reading a project's .veil.toml is judged as any other read.";
+
+/// The refusal of a write to veil's configuration.
+pub(crate) fn deny_veil_config(reason: &str) -> Decision {
+    let access = AccessAssessment::from_clearance(InformationLabel::Protected, Clearance::Derived);
+    Decision {
+        action: access.verdict,
+        label: access.label,
+        clearance: access.clearance,
+        reason: Some(reason.to_owned()),
+        severity: Some(SensitivitySeverity::Critical),
+        confidence: Some(1.0),
+        remediation: Some(VEIL_CONFIG_REMEDIATION.to_owned()),
+    }
+}
+
 /// Why a command that is not a recognised reader was blocked for naming a path.
 /// Files carry a label (`public < derived < protected`) and the agent's
 /// clearance is `derived`, so a path matched by `[sensitivity] protected` or by

@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod common;
+#[path = "common/user.rs"]
+mod user;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -43,8 +45,8 @@ fn unique_dir(label: &str) -> PathBuf {
     ))
 }
 
-/// A repo with `protected/**` protected, auditing off, an isolated HOME, and
-/// the given extra config appended to `.veil.toml`.
+/// A repo with `protected/**` protected, auditing off in an isolated HOME's
+/// settings, and the given extra config appended to `.veil.toml`.
 fn repo(extra_config: &str) -> (PathBuf, PathBuf) {
     let repo_root = unique_dir("repo");
     let home = unique_dir("home");
@@ -53,11 +55,10 @@ fn repo(extra_config: &str) -> (PathBuf, PathBuf) {
     fs::write(repo_root.join("protected").join("x.csv"), "secret,1\n").expect("fixture");
     fs::write(
         repo_root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"protected/**\"]\n\n[policy]\naudit_log = false\n\n{extra_config}"
-        ),
+        format!("[sensitivity]\nprotected = [\"protected/**\"]\n\n{extra_config}"),
     )
     .expect("config");
+    user::write_config(&home, "[policy]\naudit_log = false\n");
     (repo_root, home)
 }
 
@@ -172,14 +173,13 @@ fn default_raw_value_flags_are_denied_in_flag_and_flag_equals_forms() {
 fn raw_value_flag_denial_follows_the_warn_policy_like_a_direct_read() {
     let (repo_root, home) = repo("");
     let audit_path = repo_root.join("audit.jsonl");
-    fs::write(
-        repo_root.join(".veil.toml"),
-        format!(
-            "[sensitivity]\nprotected = [\"protected/**\"]\n\n[policy]\ndefault = \"warn\"\naudit_log = true\naudit_path = \"{}\"\n",
+    user::write_config(
+        &home,
+        &format!(
+            "[policy]\ndefault = \"warn\"\naudit_log = true\naudit_path = \"{}\"\n",
             audit_path.to_string_lossy().replace('\\', "\\\\")
         ),
-    )
-    .expect("config");
+    );
 
     let hook = run_hook(&repo_root, &home, "shape --explicit protected/x.csv");
 
@@ -217,7 +217,11 @@ fn per_tool_denied_flags_extend_the_default_for_that_tool_only() {
 
 #[test]
 fn default_list_is_configurable() {
-    let (repo_root, home) = repo("[spine.denied_flags]\ndefault = [\"--only-this\"]\n");
+    let (repo_root, home) = repo("");
+    user::write_config(
+        &home,
+        "[policy]\naudit_log = false\n[spine.denied_flags]\ndefault = [\"--only-this\"]\n",
+    );
 
     let replaced = run_hook(&repo_root, &home, "shape --explicit protected/x.csv");
     assert!(

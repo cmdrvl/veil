@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::allowlist::DEFAULT_SAFE_PATTERNS;
+use crate::allowlist::{DEFAULT_SAFE_PATTERNS, SafePathMatcher};
 use crate::audit::ROTATED_FILES;
 use crate::derived;
 use crate::protected_corpus::CorpusLimits;
@@ -46,7 +46,7 @@ const DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES: &[&str] = &[
 /// Key in `[spine.denied_flags]` that sets the list applied to every tool.
 const DENIED_FLAGS_DEFAULT_KEY: &str = "default";
 
-const PROJECT_CONFIG_NAME: &str = ".veil.toml";
+pub(crate) const PROJECT_CONFIG_NAME: &str = ".veil.toml";
 const CMDRVL_ROOT_DIR: &str = ".cmdrvl";
 const VEIL_CONFIG_RELATIVE: &[&str] = &["config", "veil", "config.toml"];
 const VEIL_AUDIT_RELATIVE: &[&str] = &["logs", "veil", "audit.jsonl"];
@@ -155,6 +155,16 @@ pub enum PolicyMode {
     Log,
 }
 
+impl PolicyMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Warn => "warn",
+            Self::Log => "log",
+        }
+    }
+}
+
 /// `[policy] dynamic_args`: the stance on a reader, a bulk transfer, or any
 /// command that runs where a protected path is in play, when one of its
 /// arguments is a variable, substitution or placeholder veil cannot resolve.
@@ -182,9 +192,45 @@ impl DynamicArgsMode {
             Self::Allow => "allow",
         }
     }
+
+    fn strictness(self) -> u8 {
+        match self {
+            Self::Deny => 2,
+            Self::Warn => 1,
+            Self::Allow => 0,
+        }
+    }
+}
+
+/// What a project config asked for and was not given, because it would loosen
+/// what the built-in defaults and the system and user settings give, or changes
+/// a setting neither of whose directions is only tighter (bd-02q).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IgnoredProjectSettings {
+    /// The project config in force.
+    pub path: PathBuf,
+    /// Each ignored setting, with its value quoted and escaped.
+    pub settings: Vec<String>,
+}
+
+impl IgnoredProjectSettings {
+    pub fn summary(&self) -> String {
+        format!(
+            "veil: ignored settings in {}: {}. A project .veil.toml can only tighten the default, system and user settings; a person can make such a change in ~/.cmdrvl/config/veil/config.toml",
+            self.path.display(),
+            self.settings.join("; ")
+        )
+    }
 }
 
 pub fn load_config(repo_root: &Path) -> io::Result<Config> {
+    load_config_reporting(repo_root).map(|(config, _)| config)
+}
+
+/// [`load_config`], with what the project config was refused.
+pub fn load_config_reporting(
+    repo_root: &Path,
+) -> io::Result<(Config, Option<IgnoredProjectSettings>)> {
     let home = env::var_os("HOME").map(PathBuf::from);
     let xdg_config_home = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let xdg_state_home = env::var_os("XDG_STATE_HOME").map(PathBuf::from);
@@ -207,7 +253,7 @@ fn load_config_from_paths(
     xdg_state_home: Option<&Path>,
     system_path: &Path,
     env_overrides: PartialConfig,
-) -> io::Result<Config> {
+) -> io::Result<(Config, Option<IgnoredProjectSettings>)> {
     let mut config = Config::defaults(home, xdg_state_home)?;
     let user_path = user_config_path(home);
     let legacy_user_path = legacy_user_config_path(home, xdg_config_home);
@@ -246,8 +292,11 @@ fn load_config_from_paths(
         }
     }
 
+    let mut ignored = None;
+    // the project's egress mode, when it replaced an inherited one
+    let mut pinned_egress = false;
     if let Some(project_path) = find_project_config(repo_root)?
-        && let Some(mut layer) = load_optional_config(&project_path, "project", home)?
+        && let Some(layer) = load_optional_config(&project_path, "project", home)?
     {
         let project_dir = project_path.parent().ok_or_else(|| {
             io::Error::new(
@@ -259,12 +308,50 @@ fn load_config_from_paths(
             )
         })?;
         let project_dir = fs::canonicalize(project_dir)?;
-        resolve_project_patterns(&mut layer, &project_dir, home);
-        config.apply_partial(layer);
+        let inherited_egress = config.policy.egress.is_none();
+        let settings = config.apply_project(layer, &project_dir, home);
+        pinned_egress = inherited_egress && config.policy.egress.is_some();
+        if !settings.is_empty() {
+            ignored = Some(IgnoredProjectSettings {
+                path: project_path,
+                settings,
+            });
+        }
     }
 
+    let env_default = env_overrides
+        .policy
+        .as_ref()
+        .filter(|policy| policy.egress.is_none())
+        .and_then(|policy| policy.default.clone());
     config.apply_partial(env_overrides);
-    Ok(config)
+    // Without the project, egress would follow a policy the environment
+    // tightened: the project's own mode must not hold it below that.
+    if pinned_egress
+        && let Some(default) = env_default
+        && strictness(&default) > strictness(config.policy.egress_mode())
+    {
+        config.policy.egress = None;
+    }
+    Ok((config, ignored))
+}
+
+/// What [`load_config`] would give a user whose home is `home`, with no
+/// system settings and no environment overrides: what unit tests load, so the
+/// settings of whoever runs them neither decide them nor are written to.
+#[doc(hidden)]
+pub fn load_config_in_home(
+    repo_root: &Path,
+    home: &Path,
+) -> io::Result<(Config, Option<IgnoredProjectSettings>)> {
+    load_config_from_paths(
+        repo_root,
+        Some(home),
+        None,
+        None,
+        &home.join("etc/veil/config.toml"),
+        PartialConfig::default(),
+    )
 }
 
 /// The directory of the project config that [`load_config`] uses from
@@ -434,6 +521,197 @@ impl Config {
         })
     }
 
+    /// Applies the project layer, each setting only where it tightens what
+    /// `self` already holds (bd-02q): anyone who can write in the project can
+    /// write its config. Returns what was left out.
+    fn apply_project(
+        &mut self,
+        mut layer: PartialConfig,
+        project_dir: &Path,
+        home: Option<&Path>,
+    ) -> Vec<String> {
+        // coverage of a safe pattern is judged on it as written too: a project
+        // that repeats `docs/**` has it rooted here, which only narrows it
+        let written_safe = layer
+            .allowlist
+            .as_ref()
+            .and_then(|allowlist| allowlist.safe_patterns.clone())
+            .unwrap_or_default();
+        resolve_project_patterns(&mut layer, project_dir, home);
+        let mut ignored = Vec::new();
+
+        if let Some(protected) = layer
+            .sensitivity
+            .and_then(|sensitivity| sensitivity.protected)
+        {
+            let removable = |pattern: &String| !is_cmdrvl_config_protection_pattern(pattern);
+            if protected.is_empty() && self.sensitivity.protected.iter().any(removable) {
+                ignored.push("sensitivity.protected = [] (it removes no pattern)".to_owned());
+            }
+            append_unique(&mut self.sensitivity.protected, protected);
+        }
+
+        if let Some(resolved) = layer
+            .allowlist
+            .and_then(|allowlist| allowlist.safe_patterns)
+        {
+            let lower = LowerSafePatterns::new(&self.allowlist.safe_patterns);
+            let mut kept = Vec::new();
+            let mut refused = Vec::new();
+            for (written, resolved) in written_safe.into_iter().zip(resolved) {
+                if lower.cover(&written, &resolved) {
+                    kept.push(resolved);
+                } else {
+                    refused.push(written);
+                }
+            }
+            note_entries(&mut ignored, "allowlist.safe_patterns adds", &refused);
+            self.allowlist.safe_patterns = kept;
+        }
+
+        if let Some(spine) = layer.spine {
+            if let Some(tools) = spine.authorized_tools {
+                // exact entries only: `/tmp/x/shape` is not the `shape` below
+                let (kept, refused): (Vec<_>, Vec<_>) = tools
+                    .into_iter()
+                    .partition(|tool| self.spine.authorized_tools.contains(tool));
+                note_entries(&mut ignored, "spine.authorized_tools adds", &refused);
+                self.spine.authorized_tools = kept;
+            }
+
+            for (key, flags) in spine.denied_flags.unwrap_or_default() {
+                let lower = if key == DENIED_FLAGS_DEFAULT_KEY {
+                    &mut self.spine.denied_flags.default
+                } else {
+                    self.spine
+                        .denied_flags
+                        .per_tool
+                        .entry(key.clone())
+                        .or_default()
+                };
+                let dropped: Vec<String> = lower
+                    .iter()
+                    .filter(|flag| !flags.contains(flag))
+                    .cloned()
+                    .collect();
+                note_entries(
+                    &mut ignored,
+                    &format!(
+                        "spine.denied_flags.{} leaves out (still denied)",
+                        key.escape_debug()
+                    ),
+                    &dropped,
+                );
+                append_unique(lower, flags);
+            }
+        }
+
+        if let Some(policy) = layer.policy {
+            // read before the default changes what egress inherits
+            let lower_egress = self.policy.egress_mode().clone();
+
+            if let Some(mode) = policy.default {
+                if strictness(&mode) < strictness(&self.policy.default) {
+                    ignored.push(format!("policy.default = {:?}", mode.as_str()));
+                } else {
+                    self.policy.default = mode;
+                }
+            }
+
+            if let Some(mode) = policy.egress {
+                if strictness(&mode) < strictness(&lower_egress) {
+                    ignored.push(format!("policy.egress = {:?}", mode.as_str()));
+                } else if strictness(&mode) > strictness(&lower_egress) {
+                    self.policy.egress = Some(mode);
+                }
+            }
+
+            if let Some(mode) = policy.dynamic_args {
+                if mode.strictness() < self.policy.dynamic_args.strictness() {
+                    ignored.push(format!("policy.dynamic_args = {:?}", mode.as_str()));
+                } else {
+                    self.policy.dynamic_args = mode;
+                }
+            }
+
+            only_turn_on(
+                &mut ignored,
+                "policy.audit_log",
+                &mut self.policy.audit_log,
+                policy.audit_log,
+            );
+            only_turn_on(
+                &mut ignored,
+                "policy.require_dcg",
+                &mut self.policy.require_dcg,
+                policy.require_dcg,
+            );
+
+            if let Some(path) = policy.audit_path
+                && path != self.policy.audit_path
+            {
+                ignored.push(format!("policy.audit_path = {path:?}"));
+            }
+
+            // neither value is only tighter: `true` keeps the path a reviewer
+            // reads, `false` keeps raw tool input off the disk
+            if let Some(inputs) = policy.audit_inputs
+                && inputs != self.policy.audit_inputs
+            {
+                ignored.push(format!("policy.audit_inputs = {inputs}"));
+            }
+        }
+
+        if let Some(corpus) = layer.protected_corpus {
+            let limits = &mut self.protected_corpus;
+            // Files are taken in a fixed order until one of the limits is
+            // reached. A higher `max_files` takes the same files and more.
+            // Either direction of the other three can leave out a file the
+            // lower layers take: a longer `max_file_bytes` or a longer walk
+            // spends the budget on other files.
+            if let Some(max_files) = corpus.max_files {
+                if max_files < limits.max_files {
+                    ignored.push(format!("protected_corpus.max_files = {max_files}"));
+                } else {
+                    limits.max_files = max_files;
+                }
+            }
+            for (name, asked, held) in [
+                ("max_bytes", corpus.max_bytes, limits.max_bytes),
+                (
+                    "max_file_bytes",
+                    corpus.max_file_bytes,
+                    limits.max_file_bytes,
+                ),
+                (
+                    "max_walk_entries",
+                    corpus.max_walk_entries.map(|value| value as u64),
+                    limits.max_walk_entries as u64,
+                ),
+            ] {
+                if let Some(asked) = asked
+                    && asked != held
+                {
+                    ignored.push(format!("protected_corpus.{name} = {asked}"));
+                }
+            }
+        }
+
+        if let Some(mcp) = layer.mcp {
+            only_turn_on(&mut ignored, "mcp.screen", &mut self.mcp.screen, mcp.screen);
+
+            if let Some(tools) = mcp.ignore_tools {
+                let (kept, refused): (Vec<_>, Vec<_>) = tools
+                    .into_iter()
+                    .partition(|tool| ignored_already(&self.mcp.ignore_tools, tool));
+                note_entries(&mut ignored, "mcp.ignore_tools adds", &refused);
+                self.mcp.ignore_tools = kept;
+            }
+        }
+
+        ignored
+    }
+
     fn apply_partial(&mut self, partial: PartialConfig) {
         if let Some(sensitivity) = partial.sensitivity
             && let Some(protected) = sensitivity.protected
@@ -518,6 +796,98 @@ impl Config {
             if let Some(ignore_tools) = mcp.ignore_tools {
                 self.mcp.ignore_tools = ignore_tools;
             }
+        }
+    }
+}
+
+/// How much a policy mode holds back: `deny` refuses, `warn` tells and lets
+/// through, `log` only records.
+fn strictness(mode: &PolicyMode) -> u8 {
+    match mode {
+        PolicyMode::Deny => 2,
+        PolicyMode::Warn => 1,
+        PolicyMode::Log => 0,
+    }
+}
+
+/// A switch whose `true` is the stricter side.
+fn only_turn_on(ignored: &mut Vec<String>, name: &str, held: &mut bool, asked: Option<bool>) {
+    match asked {
+        Some(true) => *held = true,
+        Some(false) if *held => ignored.push(format!("{name} = false")),
+        Some(false) | None => {}
+    }
+}
+
+/// One note for a list setting, naming at most five of its entries.
+fn note_entries(ignored: &mut Vec<String>, what: &str, entries: &[String]) {
+    const NAMED: usize = 5;
+    if entries.is_empty() {
+        return;
+    }
+    let named: Vec<String> = entries
+        .iter()
+        .take(NAMED)
+        .map(|entry| format!("{entry:?}"))
+        .collect();
+    let more = match entries.len().saturating_sub(NAMED) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    ignored.push(format!("{what} {}{more}", named.join(", ")));
+}
+
+/// Whether every tool the ignore entry `tool` names is ignored by `lower` too.
+fn ignored_already(lower: &[String], tool: &str) -> bool {
+    let stem = tool.strip_suffix('*').unwrap_or(tool);
+    lower.iter().any(|held| {
+        held == tool
+            || held
+                .strip_suffix('*')
+                .is_some_and(|prefix| stem.starts_with(prefix))
+    })
+}
+
+/// The safe patterns of the lower layers, to ask whether a project's pattern
+/// names only files they already call safe. It answers no where it cannot tell.
+struct LowerSafePatterns<'a> {
+    written: &'a [String],
+    all: SafePathMatcher,
+    /// Only the `dir/**` ones, which cover a whole tree or none of it.
+    trees: SafePathMatcher,
+}
+
+impl<'a> LowerSafePatterns<'a> {
+    fn new(written: &'a [String]) -> Self {
+        Self {
+            written,
+            all: SafePathMatcher::from_patterns(written.iter()),
+            trees: SafePathMatcher::from_patterns(
+                written.iter().filter(|pattern| pattern.ends_with("/**")),
+            ),
+        }
+    }
+
+    /// `written` is the project's pattern as its file has it, `resolved` as it
+    /// is applied.
+    fn cover(&self, written: &str, resolved: &str) -> bool {
+        if self
+            .written
+            .iter()
+            .any(|held| held == written || held == resolved)
+        {
+            return true;
+        }
+        if Path::new(resolved)
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        {
+            return false;
+        }
+        match resolved.strip_suffix("/**") {
+            Some(tree) => !tree.contains('*') && self.trees.covers_directory(Path::new(tree)),
+            // one file, or one name wherever it is
+            None => !resolved.contains('*') && self.all.is_safe(resolved),
         }
     }
 }
@@ -1125,6 +1495,7 @@ mod tests {
             &system_path,
             env_overrides,
         )
+        .map(|(config, _)| config)
     }
 
     fn expected_cmdrvl_profile(home: &Path) -> Vec<String> {
@@ -1210,45 +1581,70 @@ mod tests {
         .unwrap();
         assert_eq!(defaults.protected_corpus, CorpusLimits::default());
 
-        let repo_root = unique_temp_root("repo");
-        let home = unique_temp_root("home");
-        let layered = load_for_test(
-            &repo_root,
-            &home,
-            Some(
-                r#"
-                [protected_corpus]
-                max_files = 10
-                max_bytes = 1000
-                "#,
-            ),
-            Some(
-                r#"
-                [protected_corpus]
-                max_files = 20
-                "#,
-            ),
-            Some(
-                r#"
-                [protected_corpus]
-                max_file_bytes = 500
-                max_walk_entries = 99
-                "#,
-            ),
-            PartialConfig::default(),
-        )
-        .unwrap();
+        let layered = |project: Option<&str>| {
+            let repo_root = unique_temp_root("repo");
+            let home = unique_temp_root("home");
+            load_for_test(
+                &repo_root,
+                &home,
+                Some(
+                    r#"
+                    [protected_corpus]
+                    max_files = 10
+                    max_bytes = 1000
+                    "#,
+                ),
+                Some(
+                    r#"
+                    [protected_corpus]
+                    max_files = 20
+                    max_file_bytes = 500
+                    max_walk_entries = 99
+                    "#,
+                ),
+                project,
+                PartialConfig::default(),
+            )
+            .unwrap()
+            .protected_corpus
+        };
+        let lower = CorpusLimits {
+            max_files: 20,
+            max_bytes: 1000,
+            max_file_bytes: 500,
+            max_walk_entries: 99,
+        };
 
         assert_eq!(
-            layered.protected_corpus,
-            CorpusLimits {
-                max_files: 20,
-                max_bytes: 1000,
-                max_file_bytes: 500,
-                max_walk_entries: 99,
-            },
-            "user overrides system per key; project and system keys survive"
+            layered(None),
+            lower,
+            "user overrides system per key; system keys survive"
         );
+        // a project may fingerprint more files: the corpus only grows
+        assert_eq!(
+            layered(Some("[protected_corpus]\nmax_files = 30\n")),
+            CorpusLimits {
+                max_files: 30,
+                ..lower
+            }
+        );
+        // fewer files leaves some out, and either direction of the other three
+        // can drop a file the lower layers include
+        for project in [
+            "max_files = 5",
+            "max_bytes = 999",
+            "max_bytes = 1001",
+            "max_file_bytes = 499",
+            "max_file_bytes = 501",
+            "max_walk_entries = 98",
+            "max_walk_entries = 100",
+        ] {
+            assert_eq!(
+                layered(Some(&format!("[protected_corpus]\n{project}\n"))),
+                lower,
+                "{project}"
+            );
+        }
     }
 
     #[test]
@@ -1427,7 +1823,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.policy.default, PolicyMode::Warn);
+        assert_eq!(config.0.policy.default, PolicyMode::Warn);
         let notices = read_jsonl(&notice_log_path(&home));
         assert!(notices.iter().any(|notice| {
             notice["path_class"] == "veil-user-config" && notice["action"] == "canonical-preferred"
@@ -1522,7 +1918,7 @@ mod tests {
         .unwrap();
 
         let canonical_path = canonical_audit_path(&home);
-        assert_eq!(config.policy.audit_path, canonical_path);
+        assert_eq!(config.0.policy.audit_path, canonical_path);
         assert_eq!(
             fs::read_to_string(canonical_path).expect("canonical audit should be readable"),
             r#"{"tool":"Read","decision":"deny","path_class":"fixture"}"#
@@ -1537,33 +1933,30 @@ mod tests {
     }
 
     #[test]
-    fn project_layer_overrides_user_layer() {
-        let repo_root = unique_temp_root("repo");
-        let home = unique_temp_root("home");
-
-        let config = load_for_test(
-            &repo_root,
-            &home,
-            None,
-            Some(
-                r#"
-                [spine]
-                authorized_tools = ["shape"]
-                "#,
-            ),
-            Some(
-                r#"
-                [spine]
-                authorized_tools = ["shape", "profile", "canon"]
-                "#,
-            ),
-            PartialConfig::default(),
-        )
-        .unwrap();
+    fn project_layer_narrows_the_user_layer_and_adds_nothing() {
+        let load = |user: &str, project: &str| {
+            let repo_root = unique_temp_root("repo");
+            let home = unique_temp_root("home");
+            load_for_test(
+                &repo_root,
+                &home,
+                None,
+                Some(&format!("[spine]\nauthorized_tools = {user}\n")),
+                Some(&format!("[spine]\nauthorized_tools = {project}\n")),
+                PartialConfig::default(),
+            )
+            .unwrap()
+            .spine
+            .authorized_tools
+        };
 
         assert_eq!(
-            config.spine.authorized_tools,
-            vec!["shape", "profile", "canon"]
+            load(r#"["shape"]"#, r#"["shape", "profile", "canon"]"#),
+            ["shape"]
+        );
+        assert_eq!(
+            load(r#"["shape", "profile"]"#, r#"["profile"]"#),
+            ["profile"]
         );
     }
 
@@ -1597,7 +1990,12 @@ mod tests {
         let config = load_for_test(
             &repo_root,
             &home,
-            None,
+            Some(
+                r#"
+                [spine.denied_flags]
+                shape = ["--replaced-by-the-user"]
+                "#,
+            ),
             Some(
                 r#"
                 [spine.denied_flags]
@@ -1619,8 +2017,8 @@ mod tests {
         assert_eq!(config.spine.denied_flags.default, vec!["--explicit"]);
         assert_eq!(
             config.spine.denied_flags.per_tool.get("shape"),
-            Some(&vec!["--head".to_owned()]),
-            "project layer replaces the user layer's list for the same tool"
+            Some(&vec!["--columns".to_owned(), "--head".to_owned()]),
+            "the user replaces the system's list; the project only adds to it"
         );
         assert_eq!(
             config.spine.denied_flags.per_tool.get("profile"),
@@ -1773,11 +2171,25 @@ mod tests {
             config.sensitivity.protected,
             expected_with_cmdrvl_profile(&home, &["env/**"])
         );
-        assert_eq!(config.allowlist.safe_patterns, vec!["project.md"]);
+        // the project replaces the user's list only with entries it covers
+        assert!(config.allowlist.safe_patterns.is_empty());
         assert_eq!(config.spine.authorized_tools, vec!["env-tool"]);
         assert_eq!(config.policy.default, PolicyMode::Warn);
         assert!(!config.policy.audit_log);
         assert_eq!(config.policy.audit_path, home.join("custom/audit.jsonl"));
+
+        let repo_root = unique_temp_root("repo");
+        let home = unique_temp_root("home");
+        let without_a_project = load_for_test(
+            &repo_root,
+            &home,
+            Some("[allowlist]\nsafe_patterns = [\"system.md\"]\n"),
+            Some("[allowlist]\nsafe_patterns = [\"user.md\"]\n"),
+            None,
+            PartialConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(without_a_project.allowlist.safe_patterns, vec!["user.md"]);
     }
 
     #[test]
@@ -2043,14 +2455,25 @@ mod tests {
         assert!(default.mcp.ignore_tools.is_empty());
 
         assert!(!load(Some(&screen(false)), None, None).mcp.screen);
-        // a later layer wins, in either direction
+        // the user wins over the system in either direction
         assert!(
             load(Some(&screen(false)), Some(&screen(true)), None)
                 .mcp
                 .screen
         );
         assert!(
-            !load(None, Some(&screen(true)), Some(&screen(false)))
+            !load(Some(&screen(true)), Some(&screen(false)), None)
+                .mcp
+                .screen
+        );
+        // a project only turns screening on
+        assert!(
+            load(None, Some(&screen(true)), Some(&screen(false)))
+                .mcp
+                .screen
+        );
+        assert!(
+            load(None, Some(&screen(false)), Some(&screen(true)))
                 .mcp
                 .screen
         );
@@ -2067,10 +2490,18 @@ mod tests {
         // `ignore_tools` is replaced by the later layer, not merged
         let config = load(
             Some("[mcp]\nignore_tools = [\"mcp__a__b\"]\n"),
+            Some("[mcp]\nignore_tools = [\"mcp__c__*\"]\n"),
+            None,
+        );
+        assert_eq!(config.mcp.ignore_tools, ["mcp__c__*"]);
+        assert!(config.mcp.screen);
+        // a project's list replaces too, but keeps only what is ignored below
+        let config = load(
+            Some("[mcp]\nignore_tools = [\"mcp__a__b\"]\n"),
             None,
             Some("[mcp]\nignore_tools = [\"mcp__c__*\"]\n"),
         );
-        assert_eq!(config.mcp.ignore_tools, ["mcp__c__*"]);
+        assert!(config.mcp.ignore_tools.is_empty());
         assert!(config.mcp.screen);
     }
 
