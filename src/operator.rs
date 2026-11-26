@@ -2088,6 +2088,40 @@ mod tests {
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions)
                 .expect("test executable permissions should be writable");
+            wait_until_executable(path);
+        }
+    }
+
+    /// Returns once `path` can be executed.
+    ///
+    /// A script that was just written can fail to start with "Text file busy"
+    /// (ETXTBSY) although the thread that wrote it has closed it: another test
+    /// thread that forked while the file was open holds a copy of the write handle
+    /// until its child execs. The operator reports a tool that does not start as
+    /// an error, so a test of what the tool describes would then see no available
+    /// tool. The kernel lets an exec through only when no process holds the file
+    /// open for writing, so one exec that works shows the file is ready for every
+    /// later one. Any other error, or a file still busy after ten seconds, fails
+    /// here with the error itself.
+    #[cfg(unix)]
+    fn wait_until_executable(path: &Path) {
+        let started = std::time::Instant::now();
+
+        loop {
+            match std::process::Command::new(path).arg("--describe").output() {
+                Ok(_) => return,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && started.elapsed() < std::time::Duration::from_secs(10) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!(
+                    "test tool {} cannot be executed after {:?}: {error}",
+                    path.display(),
+                    started.elapsed()
+                ),
+            }
         }
     }
 
@@ -2231,15 +2265,17 @@ mod tests {
             value["guidance"],
             "Start with veil operator when a sensitive-file read is blocked, then choose an authorized spine tool instead of guessing a shell command."
         );
-        assert_eq!(value["summary"]["configured"], 2);
-        assert_eq!(value["summary"]["available"], 1);
-        assert_eq!(value["summary"]["unavailable"], 1);
+        // the report is the message: a tool that did not start says why in it
+        assert_eq!(value["summary"]["configured"], 2, "{rendered}");
+        assert_eq!(value["summary"]["available"], 1, "{rendered}");
+        assert_eq!(value["summary"]["unavailable"], 1, "{rendered}");
         assert!(
             value["tools"]
                 .as_array()
                 .expect("tools should be an array")
                 .iter()
-                .any(|tool| tool["status"] == "available" && tool["manifest"]["name"] == "shape")
+                .any(|tool| tool["status"] == "available" && tool["manifest"]["name"] == "shape"),
+            "{rendered}"
         );
         assert!(
             value["tools"]
@@ -2251,7 +2287,8 @@ mod tests {
                         && tool["reason"]
                             .as_str()
                             .is_some_and(|reason| reason.contains("not found"))
-                })
+                }),
+            "{rendered}"
         );
     }
 
@@ -2291,12 +2328,21 @@ mod tests {
         let rendered = render_operator_for_repo(&repo_root, false)
             .expect("operator human output should render");
 
-        assert!(rendered.contains("Operator"));
-        assert!(rendered.contains("start with `veil operator`"));
-        assert!(rendered.contains("instead of guessing a shell command"));
-        assert!(rendered.contains("shape [available]"));
-        assert!(rendered.contains("shape sensitive.csv --json"));
-        assert!(rendered.contains("rvl [missing]"));
+        assert!(rendered.contains("Operator"), "{rendered}");
+        assert!(
+            rendered.contains("start with `veil operator`"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("instead of guessing a shell command"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("shape [available]"), "{rendered}");
+        assert!(
+            rendered.contains("shape sensitive.csv --json"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("rvl [missing]"), "{rendered}");
     }
 
     #[test]
@@ -2316,13 +2362,14 @@ mod tests {
             render_operator_for_repo(&repo_root, true).expect("operator JSON should render");
         let value: Value = serde_json::from_str(&rendered).expect("operator JSON should parse");
 
-        assert_eq!(value["summary"]["available"], 0);
-        assert_eq!(value["summary"]["unavailable"], 1);
-        assert_eq!(value["tools"][0]["status"], "error");
+        assert_eq!(value["summary"]["available"], 0, "{rendered}");
+        assert_eq!(value["summary"]["unavailable"], 1, "{rendered}");
+        assert_eq!(value["tools"][0]["status"], "error", "{rendered}");
         assert!(
             value["tools"][0]["reason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("invalid JSON"))
+                .is_some_and(|reason| reason.contains("invalid JSON")),
+            "{rendered}"
         );
     }
 
