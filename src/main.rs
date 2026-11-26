@@ -18,6 +18,10 @@ fn main() -> ExitCode {
 
 fn dispatch() -> Result<u8, Box<dyn std::error::Error>> {
     match cli::parse_env() {
+        Ok(cli::Dispatch::BrokerMode) => {
+            veil::broker::run_broker_from_env()?;
+            Ok(0)
+        }
         Ok(cli::Dispatch::HookMode) => veil::run(),
         Ok(cli::Dispatch::Describe) => {
             println!("{}", operator::run_describe());
@@ -60,8 +64,16 @@ fn dispatch_operator(command: cli::OperatorCommand) -> Result<u8, Box<dyn std::e
             path_decision_command(args.json, || operator::run_scan(&args))
         }
         cli::OperatorCommand::Sandbox(args) => {
-            println!("{}", operator::run_sandbox(&args)?);
-            Ok(0)
+            if args.command.is_empty() {
+                println!("{}", operator::run_sandbox(&args)?);
+                Ok(0)
+            } else {
+                operator::launch_sandbox(&args.command)
+            }
+        }
+        cli::OperatorCommand::Exec(args) => {
+            let exit_code = veil::broker::run_exec(args.tool, args.args)?;
+            Ok(u8::try_from(exit_code).unwrap_or(1))
         }
         cli::OperatorCommand::Packs(args) => {
             println!("{}", operator::run_packs(&args)?);
@@ -144,6 +156,7 @@ fn command_requires_guard_preflight(command: &cli::OperatorCommand) -> bool {
             | cli::OperatorCommand::Capabilities(_)
             | cli::OperatorCommand::RobotDocs(_)
             | cli::OperatorCommand::Sandbox(_)
+            | cli::OperatorCommand::Exec(_)
             | cli::OperatorCommand::Install
             | cli::OperatorCommand::Uninstall
     )

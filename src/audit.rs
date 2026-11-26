@@ -16,11 +16,10 @@ pub const SCHEMA_VERSION: &str = "veil.audit.v2";
 /// Written on every record as `enforcement`: what stood behind the decision.
 /// `hook` is a hook reading the text of a tool call, which is advisory and
 /// parser-based: it can refuse what it can see and cannot stop what it cannot.
-/// The other value a record may carry is `sandbox`, for a decision enforced by
-/// an operating-system sandbox; nothing in veil enforces one yet, so nothing
-/// writes it, and today this is a constant because it is true. The sandbox
-/// work (bd-apj) has to make it depend on what ran. A record without the key,
-/// written before it existed, was a hook decision: that was the only kind.
+/// This constant is what every hook record carries. The sandbox broker writes
+/// `sandbox`, and `veil exec` outside a sandbox writes `direct`, through
+/// [`append_audit_record_with_enforcement`]. A record without the key, written
+/// before it existed, was a hook decision: that was the only kind.
 pub const ENFORCEMENT: &str = "hook";
 
 /// The audit log is rotated when it reaches this size...
@@ -73,6 +72,13 @@ pub struct AuditRecord {
 
 impl AuditRecord {
     pub fn to_json_value(&self) -> Value {
+        self.to_json_value_with_enforcement(ENFORCEMENT)
+    }
+
+    /// Serialize a record with the enforcement boundary that actually made
+    /// the decision. Hook callers keep using [`Self::to_json_value`]; broker
+    /// decisions identify the OS sandbox explicitly.
+    pub fn to_json_value_with_enforcement(&self, enforcement: &str) -> Value {
         json!({
             "schema_version": SCHEMA_VERSION,
             "ts": self.ts,
@@ -89,7 +95,7 @@ impl AuditRecord {
             "would_deny": self.would_deny,
             "path_is_hash": self.path_is_hash,
             "tool_input": self.tool_input,
-            "enforcement": ENFORCEMENT,
+            "enforcement": enforcement,
         })
     }
 }
@@ -120,7 +126,21 @@ pub fn append_default_audit_record(record: &AuditRecord) -> io::Result<PathBuf> 
 }
 
 pub fn append_audit_record(path: &Path, record: &AuditRecord) -> io::Result<()> {
-    append_audit_record_rotating(path, record, ROTATE_BYTES, ROTATED_FILES)
+    append_audit_record_with_enforcement(path, record, ENFORCEMENT)
+}
+
+pub fn append_audit_record_with_enforcement(
+    path: &Path,
+    record: &AuditRecord,
+    enforcement: &str,
+) -> io::Result<()> {
+    append_audit_record_rotating_with_enforcement(
+        path,
+        record,
+        enforcement,
+        ROTATE_BYTES,
+        ROTATED_FILES,
+    )
 }
 
 /// Appends one record as one line, after rotating a log that has reached
@@ -139,13 +159,23 @@ pub fn append_audit_record_rotating(
     max_bytes: u64,
     keep: usize,
 ) -> io::Result<()> {
+    append_audit_record_rotating_with_enforcement(path, record, ENFORCEMENT, max_bytes, keep)
+}
+
+pub fn append_audit_record_rotating_with_enforcement(
+    path: &Path,
+    record: &AuditRecord,
+    enforcement: &str,
+    max_bytes: u64,
+    keep: usize,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let rotation = rotate_if_full(path, max_bytes, keep);
 
-    let mut line = serde_json::to_vec(&record.to_json_value())
+    let mut line = serde_json::to_vec(&record.to_json_value_with_enforcement(enforcement))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     line.push(b'\n');
 

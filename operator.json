@@ -3,7 +3,7 @@
   "name": "veil",
   "tool_version": "0.4.2",
   "contract_version": "1.0.0",
-  "description": "Data exfiltration guard for AI coding agents. Bare `veil` is hook mode: it reads one Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload on stdin and prints that protocol's allow/deny decision. Subcommands include read-only discovery, diagnostics and Seatbelt policy compilation, plus `install`/`uninstall` for the managed Claude hook entries.",
+  "description": "Data exfiltration guard for AI coding agents. Bare `veil` is hook mode: it reads one Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload on stdin and prints that protocol's allow/deny decision. Subcommands include read-only discovery, diagnostics, Seatbelt sandbox launch, and brokered metadata processing, plus `install`/`uninstall` for the managed Claude hook entries.",
   "repository": "https://github.com/cmdrvl/veil",
   "license": "MIT",
   "agent_guide": "veil robot-docs guide",
@@ -22,6 +22,8 @@
       "veil scan <DIR> [--json]",
       "veil sandbox --print-profile",
       "veil sandbox --dry-run",
+      "veil sandbox -- <command> [args...]",
+      "veil exec <tool> [args...]",
       "veil packs [--json]",
       "veil config [--json]",
       "veil audit [--json] [--class <class> | --validate]",
@@ -91,14 +93,26 @@
     },
     {
       "name": "sandbox",
-      "description": "Compile the merged config's protected paths into a macOS Seatbelt profile. This command prints review material only; it does not launch sandbox-exec or apply confinement.",
+      "description": "Compile the merged config's protected paths into a macOS Seatbelt profile, or launch a command confined by that profile with a session-scoped metadata broker.",
       "options": [
         { "name": "print_profile", "flag": "--print-profile", "type": "flag", "description": "Print the generated Seatbelt profile to stdout; compiler warnings go to stderr" },
         { "name": "dry_run", "flag": "--dry-run", "type": "flag", "description": "Compile and report rule coverage and limitations without printing the profile or applying confinement" }
       ],
       "read_only": false,
       "guard_preflight_required": false,
-      "notes": "Loading merged config may migrate a legacy user config. Relative protected patterns are rooted at the current project directory. Glob matches are a filesystem snapshot; newly matching paths require recompilation. Hook-only built-in path classifiers and pre-existing hardlink aliases are not covered by this profile. It does not restrict network access or revoke read-capable file descriptors opened before confinement."
+      "arguments": [{ "name": "command", "type": "string[]", "position": 0, "required": false, "description": "Command and arguments after `--`; runs under Seatbelt with the broker outside confinement" }],
+      "notes": "Loading merged config may migrate a legacy user config. Relative protected patterns are rooted at the current project directory. Glob matches are a filesystem snapshot; newly matching paths require recompilation. Hook-only built-in path classifiers and pre-existing hardlink aliases are not covered by this profile. It does not restrict network access or revoke read-capable file descriptors opened before confinement. The broker socket is private to the session, and broker output is scanned before return."
+    },
+    {
+      "name": "exec",
+      "description": "Run an authorized spine tool through the active session broker, or directly with the same authorization and output scanning when no broker socket is active.",
+      "arguments": [
+        { "name": "tool", "type": "string", "position": 0, "required": true, "description": "Configured authorized spine tool basename" },
+        { "name": "args", "type": "string[]", "position": 1, "required": false, "description": "Typed tool arguments; never parsed as shell text" }
+      ],
+      "read_only": false,
+      "guard_preflight_required": false,
+      "notes": "Denied raw-output flags, shell metacharacters, unknown tools, oversized requests, and detector findings are refused. Broker calls are bounded and audited with input/output hashes; returned outputs are recorded in the derived registry."
     },
     {
       "name": "packs",

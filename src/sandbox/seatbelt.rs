@@ -331,6 +331,42 @@ fn add_rule(path: PathBuf, kind: RuleKind, rules: &mut BTreeSet<DenyRule>) -> io
     Ok(())
 }
 
+/// A profile under which a process can write no file. The broker runs each tool
+/// under it, so no flag or subcommand of a tool (`--output`, a copy into an
+/// evidence pack, a sliced CSV) can put unscanned bytes where the confined
+/// client reads them.
+pub const NO_FILE_WRITES_PROFILE: &str = "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n";
+
+/// Rules, to append to a compiled profile, that keep the confined process from
+/// changing `files` or anything under `subtrees`. No directory above one of
+/// them may be renamed or removed, which would let another take its place.
+/// Paths must be absolute with symlinked directories resolved, as Seatbelt
+/// compares them.
+pub fn write_denials(files: &[PathBuf], subtrees: &[PathBuf]) -> io::Result<String> {
+    let mut rules = BTreeSet::new();
+    let targets = files
+        .iter()
+        .map(|path| ("literal", path))
+        .chain(subtrees.iter().map(|path| ("subpath", path)));
+
+    for (kind, path) in targets {
+        rules.insert(format!(
+            "(deny file-write* ({kind} \"{}\"))\n",
+            seatbelt_string(path)?
+        ));
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor.parent().is_some() {
+                rules.insert(format!(
+                    "(deny file-write-unlink (literal \"{}\"))\n",
+                    seatbelt_string(ancestor)?
+                ));
+            }
+        }
+    }
+
+    Ok(rules.into_iter().collect())
+}
+
 fn seatbelt_string(path: &Path) -> io::Result<String> {
     let text = path.to_str().ok_or_else(|| {
         io::Error::new(

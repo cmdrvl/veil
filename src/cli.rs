@@ -12,6 +12,8 @@ use clap::{Args, Parser, Subcommand};
     about = "Data exfiltration guard for AI coding agents"
 )]
 pub struct Cli {
+    #[arg(long = "broker", hide = true)]
+    broker_mode: bool,
     #[arg(long = "robot-triage", help = "Emit read-only JSON triage for agents")]
     robot_triage: bool,
     #[arg(
@@ -149,6 +151,17 @@ pub struct SandboxArgs {
     pub print_profile: bool,
     #[arg(long, conflicts_with = "print_profile")]
     pub dry_run: bool,
+    #[arg(last = true, value_name = "COMMAND", num_args = 1..)]
+    pub command: Vec<OsString>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+#[command(trailing_var_arg = true)]
+pub struct ExecArgs {
+    #[arg(value_name = "TOOL")]
+    pub tool: String,
+    #[arg(value_name = "ARGS", allow_hyphen_values = true, num_args = 0..)]
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
@@ -173,6 +186,8 @@ pub enum OperatorCommand {
     Scan(DirCommandArgs),
     #[command(about = "Compile an opt-in macOS Seatbelt policy")]
     Sandbox(SandboxArgs),
+    #[command(about = "Run an authorized metadata tool through the broker")]
+    Exec(ExecArgs),
     #[command(about = "List built-in sensitivity packs")]
     Packs(JsonOutputArgs),
     #[command(about = "Show the merged active configuration")]
@@ -192,6 +207,7 @@ pub enum OperatorCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Dispatch {
     HookMode,
+    BrokerMode,
     Describe,
     Schema,
     Operator(OperatorCommand),
@@ -199,6 +215,10 @@ pub enum Dispatch {
 
 impl Cli {
     pub fn dispatch(self) -> Dispatch {
+        if self.broker_mode {
+            return Dispatch::BrokerMode;
+        }
+
         if self.describe {
             return Dispatch::Describe;
         }
@@ -294,6 +314,15 @@ mod tests {
             Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
                 print_profile: true,
                 dry_run: false,
+                command: Vec::new(),
+            }))
+        );
+        assert_eq!(
+            parse(&["veil", "sandbox", "--", "/bin/echo", "hello"]),
+            Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
+                print_profile: false,
+                dry_run: false,
+                command: vec!["/bin/echo".into(), "hello".into()],
             }))
         );
         assert_eq!(
@@ -301,8 +330,25 @@ mod tests {
             Dispatch::Operator(OperatorCommand::Sandbox(SandboxArgs {
                 print_profile: false,
                 dry_run: true,
+                command: Vec::new(),
             }))
         );
+    }
+
+    #[test]
+    fn exec_forwards_tool_arguments_in_typed_positions() {
+        assert_eq!(
+            parse(&["veil", "exec", "shape", "--explicit", "private.csv"]),
+            Dispatch::Operator(OperatorCommand::Exec(ExecArgs {
+                tool: "shape".to_owned(),
+                args: vec!["--explicit".to_owned(), "private.csv".to_owned()],
+            }))
+        );
+    }
+
+    #[test]
+    fn hidden_broker_flag_selects_internal_mode() {
+        assert_eq!(parse(&["veil", "--broker"]), Dispatch::BrokerMode);
     }
 
     #[test]
@@ -378,6 +424,7 @@ mod tests {
             "explain",
             "scan",
             "sandbox",
+            "exec",
             "packs",
             "config",
             "audit",

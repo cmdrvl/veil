@@ -2,11 +2,18 @@
 
 use std::collections::VecDeque;
 use std::env;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use veil::allowlist::SafePathMatcher;
@@ -252,9 +259,12 @@ pub fn run_scan(args: &DirCommandArgs) -> Result<String, Box<dyn std::error::Err
 }
 
 /// Compile the merged project policy into a reviewable macOS Seatbelt profile.
-/// This command prints policy text or a coverage summary; it does not launch
-/// `sandbox-exec` and does not claim that a process was confined.
+/// Printing modes are diagnostics only; `launch_sandbox` applies the compiled
+/// profile to a child process and starts its broker outside confinement.
 pub fn run_sandbox(args: &SandboxArgs) -> Result<String, Box<dyn std::error::Error>> {
+    if !args.command.is_empty() {
+        return Err("sandbox launch is handled by the launcher".into());
+    }
     if args.print_profile == args.dry_run {
         return Err("choose exactly one of --print-profile or --dry-run".into());
     }
@@ -280,6 +290,105 @@ pub fn run_sandbox(args: &SandboxArgs) -> Result<String, Box<dyn std::error::Err
         writeln!(output, "Warning: {warning}")?;
     }
     Ok(output)
+}
+
+/// Start the broker outside Seatbelt and apply the compiled profile to the
+/// requested client process. The broker is stopped and its socket removed when
+/// the confined process exits.
+pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Error>> {
+    if command.is_empty() {
+        return Err("veil sandbox requires a command after `--`".into());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = command;
+        return Err("the broker launcher currently requires macOS Seatbelt".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project_root = env::current_dir()?;
+        let config = config::load_config(&project_root)?;
+        let compiled = veil::sandbox::seatbelt::compile(&config, &project_root)?;
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or("HOME is required to launch the broker")?;
+        let broker_dir = home.join(".cmdrvl/state/veil/broker");
+        fs::create_dir_all(&broker_dir)?;
+        let metadata = fs::symlink_metadata(&broker_dir)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("broker state path must be a real directory".into());
+        }
+        fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o700))?;
+
+        let session = broker_session_id();
+        let socket = broker_dir.join(format!("{session}.sock"));
+        let executable = env::current_exe()?;
+        let mut profile = compiled.profile;
+        profile.push_str(&veil::broker::sandbox_write_denials(
+            &config,
+            &env::var_os("PATH").unwrap_or_default(),
+            &home.join(".cmdrvl/state/veil"),
+        )?);
+        let mut broker = Command::new(executable)
+            .arg("--broker")
+            .current_dir(&project_root)
+            .env("VEIL_BROKER_SOCKET", &socket)
+            .env("VEIL_BROKER_SESSION", &session)
+            // The pipe stays open as long as this launcher lives; the broker
+            // exits when it closes.
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            // Inherited so a startup or accept failure says why. Tool output
+            // never reaches it: tool pipes are captured and scanned.
+            .stderr(Stdio::inherit())
+            .spawn()?;
+
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            if let Some(status) = broker.try_wait()? {
+                return Err(format!("broker exited before opening its socket: {status}").into());
+            }
+            if Instant::now() >= ready_deadline {
+                let _ = broker.kill();
+                let _ = broker.wait();
+                return Err("timed out waiting for the broker socket".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let status = Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(profile)
+            .args(command)
+            .env("VEIL_BROKER_SOCKET", &socket)
+            .status();
+        let _ = broker.kill();
+        let stop_result = broker.wait().map(|_| ());
+        let socket_result = fs::remove_file(&socket);
+        let status = status?;
+        stop_result?;
+        socket_result?;
+        Ok(status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(1))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn broker_session_id() -> String {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or_default())
+        .unwrap_or_default();
+    format!(
+        "{:08x}{:08x}",
+        std::process::id(),
+        u32::try_from(time).unwrap_or_default()
+    )
 }
 
 pub fn run_packs(args: &JsonOutputArgs) -> Result<String, Box<dyn std::error::Error>> {
@@ -3021,7 +3130,13 @@ mod tests {
             // (command_requires_guard_preflight) and the manifest says `false`.
             let exempt = matches!(
                 name,
-                "doctor" | "capabilities" | "robot-docs" | "sandbox" | "install" | "uninstall"
+                "doctor"
+                    | "capabilities"
+                    | "robot-docs"
+                    | "sandbox"
+                    | "exec"
+                    | "install"
+                    | "uninstall"
             );
             assert_eq!(
                 declared, !exempt,

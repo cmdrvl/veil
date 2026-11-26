@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "macos")]
 use std::process::Output;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -40,6 +42,19 @@ fn veil(root: &Path) -> Command {
         .env_remove("VEIL_AUDIT_PATH")
         .env_remove("VEIL_DYNAMIC_ARGS");
     command
+}
+
+#[cfg(target_os = "macos")]
+fn create_executable(path: &Path, source: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("executable directory");
+    }
+    fs::write(path, source).expect("executable should be written");
+    let mut permissions = fs::metadata(path)
+        .expect("executable should exist")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).expect("executable permissions should be set");
 }
 
 #[cfg(target_os = "macos")]
@@ -190,6 +205,297 @@ fn generated_profile_denies_target_and_symlink_and_blocks_new_hardlinks() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "private payload\n");
+}
+
+#[test]
+fn a_denial_inside_a_sandbox_points_at_the_broker() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let root = fixture();
+    let reason = |socket: Option<&str>| {
+        let payload = serde_json::json!({
+            "session_id": "broker-hint",
+            "cwd": root,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "cat .env" },
+        });
+        let mut command = veil(&root);
+        command
+            .env("VEIL_HARNESS", "plain")
+            .env_remove("VEIL_BROKER_SOCKET")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(socket) = socket {
+            command.env("VEIL_BROKER_SOCKET", socket);
+        }
+        let mut child = command.spawn().expect("hook should start");
+        child
+            .stdin
+            .take()
+            .expect("stdin is piped")
+            .write_all(payload.to_string().as_bytes())
+            .expect("payload should be written");
+        let output = child.wait_with_output().expect("hook should exit");
+        let decision: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("a JSON decision");
+        assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
+        // remediation is what the hook says on standard error
+        String::from_utf8(output.stderr).expect("stderr is UTF-8")
+    };
+
+    assert!(reason(Some("/tmp/broker.sock")).contains("run: veil exec shape <path>"));
+    assert!(!reason(None).contains("veil exec"));
+}
+
+/// A `HOME` for a broker test. The session socket lives under it, and a macOS
+/// Unix socket path must be under 104 bytes, which no directory under
+/// `temp_dir()` leaves room for.
+#[cfg(target_os = "macos")]
+fn short_home() -> PathBuf {
+    let home = PathBuf::from(format!(
+        "/tmp/vb-{}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .subsec_nanos(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&home).expect("short fixture home");
+    fs::canonicalize(home).expect("canonical fixture home")
+}
+
+/// The broker runs tools with the operator's own permissions, so nothing the
+/// confined process does may change what the broker runs, or use a tool to put
+/// protected bytes where the confined process can read them.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_client_cannot_turn_the_broker_into_cat() {
+    let root = fixture();
+    let home = short_home();
+    let protected = root.join("protected.txt");
+    fs::write(&protected, "MERIDIAN-VAULT-CONFIDENTIAL\nsecond row\n").expect("protected");
+    fs::write(
+        root.join(".veil.toml"),
+        "[sensitivity]\nprotected = [\"protected.txt\"]\n[spine]\nauthorized_tools = [\"shape\"]\n",
+    )
+    .expect("project policy");
+    fs::create_dir(root.join("sub")).expect("subdirectory");
+
+    // The tool is reached through a symlink on PATH, as installed tools often are.
+    let real_bin = root.join("real-bin");
+    let real_shape = real_bin.join("shape-1.0");
+    create_executable(
+        &real_shape,
+        "#!/bin/sh\nif [ \"$1\" = \"--copy\" ]; then /bin/cp \"$2\" \"$3\"; echo copied; exit 0; fi\nrows=$(/usr/bin/wc -l < \"$1\" | /usr/bin/tr -d ' ')\nprintf '{\"rows\":%s}\\n' \"$rows\"\n",
+    );
+    let bin = root.join("bin");
+    fs::create_dir(&bin).expect("bin directory");
+    std::os::unix::fs::symlink(&real_shape, bin.join("shape")).expect("tool symlink");
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fixture PATH should be joinable");
+
+    let script = r#"
+veil=$1 root=$2 bin=$2/bin real=$2/real-bin
+cd "$root/sub"
+echo "SUBDIR=$("$veil" exec shape ../protected.txt)"
+cd /usr
+if "$veil" exec shape "$root/protected.txt" >/dev/null 2>&1; then echo OUTSIDE_CWD_ALLOWED; fi
+cd "$root"
+"$veil" exec shape --copy "$root/protected.txt" "$root/stolen.txt" >/dev/null 2>&1
+if /bin/cat "$root/stolen.txt" 2>/dev/null; then echo COPY_ALLOWED; fi
+evil='#!/bin/sh
+/bin/cat "$1"'
+(echo "$evil" > "$real/shape-1.0") 2>/dev/null && echo OVERWRITE_ALLOWED
+/bin/rm -f "$bin/shape" 2>/dev/null && echo UNLINK_ALLOWED
+/bin/mv "$real" "$root/moved-real" 2>/dev/null && echo RENAME_REAL_ALLOWED
+/bin/mv "$bin" "$root/moved-bin" 2>/dev/null && echo RENAME_BIN_ALLOWED
+(echo forged >> "$HOME/.cmdrvl/state/veil/derived.jsonl") 2>/dev/null && echo FORGE_ALLOWED
+echo "AFTER=$("$veil" exec shape "$root/protected.txt")"
+echo ordinary > "$root/ordinary-write.txt" && echo ORDINARY_WRITE_ALLOWED
+"#;
+    let output = veil(&root)
+        .args(["sandbox", "--", "/bin/sh", "-c", script, "sh"])
+        .arg(env!("CARGO_BIN_EXE_veil"))
+        .arg(&root)
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("VEIL_PROTECTED", "protected.txt")
+        .output()
+        .expect("veil should launch the sandboxed client");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let context = format!(
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(output.status.success(), "{context}");
+    // a relative path means what it means where the client stands
+    assert!(stdout.contains("SUBDIR={\"rows\":2}"), "{context}");
+    assert!(stdout.contains("AFTER={\"rows\":2}"), "{context}");
+    // control: the confinement does not stop ordinary work in the project
+    assert!(stdout.contains("ORDINARY_WRITE_ALLOWED"), "{context}");
+    for escape in [
+        "OUTSIDE_CWD_ALLOWED",
+        "COPY_ALLOWED",
+        "OVERWRITE_ALLOWED",
+        "UNLINK_ALLOWED",
+        "RENAME_REAL_ALLOWED",
+        "RENAME_BIN_ALLOWED",
+        "FORGE_ALLOWED",
+        "MERIDIAN-VAULT-CONFIDENTIAL",
+    ] {
+        assert!(!stdout.contains(escape), "{escape}\n{context}");
+    }
+}
+
+/// The broker must not outlive its launcher, even one that is killed outright
+/// and so runs no cleanup.
+#[cfg(target_os = "macos")]
+#[test]
+fn broker_exits_when_its_launcher_is_killed() {
+    let root = fixture();
+    let home = short_home();
+    fs::write(root.join("protected.txt"), "private\n").expect("protected");
+
+    let mut launcher = veil(&root)
+        .args(["sandbox", "--", "/bin/sleep", "20"])
+        .env("HOME", &home)
+        .env("VEIL_PROTECTED", "protected.txt")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("veil should launch");
+    let broker_dir = home.join(".cmdrvl/state/veil/broker");
+    let sockets = || fs::read_dir(&broker_dir).map_or(0, |entries| entries.count());
+    let wait_for = |wanted: usize| {
+        (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            sockets() == wanted
+        })
+    };
+
+    assert!(wait_for(1), "the session socket should appear");
+    launcher.kill().expect("launcher should be killed");
+    launcher.wait().expect("launcher should be reaped");
+    assert!(wait_for(0), "the broker should remove its socket and exit");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_client_gets_only_scanned_derived_output_from_session_broker() {
+    let root = fixture();
+    let home = short_home();
+    let protected = root.join("protected.txt");
+    fs::write(
+        &protected,
+        "MERIDIAN-VAULT-CONFIDENTIAL\nsecond private row\n",
+    )
+    .expect("protected fixture");
+    fs::write(
+        root.join(".veil.toml"),
+        "[sensitivity]\nprotected = [\"protected.txt\"]\n[spine]\nauthorized_tools = [\"shape\"]\n",
+    )
+    .expect("project policy");
+
+    let fake_bin = root.join("bin");
+    let shape = fake_bin.join("shape");
+    create_executable(
+        &shape,
+        "#!/bin/sh\nif [ \"$1\" = \"--leak\" ]; then printf 'AKIAIOSFODNN7EXAMPLE\\n'; exit 0; fi\nif [ \"$1\" = \"--large\" ]; then /usr/bin/head -c 16777217 /dev/zero; exit 0; fi\nrows=$(/usr/bin/wc -l < \"$1\" | /usr/bin/tr -d ' ')\nprintf '{\"rows\":%s}\\n' \"$rows\"\n",
+    );
+    let path = std::env::join_paths(std::iter::once(fake_bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("fixture PATH should be joinable");
+
+    let veil_binary = env!("CARGO_BIN_EXE_veil");
+    let protected_arg = protected.to_str().expect("protected path is UTF-8");
+    let script = format!(
+        "mode=$(/usr/bin/stat -f '%Lp' \"$VEIL_BROKER_SOCKET\")\nif [ \"$mode\" = 600 ]; then echo SOCKET_0600; else exit 46; fi\nif /bin/cat '{protected_arg}' 2>/dev/null; then echo DIRECT_READ_ALLOWED; exit 41; else echo DIRECT_READ_DENIED; fi\n'{veil_binary}' exec shape '{protected_arg}'\nif '{veil_binary}' exec shape --leak '{protected_arg}' >/dev/null 2>&1; then echo SCANNER_ALLOWED; exit 42; else echo SCANNER_DENIED; fi\nif '{veil_binary}' exec shape --explicit '{protected_arg}' >/dev/null 2>&1; then echo FLAG_ALLOWED; exit 43; else echo FLAG_DENIED; fi\nif '{veil_binary}' exec cat '{protected_arg}' >/dev/null 2>&1; then echo TOOL_ALLOWED; exit 44; else echo TOOL_DENIED; fi\nif '{veil_binary}' exec shape --large '{protected_arg}' >/dev/null 2>&1; then echo OVERSIZE_ALLOWED; exit 45; else echo OUTPUT_CAP_ENFORCED; fi\ni=0\nwhile [ \"$i\" -lt 60 ]; do if '{veil_binary}' exec shape '{protected_arg}' >/dev/null 2>&1; then i=$((i + 1)); else echo CALL_CAP:$i; break; fi; done\n"
+    );
+    let output = veil(&root)
+        .arg("sandbox")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("VEIL_PROTECTED", "protected.txt")
+        .output()
+        .expect("veil should launch the sandboxed client");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("test output is UTF-8");
+    assert!(stdout.contains("DIRECT_READ_DENIED"), "{stdout}");
+    assert!(stdout.contains("SOCKET_0600"), "{stdout}");
+    assert!(stdout.contains("{\"rows\":2}"), "{stdout}");
+    assert!(stdout.contains("SCANNER_DENIED"), "{stdout}");
+    assert!(stdout.contains("FLAG_DENIED"), "{stdout}");
+    assert!(stdout.contains("TOOL_DENIED"), "{stdout}");
+    assert!(stdout.contains("OUTPUT_CAP_ENFORCED"), "{stdout}");
+    assert!(stdout.contains("CALL_CAP:59"), "{stdout}");
+    assert!(!stdout.contains("MERIDIAN-VAULT-CONFIDENTIAL"), "{stdout}");
+    assert!(!stdout.contains("AKIAIOSFODNN7EXAMPLE"), "{stdout}");
+
+    let audit_path = home.join(".cmdrvl/logs/veil/audit.jsonl");
+    let audit = fs::read_to_string(audit_path).expect("broker calls should be audited");
+    let records = audit
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("audit JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 65, "each broker call must have one record");
+    assert!(records.iter().all(|record| {
+        record["enforcement"] == "sandbox"
+            && record["origin"] == "broker"
+            && record["tool_input"]["input_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.starts_with("blake3:"))
+            && record["tool_input"]["output_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.starts_with("blake3:"))
+    }));
+    assert!(records.iter().any(|record| {
+        record["reason"].as_str().is_some_and(|reason| {
+            reason.contains("SECRET_AWS_ACCESS_KEY") && reason.contains("blake3:")
+        })
+    }));
+    let derived_path = home.join(".cmdrvl/state/veil/derived.jsonl");
+    let derived = fs::read_to_string(derived_path).expect("derived outputs should be registered");
+    assert!(derived.lines().count() >= 60, "{derived}");
+    assert!(!derived.contains("MERIDIAN-VAULT-CONFIDENTIAL"));
+
+    let socket_parent = home.join(".cmdrvl/state/veil/broker");
+    assert!(
+        socket_parent.exists(),
+        "private broker state directory should remain"
+    );
+    assert_eq!(
+        fs::metadata(&socket_parent)
+            .expect("broker directory metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::read_dir(socket_parent)
+            .expect("broker directory should be readable")
+            .count(),
+        0,
+        "the session socket should be removed when its launcher exits"
+    );
 }
 
 #[cfg(target_os = "linux")]

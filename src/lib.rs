@@ -2,6 +2,7 @@
 
 pub mod allowlist;
 pub mod audit;
+pub mod broker;
 pub mod broker_output;
 pub mod config;
 pub mod evaluator;
@@ -66,6 +67,21 @@ pub(crate) struct ReplayDecision {
 /// (the calling wrapper or the send-policy / disclosure service the README
 /// names under "Boundary With Outbound Screening").
 const EGRESS_REMEDIATION: &str = "Egress blocked: this command would send a protected path off this machine. Do not send the protected file itself, or a copy, archive or encoding of it. For information that will cross a model boundary: run `veil operator` to discover the authorized spine tools, derive a metadata-safe artifact, and have `airlock` attest it. For anything sent to a person or a service: it goes out under the send-path policy (the calling wrapper, or the send-policy / disclosure service, that checks the recipient, authorization and approval), not from this session; stop and ask the operator to do the transfer under that policy.";
+
+/// Inside `veil sandbox` a spine tool run directly cannot read a protected
+/// file; it reads one only through the broker. A denial whose way forward is a
+/// spine tool says so. Egress and MCP denials stay as they are: their way
+/// forward is not to send the file.
+fn point_at_broker(decision: &mut Decision) {
+    if let Some(remediation) = decision.remediation.as_mut()
+        && !remediation.starts_with(EGRESS_REMEDIATION)
+        && !remediation.starts_with(MCP_REMEDIATION)
+    {
+        remediation.push_str(BROKER_REMEDIATION);
+    }
+}
+
+const BROKER_REMEDIATION: &str = " This session is inside a veil sandbox, where a spine tool reads a protected file only through the broker. run: veil exec shape <path> (or another authorized spine tool).";
 
 /// Marks the denial of a command that sends what it is given (`curl`, `scp`,
 /// `aws`, a mail client...) as an egress attempt: its remediation says so and
@@ -206,7 +222,10 @@ fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
         let commands = extract_commands(hook_input);
         evaluate_commands(hook_input, &config, &registry, &commands)
     };
-    let decision = select_decision(&outcomes);
+    let mut decision = select_decision(&outcomes);
+    if std::env::var_os(broker::BROKER_SOCKET_ENV).is_some() {
+        point_at_broker(&mut decision);
+    }
     let mut rendered = render_decision(hook_input.protocol, &decision);
 
     let warned = outcomes
