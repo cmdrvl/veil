@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Flags that escalate an authorized spine tool from metadata-safe output to raw
@@ -92,7 +93,7 @@ pub fn detect_spine_argv(
     denied_flags: &DeniedFlags,
     cwd: &Path,
 ) -> Option<SpineInvocation> {
-    let (program, args) = argv.split_first()?;
+    let (program, args) = through_veil_exec(argv, authorized_tools, cwd).split_first()?;
 
     let tool_name = authorized_tool_name(program, authorized_tools)?;
     let target_path = extract_target_path(args, cwd)?;
@@ -103,6 +104,41 @@ pub fn detect_spine_argv(
         target_path,
         denied_flag,
     })
+}
+
+/// `veil exec TOOL ARGS...` runs TOOL through the broker, so when TOOL is an
+/// authorized spine tool the command is judged as `TOOL ARGS...` (bd-fxa).
+/// Anything else is still judged as a command named `veil`.
+fn through_veil_exec<'a>(
+    argv: &'a [String],
+    authorized_tools: &[String],
+    cwd: &Path,
+) -> &'a [String] {
+    match argv {
+        [program, subcommand, tool, ..]
+            if subcommand == "exec"
+                && authorized_tool_name(tool, authorized_tools).is_some()
+                && names_this_veil(program, cwd) =>
+        {
+            &argv[2..]
+        }
+        _ => argv,
+    }
+}
+
+/// The word `veil`, found on `PATH` as a bare spine tool name is, or a path to
+/// the program that is running. A spine tool is recognised by its file name,
+/// but this must not be: any other script called `veil` would get its place.
+fn names_this_veil(program: &str, cwd: &Path) -> bool {
+    if program == "veil" {
+        return true;
+    }
+    program.contains('/')
+        && std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .is_ok_and(|running| {
+                fs::canonicalize(cwd.join(program)).is_ok_and(|named| named == running)
+            })
 }
 
 fn left_pipeline(tokens: &[String]) -> &[String] {

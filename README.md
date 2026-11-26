@@ -100,7 +100,11 @@ that denies reading the `[sensitivity].protected` paths. Inside it,
 `veil exec <tool> [args...]` asks a broker, which runs outside the sandbox, to
 run an authorized spine tool on a protected file and return what it prints.
 Outside a sandbox, `veil exec` applies the same tool, flag and output checks
-and confines nothing.
+and confines nothing. The hook judges `veil exec <authorized tool> ...` as it
+judges the tool itself, raw-value flags included. That holds for the word
+`veil`, found on `PATH` as a bare tool name is, or the path of the running veil;
+another program named `veil` gets nothing, and `veil exec` of anything else is
+judged as before.
 
 Seatbelt rules name paths, so the profile also keeps protected content from
 getting a name the rules do not cover. The confined command cannot rename,
