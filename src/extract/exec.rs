@@ -496,10 +496,10 @@ impl Lexer<'_> {
             Language::Node => byte == b'/' && self.peek(1) == Some(b'/'),
             Language::Perl => {
                 byte == b'#'
-                    && !self
+                    && self
                         .index
                         .checked_sub(1)
-                        .is_some_and(|before| self.bytes[before] == b'$')
+                        .is_none_or(|before| self.bytes[before] != b'$')
             }
             _ => byte == b'#',
         };

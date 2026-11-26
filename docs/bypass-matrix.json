@@ -799,9 +799,9 @@
       "class": "Other readers and tools",
       "from": "found since",
       "hook_only": {
-        "cause": "the script file does not exist when veil looks, and veil does not judge text written to an unprotected file",
-        "decision": "allow",
-        "leaks": "contents"
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
       },
       "id": "sed-file-written-same-line",
       "sandbox": "blocked (design, not run)",
@@ -814,9 +814,9 @@
       "class": "Other readers and tools",
       "from": "found since",
       "hook_only": {
-        "cause": "the script file does not exist when veil looks: the same limit for every interpreter (bd-1bk)",
-        "decision": "allow",
-        "leaks": "contents"
+        "class": "",
+        "decision": "deny",
+        "reason_class": "direct_read"
       },
       "id": "script-python-written-same-line",
       "sandbox": "blocked (design, not run)",

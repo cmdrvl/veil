@@ -6,8 +6,8 @@
 //!
 //! What they do not cover, and the README says so: a path a script builds at run
 //! time (from the environment, a file, user input, a module it imports); a script
-//! that arrives through a pipe; a script in a zip; a script written by an earlier
-//! command of the same line (the file does not exist yet when veil looks).
+//! that arrives through a pipe; a script in a zip. A script an earlier command of
+//! the same line writes is covered by `written_scripts.rs`.
 
 use std::fs;
 use std::io::Write;

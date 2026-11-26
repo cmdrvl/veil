@@ -385,6 +385,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                         origin: Origin::Wrapper,
                         stdin_piped: command.stdin_piped,
                         heredoc_body: None,
+                        heredoc_computed: false,
                     };
                     expand(inner, depth + 1, run, out);
                 }

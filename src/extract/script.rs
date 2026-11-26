@@ -38,6 +38,7 @@ use super::{
     extract_interpreter_script_paths, home_directory, ignorable_system_path, interpreter_kind,
     is_plain_name, jq, lexical_path, normalize_candidates, path_shaped, sed,
     strip_redirection_words,
+    written::{Writes, Written},
 };
 
 /// The largest script veil reads, in bytes.
@@ -57,11 +58,20 @@ const FILESYSTEM_BUDGET: usize = 512;
 /// The longest string or word veil treats as a path.
 const MAX_TOKEN: usize = 4096;
 
-/// What veil has read of the scripts one Bash call runs.
+/// What veil has read of the scripts one Bash call runs, and what the call
+/// writes to files before it runs them (bd-4uy).
 #[derive(Default)]
 pub(super) struct Scripts {
     read: usize,
     bytes: u64,
+    written: Written,
+}
+
+impl Scripts {
+    /// The writes of `commands`, which the scripts they run are read against.
+    pub(super) fn collect_writes(&mut self, commands: &[SimpleCommand], cwd: &Path) {
+        self.written.collect(commands, cwd);
+    }
 }
 
 /// The script a simple command runs, when it runs one.
@@ -84,14 +94,14 @@ pub(super) fn inspect(
     scripts: &mut Scripts,
     out: &mut Vec<CommandExtraction>,
 ) {
-    for run in sed_scripts(command, cwd) {
+    for run in sed_scripts(command, cwd, scripts) {
         inspect_sed(&run, cwd, depth, scripts, out);
     }
     inspect_jq(command, cwd, depth, scripts, out);
     inspect_inline(command, cwd, env, depth, scripts, out);
     inspect_awk(command, cwd, env, depth, scripts, out);
 
-    let Some(run) = find_script(command, cwd) else {
+    let Some(run) = find_script(command, cwd, scripts) else {
         return;
     };
     let (path, contents) = read_script(&run.path, run.kind, depth, scripts);
@@ -105,6 +115,7 @@ pub(super) fn inspect(
     match contents {
         Contents::Nothing => {}
         Contents::Unread(why) => out.push(extraction(&run.program, &run.name, source(Some(why)))),
+        Contents::Computed => out.push(computed(&run.program, &run.name, source(None))),
         Contents::Text(text) if run.kind == InterpreterKind::Shell => {
             shell_commands(&text, &source(None), cwd, env, depth, scripts, out);
         }
@@ -241,7 +252,10 @@ fn typed_commands(
         home: env.home.clone(),
     };
 
-    for inner in decompose_in(line, &inner_env) {
+    let commands = decompose_in(line, &inner_env);
+    scripts.collect_writes(&commands, cwd);
+
+    for inner in commands {
         let inner_cwd = inner.cwd.as_deref().unwrap_or(cwd);
         let mut found = command_extraction(&inner, inner_cwd);
 
@@ -279,7 +293,8 @@ fn inspect_awk(
     if names.is_empty()
         && program.contains('/')
         && usable(program)
-        && shebang_program(&locate(program, cwd)).is_some_and(|name| exec::is_awk(&name))
+        && shebang_program_in(&locate(program, cwd), &scripts.written)
+            .is_some_and(|name| exec::is_awk(&name))
     {
         names.push(program.clone());
     }
@@ -297,6 +312,7 @@ fn inspect_awk(
         match contents {
             Contents::Nothing => {}
             Contents::Unread(why) => out.push(extraction(program, &name, source(Some(why)))),
+            Contents::Computed => out.push(computed(program, &name, source(None))),
             Contents::Text(text) => {
                 let source = source(None);
                 let mut found = extraction(program, &name, source.clone());
@@ -332,7 +348,10 @@ fn shell_commands(
         home: env.home.clone(),
     };
 
-    for inner in decompose_in(text, &inner_env) {
+    let commands = decompose_in(text, &inner_env);
+    scripts.collect_writes(&commands, cwd);
+
+    for inner in commands {
         if inner.argv.is_empty() && !inner.is_opaque() {
             continue;
         }
@@ -371,7 +390,7 @@ struct SedRun {
 /// The sed script files `command` runs: every `-f` and `--file` of a `sed`, the
 /// file `-f -` has redirected in, or a file run by name whose first line names
 /// sed. Empty for any other command.
-fn sed_scripts(command: &SimpleCommand, cwd: &Path) -> Vec<SedRun> {
+fn sed_scripts(command: &SimpleCommand, cwd: &Path, scripts: &Scripts) -> Vec<SedRun> {
     let Some((program, args)) = command.argv.split_first() else {
         return Vec::new();
     };
@@ -397,7 +416,7 @@ fn sed_scripts(command: &SimpleCommand, cwd: &Path) -> Vec<SedRun> {
     if program.contains('/') && usable(program) {
         let path = locate(program, cwd);
 
-        if shebang_program(&path).is_some_and(|name| sed::is_sed(&name)) {
+        if shebang_program_in(&path, &scripts.written).is_some_and(|name| sed::is_sed(&name)) {
             return vec![SedRun {
                 program: program.clone(),
                 name: program.clone(),
@@ -431,6 +450,7 @@ fn inspect_sed(
     match contents {
         Contents::Nothing => {}
         Contents::Unread(why) => out.push(extraction(&run.program, &run.name, source(Some(why)))),
+        Contents::Computed => out.push(computed(&run.program, &run.name, source(None))),
         Contents::Text(text) => {
             let named = sed::file_script_files(&text);
             let mut found = extraction(&run.program, &run.name, source(None));
@@ -536,6 +556,7 @@ fn inspect_jq(
         match contents {
             Contents::Nothing => {}
             Contents::Unread(why) => out.push(extraction(program, &file.name, source(Some(why)))),
+            Contents::Computed => out.push(computed(program, &file.name, source(None))),
             Contents::Text(text) => {
                 let found = jq::prelude(&text);
                 // The imports of a file are searched from the working directory
@@ -632,9 +653,22 @@ fn extraction(program: &str, name: &str, source: ScriptSource) -> CommandExtract
     }
 }
 
+/// An extraction for a script the command string writes with text veil cannot
+/// see (bd-4uy): it is run, and what it reads is not known, as for a word veil
+/// cannot resolve. The dynamic-argument stance decides.
+fn computed(program: &str, name: &str, source: ScriptSource) -> CommandExtraction {
+    let mut found = extraction(program, name, source);
+
+    found.unresolved.push(format!(
+        "{name}, a script this command string writes with text veil cannot see"
+    ));
+    found.dynamic_strict = true;
+    found
+}
+
 // ---- which script a command runs --------------------------------------------
 
-fn find_script(command: &SimpleCommand, cwd: &Path) -> Option<Run> {
+fn find_script(command: &SimpleCommand, cwd: &Path, scripts: &Scripts) -> Option<Run> {
     let (program, args) = command.argv.split_first()?;
     let base = command_name(program);
 
@@ -676,7 +710,12 @@ fn find_script(command: &SimpleCommand, cwd: &Path) -> Option<Run> {
 
     // `./x.py`: a file run by name runs under the interpreter on its first line.
     let by_first_line = if program.contains('/') {
-        shebang_kind(&path)
+        shebang_kind_in(&path, &scripts.written).or_else(|| {
+            // text veil cannot see has no first line to read: run by name, it is
+            // a script whose text is unknown
+            (scripts.written.find(&path, path.exists()) == Writes::Computed)
+                .then_some(InterpreterKind::Shell)
+        })
     } else {
         None
     };
@@ -711,7 +750,7 @@ fn extension_kind(path: &Path) -> Option<InterpreterKind> {
     }
 }
 
-fn locate(name: &str, cwd: &Path) -> PathBuf {
+pub(super) fn locate(name: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(name);
 
     if path.is_absolute() {
@@ -722,7 +761,7 @@ fn locate(name: &str, cwd: &Path) -> PathBuf {
 }
 
 /// A word that names one file: not a variable, a substitution or a glob.
-fn usable(word: &str) -> bool {
+pub(super) fn usable(word: &str) -> bool {
     !word.is_empty() && !word.contains(['$', SUBSTITUTION, '*', '?', '[', '`'])
 }
 
@@ -892,8 +931,17 @@ fn script_operand<'a>(kind: InterpreterKind, name: &str, args: &'a [String]) -> 
 
 /// The interpreter named on the first line of a file run by name, when it is one
 /// veil reads: `#!/usr/bin/env python3`, `#!/bin/bash`.
-fn shebang_kind(path: &Path) -> Option<InterpreterKind> {
-    interpreter_kind(&shebang_program(path)?)
+/// A file the command string writes is read as written (bd-4uy).
+fn shebang_kind_in(path: &Path, written: &Written) -> Option<InterpreterKind> {
+    interpreter_kind(&shebang_program_in(path, written)?)
+}
+
+/// [`shebang_program`] of a file the command string writes first, as written.
+fn shebang_program_in(path: &Path, written: &Written) -> Option<String> {
+    match written.first_line(path) {
+        Some(line) if line.starts_with("#!") => program_of_line(&line[2..]),
+        _ => shebang_program(path),
+    }
 }
 
 /// The program named on the first line of a file run by name, `env` looked
@@ -909,7 +957,11 @@ fn shebang_program(path: &Path) -> Option<String> {
         .strip_prefix(b"#!")?
         .split(|byte| *byte == b'\n')
         .next()?;
-    let line = String::from_utf8_lossy(first_line);
+    program_of_line(&String::from_utf8_lossy(first_line))
+}
+
+/// The program a first line names, after its `#!`.
+fn program_of_line(line: &str) -> Option<String> {
     let mut words = line.split_whitespace();
     let mut program = command_name(words.next()?);
 
@@ -928,11 +980,71 @@ enum Contents {
     Text(String),
     /// A script that is there and that veil did not read; why.
     Unread(String),
+    /// The command string writes the file with text veil cannot see (bd-4uy).
+    Computed,
     /// Not a file veil reads: nothing by that name, a pipe, a directory.
     Nothing,
 }
 
+/// A script as it will be when the command runs it: the text on disk, and the text
+/// the command string writes to the file before it runs it. Both are read, since
+/// the write may not happen (`false && printf ... > x`), or may come after a run
+/// in a loop. A file the string writes with text veil cannot see is
+/// [`Contents::Computed`].
 fn read_script(
+    path: &Path,
+    kind: InterpreterKind,
+    depth: usize,
+    scripts: &mut Scripts,
+) -> (PathBuf, Contents) {
+    let (path, contents) = read_file(path, kind, depth, scripts);
+    let on_disk = !matches!(contents, Contents::Nothing);
+
+    match scripts.written.find(&path, on_disk) {
+        Writes::Untouched => (path, contents),
+        Writes::Computed => (path, Contents::Computed),
+        Writes::Text(written) => {
+            let (mut text, counted) = match contents {
+                Contents::Text(text) => (text, true),
+                Contents::Nothing => (String::new(), false),
+                other => return (path, other),
+            };
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            let before = text.len() as u64;
+            text.push_str(&written);
+
+            let size = text.len() as u64;
+            if size > SCRIPT_LIMIT {
+                return (path, Contents::Unread(too_large(size)));
+            }
+            // the disk text was counted when it was read
+            let added = size - before;
+            if !counted {
+                if depth >= MAX_DEPTH
+                    || scripts.read >= MAX_SCRIPTS
+                    || scripts.bytes + size > MAX_SCRIPT_BYTES
+                {
+                    return (path, Contents::Unread(beyond_followed()));
+                }
+                scripts.read += 1;
+            }
+            scripts.bytes += added;
+            (path, Contents::Text(text))
+        }
+    }
+}
+
+fn beyond_followed() -> String {
+    format!(
+        "is more script than veil follows for one command ({MAX_DEPTH} levels, \
+         {MAX_SCRIPTS} scripts, {MAX_SCRIPT_BYTES} bytes)"
+    )
+}
+
+/// The file as it is on disk.
+fn read_file(
     path: &Path,
     kind: InterpreterKind,
     depth: usize,
@@ -961,11 +1073,7 @@ fn read_script(
     }
     if depth >= MAX_DEPTH || scripts.read >= MAX_SCRIPTS || scripts.bytes + size > MAX_SCRIPT_BYTES
     {
-        let why = format!(
-            "is more script than veil follows for one command ({MAX_DEPTH} levels, \
-             {MAX_SCRIPTS} scripts, {MAX_SCRIPT_BYTES} bytes)"
-        );
-        return (path, Contents::Unread(why));
+        return (path, Contents::Unread(beyond_followed()));
     }
 
     let Ok(file) = File::open(&path) else {
@@ -1669,6 +1777,11 @@ mod tests {
         command.split_whitespace().map(str::to_owned).collect()
     }
 
+    /// The interpreter a file on disk names on its first line.
+    fn shebang_kind(path: &Path) -> Option<InterpreterKind> {
+        shebang_kind_in(path, &Written::default())
+    }
+
     /// The script file named, or `None` when the code is not in a named file.
     fn operand(kind: InterpreterKind, name: &str, command: &str) -> Option<String> {
         match script_operand(kind, name, &argv(command)) {
@@ -2137,7 +2250,7 @@ p = os.path.join(BASE, "a.csv")"#
         let mut scripts = Scripts::default();
         let unread = match read_script(&big, InterpreterKind::Python, 0, &mut scripts).1 {
             Contents::Unread(why) => Some(why),
-            Contents::Text(_) | Contents::Nothing => None,
+            Contents::Text(_) | Contents::Computed | Contents::Nothing => None,
         };
         assert!(
             unread.as_deref().is_some_and(|why| why.contains("bytes")),

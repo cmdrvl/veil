@@ -127,6 +127,10 @@ pub struct SimpleCommand {
     pub stdin_piped: bool,
     /// The here-document attached to this command, when it has one.
     pub heredoc_body: Option<String>,
+    /// The here-document's delimiter was not quoted and its body has something
+    /// the shell expands (`$x`, `` `date` ``, a backslash): the text the command
+    /// reads is not the text as written.
+    pub heredoc_computed: bool,
 }
 
 impl SimpleCommand {
@@ -142,6 +146,7 @@ impl SimpleCommand {
             origin: Origin::Top,
             stdin_piped: false,
             heredoc_body: None,
+            heredoc_computed: false,
         }
     }
 
@@ -562,6 +567,7 @@ fn simple_command(
         origin,
         stdin_piped: segment.stdin_piped,
         heredoc_body: segment.heredoc.clone(),
+        heredoc_computed: segment.heredoc_computed,
     })
 }
 
@@ -589,6 +595,9 @@ struct Segment {
     /// This segment only runs if the preceding `&&` or `||` condition matches.
     conditional: bool,
     heredoc: Option<String>,
+    /// A here-document of this segment is expanded by the shell and its body has
+    /// something to expand.
+    heredoc_computed: bool,
     /// Bodies of `$( )`, backticks and `<( )` found in `text`, and in an
     /// expanding here-document body.
     substitutions: Vec<String>,
@@ -1195,6 +1204,8 @@ fn read_heredoc_bodies(
 
         if heredoc.expands {
             segment.substitutions.extend(expansions(&body));
+            // `\` also: before `$`, a backtick or another `\` it is removed
+            segment.heredoc_computed |= body.contains(['$', '`', '\\']);
         }
         match &mut segment.heredoc {
             Some(existing) => existing.push_str(&body),

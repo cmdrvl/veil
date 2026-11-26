@@ -5,7 +5,7 @@
 
 Enforcement level today: **hook-only** (advisory; parser-based). `veil` reads the text of a tool call before it runs and decides from the paths that text names. It does not sandbox anything, so anything it cannot see in that text it cannot stop.
 
-207 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **152** are blocked, **27** are still ALLOWED and are listed below (17 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
+207 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **154** are blocked, **25** are still ALLOWED and are listed below (15 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
 
 How to read the columns:
 
@@ -19,15 +19,13 @@ How to read the columns:
 
 These are listed, not hidden. They are grouped by what they let out, because a file listing and a `git push` are not the same thing.
 
-### Contents can get out (17)
+### Contents can get out (15)
 
 The contents of a protected file can get out this way.
 
 | Vector | Why it is allowed | Sandbox |
 |---|---|---|
 | `sqlite3 :memory: ".import data/clients/holdings.csv t" "select * from t"` | the path is inside one quoted `.import` argument, which veil let through | blocked (design, not run) |
-| `printf 'r .env\n' > tmp.sed; sed -f tmp.sed notes.md` | the script file does not exist when veil looks, and veil does not judge text written to an unprotected file | blocked (design, not run) |
-| `printf 'print(open(".env").read())\n' > tmp.py; python3 tmp.py` | the script file does not exist when veil looks: the same limit for every interpreter (bd-1bk) | blocked (design, not run) |
 | `cat hard.csv` | a hardlink is the same file under another name, and the name is not protected | **ALLOWED** (measured, ADR B-1): ADR B-1 measured the hardlink read succeeding under a literal-path profile |
 | `cat copy.csv` | a copy made earlier is a different, unprotected path: labels do not follow copies | **ALLOWED** (design, not run): the copy is at an unprotected path |
 | `python3 scripts/build_path.py` | the path is built from pieces that never spell a protected name; veil reads scripts as text | blocked (design, not run) |
@@ -121,8 +119,8 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `sed-file-stdin-redirect` | `sed -f - notes.md < scripts/read.sed` | blocked: direct_read | blocked (design, not run) | found since | `-f -` with the script file redirected in |
 | `sed-file-piped-script` | `cat scripts/read.sed \| sed -f - notes.md` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since | the script comes down a pipe veil does not follow: refused, not skipped |
 | `sed-file-shebang` | `./scripts/shebang.sed notes.md` | blocked: direct_read | blocked (design, not run) | found since | a file run by name whose first line is `#!/usr/bin/sed -f` is a sed script; veil already reads `#!/usr/bin/env python3` files |
-| `sed-file-written-same-line` | `printf 'r .env\n' > tmp.sed; sed -f tmp.sed notes.md` | **ALLOWED**: the script file does not exist when veil looks, and veil does not judge text written to an unprotected file | blocked (design, not run) | found since | no Write tool needed: one Bash call writes the script and runs it. Run as two calls, the second is denied (README, Script Files) |
-| `script-python-written-same-line` | `printf 'print(open(".env").read())\n' > tmp.py; python3 tmp.py` | **ALLOWED**: the script file does not exist when veil looks: the same limit for every interpreter (bd-1bk) | blocked (design, not run) | found since | the README lists it as a limit; no row planted it until now |
+| `sed-file-written-same-line` | `printf 'r .env\n' > tmp.sed; sed -f tmp.sed notes.md` | blocked: direct_read | blocked (design, not run) | found since | no Write tool needed: one Bash call writes the script and runs it, so veil judges the literal text the string writes (README, Script Files) |
+| `script-python-written-same-line` | `printf 'print(open(".env").read())\n' > tmp.py; python3 tmp.py` | blocked: direct_read | blocked (design, not run) | found since | the same for every interpreter: the literal text written is read as the script |
 | `sed-control-script-file` | `sed -f scripts/plain.sed notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a script file with no file in it |
 | `sed-control-in-place-script-file` | `sed -i -f scripts/plain.sed notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: `-i -f script` is an everyday GNU spelling; the BSD reading must not refuse it |
 | `sed-control-print` | `sed -n 5p notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: no file in the script |

@@ -66,12 +66,12 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 207 vectors run against the real binary, **152** are blocked and **27** are still allowed: 17 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 207 vectors run against the real binary, **154** are blocked and **25** are still allowed: 15 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
 | Direct readers | 10 | 9 | 0 / 0 / 0 | 9 / 0 / 0 |
-| Other readers and tools | 70 | 53 | 3 / 0 / 2 | 57 / 0 / 1 |
+| Other readers and tools | 70 | 55 | 1 / 0 / 2 | 57 / 0 / 1 |
 | Shell indirection | 12 | 12 | 0 / 0 / 0 | 12 / 0 / 0 |
 | Copies and aliases | 10 | 8 | 2 / 0 / 0 | 7 / 3 / 0 |
 | Interpreters and scripts | 45 | 31 | 5 / 0 / 0 | 36 / 0 / 0 |
@@ -374,9 +374,17 @@ airtight. It does not see:
   with `-m`, a zip, a `.pyc` or any binary;
 - a script piped into a shell, which is no program of an interpreter
   (`echo 'cat .env' | sh`, `awk '{print "cat .env" | "sh"}'`);
-- a script written by an earlier command of the same line (it does not exist
-  when veil looks), or changed between the hook and the run;
+- a script made by anything but `>`, `>>` or `tee` earlier on the same line
+  (`cp`, `mv`, `curl -o`, a file a program opens itself), a file already there
+  that is replaced through a path built at run time (`> "$OUT"`), or a script
+  changed between the hook and the run;
 - a directory entry point other than a Python `__main__.py`.
+
+A script an earlier command of the same line writes is read as written: `echo`
+and `printf` text, a here-document or a here-string, sent to a file by `>`, `>>`
+or `tee`. If that line writes the file with text veil cannot see (a variable, a
+substitution, a pipe, a program's output) and then runs it, the run is judged
+under the `dynamic_args` stance, which refuses it by default.
 
 It also errs the other way. A path named in a comment or a docstring is judged
 like one in code, so `# was data/clients/x.csv` is denied.

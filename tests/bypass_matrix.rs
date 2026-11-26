@@ -692,22 +692,18 @@ fn vectors() -> Vec<Vector> {
             Unlisted,
             Since,
             bash("printf 'r .env\\n' > tmp.sed; sed -f tmp.sed notes.md"),
-            allowed(
-                "the script file does not exist when veil looks, and veil does not judge text written to an unprotected file",
-            ),
+            blocked("direct_read"),
             SB_BLOCKED,
-            "no Write tool needed: one Bash call writes the script and runs it. Run as two calls, the second is denied (README, Script Files)",
+            "no Write tool needed: one Bash call writes the script and runs it, so veil judges the literal text the string writes (README, Script Files)",
         ),
         row(
             "script-python-written-same-line",
             Unlisted,
             Since,
             bash("printf 'print(open(\".env\").read())\\n' > tmp.py; python3 tmp.py"),
-            allowed(
-                "the script file does not exist when veil looks: the same limit for every interpreter (bd-1bk)",
-            ),
+            blocked("direct_read"),
             SB_BLOCKED,
-            "the README lists it as a limit; no row planted it until now",
+            "the same for every interpreter: the literal text written is read as the script",
         ),
         row(
             "sed-control-script-file",

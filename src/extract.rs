@@ -16,6 +16,7 @@ mod jq;
 mod script;
 mod sed;
 mod wrappers;
+mod written;
 
 pub use decompose::{
     MAX_DEPTH, MAX_SEGMENTS, Origin, STDIN_ARGUMENTS, SUBSTITUTION, ShellEnv, SimpleCommand,
@@ -209,7 +210,11 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
     let mut commands = Vec::new();
     let mut scripts = script::Scripts::default();
 
-    for simple in decompose_in(command, &env) {
+    let simple_commands = decompose_in(command, &env);
+    // A script the string writes is read as written, not as it is on disk now.
+    scripts.collect_writes(&simple_commands, cwd);
+
+    for simple in simple_commands {
         let cwd = simple.cwd.as_deref().unwrap_or(cwd);
 
         commands.push(command_extraction(&simple, cwd));
