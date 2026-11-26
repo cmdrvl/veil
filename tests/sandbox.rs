@@ -630,6 +630,100 @@ echo ordinary > "$root/ordinary-write.txt" && echo ORDINARY_WRITE_ALLOWED
     }
 }
 
+/// veil's settings sit under `~/.cmdrvl/config`, which is protected by default,
+/// and the hook inside the sandbox must read them: failing to, it exits 2, and a
+/// harness then blocks every tool call. Nothing else there becomes readable,
+/// whatever the settings file has been made to point at.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_hook_inside_the_sandbox_reads_veils_own_settings_and_nothing_else() {
+    use std::os::unix::fs::symlink;
+
+    const SETTINGS: &str = "# VERMILION-SETTINGS-CANARY\n[policy]\naudit_log = false\n";
+    const SECRET: &str = "OBSIDIAN-SETTINGS-CANARY";
+    let script = r#"
+veil=$1 payload=$2 other=$3
+printf '%s' "$payload" | "$veil"
+echo "HOOK_EXIT=$?"
+/bin/cat "$other" protected.txt vault/config.toml 2>/dev/null
+exit 0
+"#;
+
+    // `readable`: whether the hook gets its settings
+    for (case, readable) in [
+        ("a file", true),
+        ("a link beside it", true),
+        ("a link to a protected file", false),
+        ("a directory that links to a protected one", false),
+    ] {
+        let root = fixture();
+        let home = short_home();
+        let settings_dir = home.join(".cmdrvl/config/veil");
+        let other = home.join(".cmdrvl/config/other-tool/token.toml");
+        fs::create_dir_all(other.parent().expect("parent")).expect("other tool directory");
+        fs::write(&other, format!("# {SECRET}\n")).expect("another tool's config");
+        // valid TOML, so that veil can load these when the settings lead to them
+        fs::write(root.join("protected.txt"), format!("# {SECRET}\n")).expect("protected");
+        fs::create_dir(root.join("vault")).expect("protected directory");
+        fs::write(root.join("vault/config.toml"), format!("# {SECRET}\n")).expect("protected");
+        fs::write(
+            root.join(".veil.toml"),
+            "[sensitivity]\nprotected = [\"protected.txt\", \"vault/**\"]\n",
+        )
+        .expect("project policy");
+        let settings = settings_dir.join("config.toml");
+        if case.starts_with("a directory") {
+            symlink(root.join("vault"), &settings_dir).expect("settings directory link");
+        } else {
+            fs::create_dir_all(&settings_dir).expect("settings directory");
+            match case {
+                "a file" => fs::write(&settings, SETTINGS).expect("settings"),
+                "a link beside it" => {
+                    fs::write(settings_dir.join("mine.toml"), SETTINGS).expect("settings");
+                    symlink("mine.toml", &settings).expect("settings link");
+                }
+                _ => symlink(root.join("protected.txt"), &settings).expect("settings link"),
+            }
+        }
+        let payload = serde_json::json!({
+            "session_id": "settings",
+            "cwd": root,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "ls" },
+        })
+        .to_string();
+
+        let output = veil(&root)
+            .args(["sandbox", "--", "/bin/sh", "-c", script, "sh"])
+            .args([env!("CARGO_BIN_EXE_veil"), &payload])
+            .arg(&other)
+            .env("HOME", &home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("VEIL_PROTECTED")
+            .output()
+            .expect("veil should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let context = format!(
+            "{case}\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(output.status.success(), "{context}");
+        assert!(!stdout.contains(SECRET), "{context}");
+        if readable {
+            assert!(stdout.contains("HOOK_EXIT=0"), "{context}");
+            assert!(
+                stdout.contains("\"permissionDecision\":\"allow\""),
+                "{context}"
+            );
+        } else {
+            // the hook fails closed rather than the file becoming readable
+            assert!(stdout.contains("HOOK_EXIT=2"), "{context}");
+        }
+    }
+}
+
 /// A client that speaks the broker protocol itself, so that only reaching the
 /// broker is in question. It tries one broker's socket under several names and
 /// prints what each connection got back.

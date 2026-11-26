@@ -55,7 +55,55 @@ struct DenyRule {
 /// treats a relative pattern as workspace-scoped even though hook matching
 /// also recognizes matching suffixes outside the workspace.
 pub fn compile(config: &Config, project_root: &Path) -> io::Result<CompiledProfile> {
-    compile_with_limit(config, project_root, MAX_GLOB_ENTRIES)
+    let mut compiled = compile_with_limit(config, project_root, MAX_GLOB_ENTRIES)?;
+    if let Some(home) = std::env::var_os("HOME") {
+        compiled.profile.push_str(&read_own_settings(&absolute_path(
+            Path::new(&home),
+            Path::new("/"),
+        )?)?);
+    }
+    Ok(compiled)
+}
+
+/// veil's settings are under `~/.cmdrvl/config`, which is protected by default,
+/// and the hook inside the sandbox has to read them. These rules, which come
+/// after the denials, allow reading that one file.
+///
+/// A confined session can create any of these names that is missing, and must
+/// not be able to make something else readable in the next session. So
+/// `config` and `config/veil` must be real directories, and a settings file
+/// that is a link is followed only inside `config/veil`.
+fn read_own_settings(home: &Path) -> io::Result<String> {
+    let cmdrvl = home.join(".cmdrvl");
+    let (Ok(root), Ok(directory)) = (
+        fs::canonicalize(&cmdrvl),
+        fs::canonicalize(cmdrvl.join("config/veil")),
+    ) else {
+        return Ok(String::new());
+    };
+    let settings = directory.join("config.toml");
+    let Ok(metadata) = fs::symlink_metadata(&settings) else {
+        return Ok(String::new());
+    };
+    if directory != root.join("config/veil") {
+        return Ok(String::new());
+    }
+
+    let mut readable = vec![settings.clone()];
+    if metadata.is_symlink()
+        && let Ok(target) = fs::canonicalize(&settings)
+        && target.starts_with(&directory)
+    {
+        readable.push(target);
+    }
+    let mut rules = String::new();
+    for path in readable {
+        rules.push_str(&format!(
+            "(allow file-read* (literal \"{}\"))\n",
+            seatbelt_string(&path)?
+        ));
+    }
+    Ok(rules)
 }
 
 fn compile_with_limit(
