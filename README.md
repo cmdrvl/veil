@@ -66,12 +66,12 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 152 vectors run against the real binary, **107** are blocked and **32** are still allowed: 22 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 168 vectors run against the real binary, **120** are blocked and **31** are still allowed: 21 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
 | Direct readers | 10 | 9 | 0 / 0 / 0 | 9 / 0 / 0 |
-| Other readers and tools | 44 | 31 | 6 / 0 / 2 | 38 / 0 / 1 |
+| Other readers and tools | 60 | 44 | 5 / 0 / 2 | 50 / 0 / 1 |
 | Shell indirection | 12 | 12 | 0 / 0 / 0 | 12 / 0 / 0 |
 | Copies and aliases | 10 | 8 | 2 / 0 / 0 | 7 / 3 / 0 |
 | Interpreters and scripts | 16 | 8 | 7 / 0 / 0 | 15 / 0 / 0 |
@@ -281,7 +281,8 @@ Limits to know about:
 judges it. `python3 read.py` does not, so veil reads `read.py` and judges what is
 in it. A script operand is found for `python`, `node`, `nodejs`, `bun`, `deno`,
 `ruby`, `perl`, `Rscript`, `bash`, `sh` and `zsh` (also versioned, `python3.12`),
-for `source` and `.`, for the `-f` and `--file` files of `sed` and `gsed`, for a
+for `source` and `.`, for the `-f` and `--file` files of `sed` and `gsed` and the
+`-f` file of `jq`, for a
 file run by name (`./tools/read.py`, when its first line names an interpreter or
 is `#!/usr/bin/sed -f`), for a file the wrapper in `uv run read.py`,
 `poetry run`, `pdm run` or `deno run` runs, for a Python directory (its
@@ -311,6 +312,19 @@ What is judged depends on the language:
   or one that runs a command (the GNU `e` command or flag), is refused like a word
   veil cannot resolve, under `[policy] dynamic_args`. A `sed -f -` that is fed
   by a pipe is refused for the same reason.
+- jq programs (`jq -n 'import "secret" as $d; $d'`, `jq -n -f prog.jq`): `jq`
+  opens a file for a string in the program, with no slash and no extension.
+  `import "x" as $d;` reads `x.json` (or `x/x.json`), and `import "x" as m;` and
+  `include "x";` read `x.jq`, searched in the working directory and in every
+  `-L` and `--library-path` directory (`-L dir`, `-Ldir`, `-nL dir`), or in
+  `~/.jq` when there is no `-L`. An import with `{search: ...}` is searched only
+  in the directories it names. Every file an import may open is a named path,
+  judged with the other words of the command. The module files that exist are
+  read in turn,
+  to the depth above, for the imports they hold, and so is the program file of
+  `-f`. A prelude veil cannot read (an unterminated string, an interpolated
+  name, which jq rejects too) is refused like a word veil cannot resolve. `jq`
+  reads only the imports at the start of a program, and so does veil.
 
 A denial names the script the path was found in, and an audit record for it has
 `origin: script`. A script that is itself under a protected path is denied for
@@ -320,7 +334,8 @@ veil reads scripts as text. That is best effort, and only an OS sandbox is
 airtight. It does not see:
 
 - a path built at run time: from the environment, a file, user input, a network
-  call or a module the script imports (imports are not followed);
+  call or a module the script imports (imports are not followed, except a jq
+  program's `import` and `include`);
 - a script that arrives through a pipe (`cat read.py | python3`), a module run
   with `-m`, a zip, a `.pyc` or any binary;
 - a script written by an earlier command of the same line (it does not exist

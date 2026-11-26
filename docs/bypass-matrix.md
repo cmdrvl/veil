@@ -5,7 +5,7 @@
 
 Enforcement level today: **hook-only** (advisory; parser-based). `veil` reads the text of a tool call before it runs and decides from the paths that text names. It does not sandbox anything, so anything it cannot see in that text it cannot stop.
 
-152 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **107** are blocked, **32** are still ALLOWED and are listed below (22 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 13 are controls that must stay allowed.
+168 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **120** are blocked, **31** are still ALLOWED and are listed below (21 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 17 are controls that must stay allowed.
 
 How to read the columns:
 
@@ -19,7 +19,7 @@ How to read the columns:
 
 These are listed, not hidden. They are grouped by what they let out, because a file listing and a `git push` are not the same thing.
 
-### Contents can get out (22)
+### Contents can get out (21)
 
 The contents of a protected file can get out this way.
 
@@ -30,7 +30,6 @@ The contents of a protected file can get out this way.
 | `printf 'print(open(".env").read())\n' > tmp.py; python3 tmp.py` | the script file does not exist when veil looks: the same limit for every interpreter (bd-1bk) | blocked (design, not run) |
 | `awk 'BEGIN{system("cat .env")}'` | the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) |
 | `awk 'BEGIN{"cat .env" \| getline x; print x}'` | the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) |
-| `jq -L . -n 'import "secret" as $d; $d'` | the file is named by an import in the jq program, which veil does not parse | blocked (design, not run) |
 | `cat hard.csv` | a hardlink is the same file under another name, and the name is not protected | **ALLOWED** (measured, ADR B-1): ADR B-1 measured the hardlink read succeeding under a literal-path profile |
 | `cat copy.csv` | a copy made earlier is a different, unprotected path: labels do not follow copies | **ALLOWED** (design, not run): the copy is at an unprotected path |
 | `python3 scripts/build_path.py` | the path is built from pieces that never spell a protected name; veil reads scripts as text | blocked (design, not run) |
@@ -136,7 +135,23 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `awk-getline-file` | `awk 'BEGIN{while((getline l < ".env")>0) print l}'` | blocked: argv_path | blocked (design, not run) | found since | confirmed denied: the quoted literal is found inside the program text |
 | `awk-system-call` | `awk 'BEGIN{system("cat .env")}'` | **ALLOWED**: the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) | found since | `gawk` is the same |
 | `awk-pipe-getline` | `awk 'BEGIN{"cat .env" \| getline x; print x}'` | **ALLOWED**: the command is a string inside the awk program, which veil does not judge as a command | blocked (design, not run) | found since | `print \| "cmd"` is the same |
-| `jq-import-data` | `jq -L . -n 'import "secret" as $d; $d'` | **ALLOWED**: the file is named by an import in the jq program, which veil does not parse | blocked (design, not run) | found since | reads ./secret.json, a credentials-pack name |
+| `jq-import-data` | `jq -L . -n 'import "secret" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | reads ./secret.json, a credentials-pack name |
+| `jq-import-default-search` | `jq -n 'import "secret" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | no `-L` at all: jq searches the working directory anyway (measured on jq 1.8.2) |
+| `jq-import-protected-dir` | `jq -L data -n 'import "clients/holdings" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | the file is data/clients/holdings.json, in a protected directory |
+| `jq-import-search-metadata` | `jq -n 'import "clients/holdings" as $d {search: "data"}; $d'` | blocked: argv_path | blocked (design, not run) | found since | the directory comes from the import's own metadata, and is a bare word that names nothing protected: it opens data/clients/holdings.json. (`search: "data/clients"` would be blocked by its own path-shaped string) |
+| `jq-include-protected-module` | `jq -L data -n 'include "clients/holdings"; 1'` | blocked: argv_path | blocked (design, not run) | found since | opens data/clients/holdings.jq; a module that does not parse is reported with its own source line |
+| `jq-import-program-file` | `jq -n -f scripts/import.jq` | blocked: argv_path | blocked (design, not run) | found since | scripts/import.jq holds `import "secret" as $d; $d`; `-f` makes the first operand the program file |
+| `jq-import-from-module` | `jq -L lib -n 'include "evil"; leak'` | blocked: argv_path | blocked (design, not run) | found since | lib/evil.jq holds the import: a module a program includes is read for its own imports |
+| `jq-import-library-path-long` | `jq --library-path data -n 'import "clients/holdings" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | `--library-path dir` is the same directory as `-L dir` |
+| `jq-import-library-path-attached` | `jq -Ldata -n 'import "clients/holdings" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | `-Ldata`: the directory attached to the option |
+| `jq-import-library-path-cluster` | `jq -nL data 'import "clients/holdings" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | `-nL data`: `-L` at the end of a cluster takes the next word |
+| `jq-import-second-of-many` | `jq -n 'import "plain" as p; import "secret" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | every import of the prelude is read, not the first |
+| `jq-import-escaped-name` | `jq -n 'import "sec\u0072et" as $d; $d'` | blocked: argv_path | blocked (design, not run) | found since | the name is what the string spells: jq decodes `\u0072` to `r` before it looks for the file |
+| `jq-import-unparseable` | `jq -n 'import "sec\("r")et" as $d; $d'` | blocked: dynamic_path_unresolvable | blocked (design, not run) | found since | an interpolated module name is no constant jq accepts; a program veil cannot read is refused, not skipped |
+| `jq-control-module` | `jq -L lib -n 'include "plain"; hello'` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: lib/plain.jq is an ordinary module |
+| `jq-control-include-reads-jq-not-json` | `jq -L . -n 'include "secret"; 1'` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: `include` opens secret.jq, never secret.json (jq reports `module not found`), so nothing protected is named |
+| `jq-control-search-replaces-default` | `jq -L data -n 'import "clients/holdings" as $d {search: "./sub"}; $d'` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: with a `search` jq looks only in ./sub, not in the `-L` directory, so data/clients/holdings.json is not opened (`module not found`, jq 1.8.2) |
+| `jq-control-plain` | `jq -r '.a[]' notes.md` | **ALLOWED**: names nothing protected | **ALLOWED** (design, not run): no protected path involved | baseline | control: a program with no import |
 
 ### Shell indirection
 

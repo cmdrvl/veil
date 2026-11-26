@@ -11,6 +11,7 @@ use crate::types::ToolKind;
 mod decompose;
 mod egress;
 mod expand;
+mod jq;
 mod script;
 mod sed;
 mod wrappers;
@@ -201,7 +202,7 @@ impl CommandExtraction {
 pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction> {
     let env = ShellEnv {
         cwd: Some(cwd.to_path_buf()),
-        home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
+        home: home_directory(),
     };
 
     let mut commands = Vec::new();
@@ -216,6 +217,10 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
     }
 
     commands
+}
+
+fn home_directory() -> Option<String> {
+    std::env::var("HOME").ok().filter(|home| !home.is_empty())
 }
 
 /// What standard input is for a command that reads its script from it
@@ -298,9 +303,20 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
     if let Some(script) = &sed_script {
         paths.extend(script.reads.iter().cloned());
     }
-    let script_writes: &[String] = sed_script
+    let mut named: Vec<String> = sed_script
         .as_ref()
-        .map_or(&[][..], |script| script.writes.as_slice());
+        .map_or_else(Vec::new, |script| script.writes.clone());
+
+    // A jq program names the files it imports by a string with no slash and no
+    // extension (`import "secret" as $d;` opens ./secret.json). The files it may
+    // open are named paths, judged with the other words (bd-3h5). The program
+    // file of `-f` and the modules an import loads are read by `script.rs`.
+    let jq_program = jq::is_jq(command_name(program))
+        .then(|| jq::inline_files(args, home_directory().as_deref()));
+    if let Some(imports) = &jq_program {
+        named.extend(imports.files.iter().cloned());
+    }
+    let script_writes: &[String] = &named;
 
     // A reader veil parses names its files exactly, so an unresolved word that
     // is a pattern or an option's value (`grep "$p" file`, `head -n $n file`)
@@ -310,6 +326,11 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
     } else {
         command.unresolved.clone()
     };
+    // A jq program whose imports veil cannot read is as opaque as a word it
+    // cannot resolve, and is refused the same way (bd-3h5).
+    if let Some(text) = jq_program.and_then(|imports| imports.refused) {
+        unresolved.push(text);
+    }
     // A sed script veil cannot parse, or one that runs a command, is as opaque
     // as a word it cannot resolve: the dynamic-argument stance decides (bd-pm8).
     if let Some(script) = sed_script

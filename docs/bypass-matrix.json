@@ -51,6 +51,18 @@
         "text": "#!/usr/bin/sed -f\nr .env\n"
       },
       {
+        "path": "scripts/import.jq",
+        "text": "import \"secret\" as $d; $d\n"
+      },
+      {
+        "path": "lib/evil.jq",
+        "text": "import \"secret\" as $d;\ndef leak: $d;\n"
+      },
+      {
+        "path": "lib/plain.jq",
+        "text": "def hello: \"hi\";\n"
+      },
+      {
         "path": "copy.csv",
         "text": "name,ssn\nada,078-05-1120\n"
       },
@@ -917,14 +929,254 @@
       "class": "Other readers and tools",
       "from": "found since",
       "hook_only": {
-        "cause": "the file is named by an import in the jq program, which veil does not parse",
-        "decision": "allow",
-        "leaks": "contents"
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
       },
       "id": "jq-import-data",
       "sandbox": "blocked (design, not run)",
       "tool_input": {
         "command": "jq -L . -n 'import \"secret\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-default-search",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -n 'import \"secret\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-protected-dir",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -L data -n 'import \"clients/holdings\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-search-metadata",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -n 'import \"clients/holdings\" as $d {search: \"data\"}; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-include-protected-module",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -L data -n 'include \"clients/holdings\"; 1'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-program-file",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -n -f scripts/import.jq"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-from-module",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -L lib -n 'include \"evil\"; leak'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-library-path-long",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq --library-path data -n 'import \"clients/holdings\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-library-path-attached",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -Ldata -n 'import \"clients/holdings\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-library-path-cluster",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -nL data 'import \"clients/holdings\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-second-of-many",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -n 'import \"plain\" as p; import \"secret\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "argv_path"
+      },
+      "id": "jq-import-escaped-name",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -n 'import \"sec\\u0072et\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "dynamic_path_unresolvable"
+      },
+      "id": "jq-import-unparseable",
+      "sandbox": "blocked (design, not run)",
+      "tool_input": {
+        "command": "jq -n 'import \"sec\\(\"r\")et\" as $d; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "jq-control-module",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "jq -L lib -n 'include \"plain\"; hello'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "jq-control-include-reads-jq-not-json",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "jq -L . -n 'include \"secret\"; 1'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "jq-control-search-replaces-default",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "jq -L data -n 'import \"clients/holdings\" as $d {search: \"./sub\"}; $d'"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Other readers and tools",
+      "from": "baseline",
+      "hook_only": {
+        "cause": "names nothing protected",
+        "decision": "allow",
+        "leaks": "contents"
+      },
+      "id": "jq-control-plain",
+      "sandbox": "**ALLOWED** (design, not run): no protected path involved",
+      "tool_input": {
+        "command": "jq -r '.a[]' notes.md"
       },
       "tool_name": "Bash"
     },

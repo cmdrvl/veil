@@ -35,8 +35,9 @@ use std::path::{Path, PathBuf};
 use super::{
     ArgvPath, ArgvResolver, CommandExtraction, InterpreterKind, Origin, PathExposure, SUBSTITUTION,
     ScriptSource, ShellEnv, SimpleCommand, command_extraction, command_name, decompose_in,
-    extract_interpreter_script_paths, ignorable_system_path, interpreter_kind, is_plain_name,
-    lexical_path, normalize_candidates, path_shaped, sed, strip_redirection_words,
+    extract_interpreter_script_paths, home_directory, ignorable_system_path, interpreter_kind,
+    is_plain_name, jq, lexical_path, normalize_candidates, path_shaped, sed,
+    strip_redirection_words,
 };
 
 /// The largest script veil reads, in bytes.
@@ -86,6 +87,7 @@ pub(super) fn inspect(
     for run in sed_scripts(command, cwd) {
         inspect_sed(&run, cwd, depth, scripts, out);
     }
+    inspect_jq(command, cwd, depth, scripts, out);
 
     let Some(run) = find_script(command, cwd) else {
         return;
@@ -257,6 +259,138 @@ fn inspect_sed(
                 found.dynamic_strict = true;
             }
             out.push(found);
+        }
+    }
+}
+
+/// A jq file whose imports are read: the program file of `-f`, or a module an
+/// import may load.
+#[derive(Clone)]
+struct JqFile {
+    /// As typed, or as the module search spells it.
+    name: String,
+    /// How many files that import files lead to this one.
+    level: usize,
+}
+
+/// The most candidate module files one jq command queues. Each import of each
+/// file names a handful, and a file that exists adds its own.
+const MAX_JQ_QUEUE: usize = 2048;
+
+/// The files a jq program file, and the jq modules an import loads, name in turn
+/// (bd-3h5). What an inline program names is added by `command_extraction`; the
+/// modules it includes are read here, since a module can import a data file as
+/// well (`include "evil"` where evil.jq says `import "secret" as $d;`).
+///
+/// jq looks for a module in several places and stops at the first, but veil reads
+/// every candidate that exists: a file jq would not have loaded can only add
+/// names to judge, never hide one. A file veil cannot read in full, or whose
+/// prelude it cannot parse, is as opaque as an unresolved word.
+fn inspect_jq(
+    command: &SimpleCommand,
+    cwd: &Path,
+    depth: usize,
+    scripts: &mut Scripts,
+    out: &mut Vec<CommandExtraction>,
+) {
+    let Some((program, args)) = command.argv.split_first() else {
+        return;
+    };
+    if !jq::is_jq(command_name(program)) {
+        return;
+    }
+
+    let line = jq::command_line(args);
+    let home = home_directory();
+    let mut queue: Vec<JqFile> = Vec::new();
+
+    match (&line.program_file, &line.program) {
+        (Some(file), _) if usable(file) => queue.push(JqFile {
+            name: file.clone(),
+            level: 0,
+        }),
+        (None, Some(text)) => {
+            let found = jq::prelude(text);
+            let modules =
+                jq::module_candidates(&found.imports, &line.libraries, ".", home.as_deref());
+            queue.extend(modules.into_iter().map(|name| JqFile { name, level: 1 }));
+        }
+        _ => {}
+    }
+
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut next = 0;
+
+    while let Some(file) = queue.get(next).cloned() {
+        next += 1;
+
+        let located = locate(&file.name, cwd);
+        let key = fs::canonicalize(&located).unwrap_or_else(|_| located.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let (path, contents) = read_script(
+            &located,
+            InterpreterKind::Shell,
+            depth + file.level,
+            scripts,
+        );
+        let source = |unread: Option<String>| ScriptSource {
+            name: file.name.clone(),
+            path: fs::canonicalize(&path).unwrap_or_else(|_| path.clone()),
+            run_in: cwd.to_path_buf(),
+            unread,
+        };
+
+        match contents {
+            Contents::Nothing => {}
+            Contents::Unread(why) => out.push(extraction(program, &file.name, source(Some(why)))),
+            Contents::Text(text) => {
+                let found = jq::prelude(&text);
+                // The imports of a file are searched from the working directory
+                // and the `-L` directories; its own directory is the base of a
+                // relative `search`.
+                let directory = match file.name.rsplit_once('/') {
+                    Some(("", _)) => "/",
+                    Some((directory, _)) => directory,
+                    None => ".",
+                };
+                let mut named: Vec<String> = Vec::new();
+                for import in &found.imports {
+                    named.extend(jq::candidates(
+                        import,
+                        &line.libraries,
+                        directory,
+                        home.as_deref(),
+                    ));
+                }
+
+                let mut extracted = extraction(program, &file.name, source(None));
+                extracted.argv_paths = named_paths(&named, cwd);
+                extracted.argv_exposure = PathExposure::ReadsContents;
+                if found.refused {
+                    // Said in the reason as the file: its text is not shown.
+                    extracted
+                        .unresolved
+                        .push(format!("the jq program in {}", file.name));
+                    extracted.dynamic_strict = true;
+                }
+                out.push(extracted);
+
+                if queue.len() < MAX_JQ_QUEUE {
+                    let modules = jq::module_candidates(
+                        &found.imports,
+                        &line.libraries,
+                        directory,
+                        home.as_deref(),
+                    );
+                    queue.extend(modules.into_iter().map(|name| JqFile {
+                        name,
+                        level: file.level + 1,
+                    }));
+                }
+            }
         }
     }
 }
