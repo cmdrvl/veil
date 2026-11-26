@@ -26,8 +26,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::expand::{self, Vars, Word};
+use super::{RedirectTarget, redirect, wrappers};
 use super::{collect_input_redirect_paths, is_redirection_word, is_shell_assignment, lookup};
-use super::{redirect, wrappers};
 
 pub use super::expand::ShellEnv;
 
@@ -111,10 +111,10 @@ pub struct SimpleCommand {
     pub cwd_unresolved: bool,
     /// Files this command reads through `<`.
     pub redirects_in: Vec<String>,
-    /// Files the shell opens for writing on this command's line, absolute where
-    /// the directory is known. A wrapper that replaces the line's words leaves
-    /// them with a command that came of it (bd-qe9).
-    pub redirects_out: Vec<String>,
+    /// What the shell opens for writing on this command's line, files absolute
+    /// where the directory is known. A wrapper that replaces the line's words
+    /// leaves them with a command that came of it (bd-qe9).
+    pub redirects_out: Vec<RedirectTarget>,
     /// Words that depend on something this module could not resolve: a variable
     /// it was not told the value of, a substitution, a brace list too long to
     /// expand, or ([`STDIN_ARGUMENTS`]) what `xargs` reads from standard input.
@@ -187,6 +187,10 @@ pub(super) struct Run {
     vars: Vars,
     assigned: Vec<String>,
     pub(super) lookup_changed: bool,
+    /// What is being read was handed on by a line that used a value the shell
+    /// may not hold ([`Vars::may_be_inherited`]), as `sh -c "x >$f"` writes
+    /// one into its script: no redirect target in it can be trusted.
+    doubted: bool,
 }
 
 impl Run {
@@ -310,12 +314,19 @@ fn script_body(
         // words turn into below (bd-qe9). Only the words as written show which
         // `>` is an operator.
         let redirected = segment.text.contains('>');
+        let place = redirect::Place {
+            cwd: directory.path.as_deref(),
+            cwd_unresolved: directory.unresolved,
+            doubted: run.doubted,
+        };
+        // asked before the line's own assignments are read (bd-bow)
+        let doubtful = run.vars.may_be_inherited(&segment.text);
         let mut writes = Vec::new();
         let words = match expand::plain_words(&segment.text) {
             Some(words) => {
                 if redirected {
                     let raw: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
-                    writes = redirect::writes(&raw, &run.vars, &run.env, directory.path.as_deref());
+                    writes = redirect::writes(&raw, &run.vars, &run.env, &place);
                 }
                 words
             }
@@ -325,7 +336,7 @@ fn script_body(
                     return;
                 };
                 if redirected {
-                    writes = redirect::writes(&raw, &run.vars, &run.env, directory.path.as_deref());
+                    writes = redirect::writes(&raw, &run.vars, &run.env, &place);
                 }
 
                 // `f=data/x.csv` runs nothing; it tells the words that follow
@@ -338,6 +349,9 @@ fn script_body(
                         let value = run.vars.value(&written, &run.env);
                         if let Some(value) = &value {
                             run.assigned.push(value.clone());
+                        }
+                        if run.vars.may_be_inherited(&written) {
+                            run.vars.doubt(&name);
                         }
                         run.vars.assign(&name, value);
                     }
@@ -369,6 +383,9 @@ fn script_body(
         // `for f in a b c; do cat $f; done`: until `done`, `$f` is each of the
         // words in turn, and every one of them is judged.
         if let Some((name, values)) = for_header(&words) {
+            if doubtful {
+                run.vars.doubt(name);
+            }
             run.vars.assign_loop(name, values);
             continue;
         }
@@ -382,7 +399,7 @@ fn script_body(
         };
         let next_directory = shell_directory_after(&command, &directory, run.env.home.as_deref())
             .map(|mut next| {
-                if segment.conditional || conditional_depth > 0 {
+                if segment.conditional || conditional_depth > 0 || doubtful {
                     next.unresolved = true;
                 }
                 next
@@ -391,7 +408,10 @@ fn script_body(
             .extend(prefix.iter().map(|(_, value)| value.clone()));
         let saved = run.vars.scoped(&prefix);
         let line = (!writes.is_empty()).then(|| (out.len(), command.clone()));
+        let doubted = run.doubted;
+        run.doubted |= doubtful;
         wrappers::expand(command, depth, run, out);
+        run.doubted = doubted;
         run.vars.restore(saved);
         if let Some((first, line)) = line {
             keep_writes(writes, line, first, out);
@@ -660,7 +680,7 @@ fn simple_command(
 /// the first command that came of the line, from `out[first]` on, or to the
 /// line itself when none did.
 fn keep_writes(
-    writes: Vec<String>,
+    writes: Vec<RedirectTarget>,
     line: SimpleCommand,
     first: usize,
     out: &mut Vec<SimpleCommand>,

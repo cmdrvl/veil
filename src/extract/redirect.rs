@@ -5,10 +5,21 @@
 //! a blank before an unquoted `<` or `>` glued to a word, so every operator
 //! begins a word.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::slice;
 
-use super::decompose::{PROCESS_SUBSTITUTION, SUBSTITUTION};
+use super::decompose::PROCESS_SUBSTITUTION;
 use super::expand::{ShellEnv, Vars};
+
+/// What one output redirection writes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RedirectTarget {
+    /// A file, by the path the shell will open.
+    File(PathBuf),
+    /// A target veil cannot resolve to a file, as it was written. The shell
+    /// may open any file at all (bd-bow).
+    Unresolved(String),
+}
 
 /// What follows the `>` or `<>` (which opens for reading and writing) of a word
 /// that begins with an output redirection, with or without a descriptor or the
@@ -61,30 +72,66 @@ fn is_descriptor(target: &str) -> bool {
     digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
-/// The files the shell opens for writing when it runs the words `raw`, from the
-/// directory `cwd`. A target veil cannot resolve is left out: it is one of the
-/// command's unresolved words, which the dynamic-argument stance judges.
-pub(super) fn writes(raw: &[&str], vars: &Vars, env: &ShellEnv, cwd: Option<&Path>) -> Vec<String> {
+/// Where the words of a line are run from, and how far veil can trust what it
+/// knows there.
+pub(super) struct Place<'a> {
+    pub cwd: Option<&'a Path>,
+    /// veil cannot be sure the shell is in `cwd`.
+    pub cwd_unresolved: bool,
+    /// The script the line is in was written with a value the shell may not
+    /// hold ([`Vars::may_be_inherited`]).
+    pub doubted: bool,
+}
+
+/// What the shell opens for writing when it runs the words `raw` at `place`. A
+/// target veil cannot be sure of is listed as unresolved, and so is the file
+/// veil would take it for, if any, which is judged too.
+pub(super) fn writes(
+    raw: &[&str],
+    vars: &Vars,
+    env: &ShellEnv,
+    place: &Place<'_>,
+) -> Vec<RedirectTarget> {
     let mut writes = Vec::new();
 
-    for target in written_targets(raw) {
+    for written in written_targets(raw) {
         // a quote veil cannot read fails the whole command where its words are
         // expanded, so there is nothing to add to that here
-        let Some(words) = vars.words(&[target], env) else {
+        let Some(words) = vars.words(&[written], env) else {
             continue;
         };
+        // whatever veil makes of such a target, the shell may make another
+        // thing of it, an empty value and so no word at all included
+        let doubted = place.doubted || vars.may_be_inherited(written);
+        if doubted {
+            writes.push(RedirectTarget::Unresolved(written.to_owned()));
+        }
         for word in words {
             let text = word.text;
-            if word.unresolved.is_some()
-                || text.is_empty()
-                || text.contains([SUBSTITUTION, PROCESS_SUBSTITUTION])
-            {
+            // `> >(cmd)` is a pipe to a command, which is judged as one
+            if text.chars().eq([PROCESS_SUBSTITUTION]) {
                 continue;
             }
-            writes.push(match cwd {
-                Some(cwd) => cwd.join(&text).to_string_lossy().into_owned(),
-                None => text,
-            });
+            // text that still looks unexpanded counts as it does in a reader's
+            // file: zsh expands `$=name` and `$~name`, which veil leaves as is
+            if word.unresolved.is_some()
+                || !super::unresolved_files(&[], slice::from_ref(&text)).is_empty()
+            {
+                writes.push(RedirectTarget::Unresolved(written.to_owned()));
+                continue;
+            }
+            if text.is_empty() {
+                continue;
+            }
+            // a relative name in a directory veil cannot follow may be any file
+            if place.cwd_unresolved && !doubted && !Path::new(&text).is_absolute() {
+                writes.push(RedirectTarget::Unresolved(written.to_owned()));
+            }
+            // and the file it names in veil's best guess at one is judged too
+            writes.push(RedirectTarget::File(match place.cwd {
+                Some(cwd) => cwd.join(&text),
+                None => PathBuf::from(text),
+            }));
         }
     }
 

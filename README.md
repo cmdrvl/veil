@@ -69,7 +69,7 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 212 vectors run against the real binary, **159** are blocked and **25** are still allowed: 15 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 213 vectors run against the real binary, **160** are blocked and **25** are still allowed: 15 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
@@ -81,7 +81,7 @@ Of 212 vectors run against the real binary, **159** are blocked and **25** are s
 | Egress | 17 | 13 | 2 / 0 / 0 | 15 / 0 / 0 |
 | Content search | 9 | 5 | 0 / 0 / 4 | 7 / 0 / 2 |
 | Dynamic and hidden paths | 6 | 6 | 0 / 0 / 0 | 6 / 0 / 0 |
-| Wrappers and prefixes | 9 | 9 | 0 / 0 / 0 | 8 / 1 / 0 |
+| Wrappers and prefixes | 10 | 10 | 0 / 0 / 0 | 8 / 2 / 0 |
 | Git | 8 | 2 | 2 / 3 / 0 | 3 / 4 / 0 |
 | Agent tools (Read, Grep, Glob, Notebook) | 10 | 6 | 2 / 0 / 1 | 6 / 2 / 1 |
 | MCP tools | 5 | 3 | 1 / 0 / 0 | 0 / 0 / 4 |
@@ -473,18 +473,43 @@ egress mode does not. The audit record has `reason_class: redirect_write`. A
 command that redirects to more than 256 different files, or whose redirection
 globs are matched against more than 4096 names, is refused.
 
+**A target veil cannot resolve is refused too**, whatever the command is and
+wherever it runs, a spine tool's included: `echo x >"$OUT"`,
+`>"out-$(date +%F).log"`, zsh's `>$=OUT`, and a relative name after a `cd` veil
+cannot follow. [`[policy] dynamic_args`](#dynamic-arguments) sets this one, and
+the audit record has `reason_class: dynamic_path_unresolvable`. veil also reads
+an assignment whether or not the shell will run it (`false && OUT=notes.md;
+echo x >"$OUT"`). So when a command sets a name that veil's own environment holds,
+and so the shell's, a target that uses it is unresolved, and so is one that uses
+a copy of it.
+
+The cost, measured: of 28,680 distinct (command, directory) pairs from 30 days of
+one machine's session transcripts, replayed against a scratch home, the build
+before this rule allowed 19,384; 18 of those (0.09%) are denied now, each for a
+variable or `$( )` in a target, and nothing it denied is allowed. It denies many
+of the others only because their directories are gone since, which can hide a
+finding: the target's own text is one veil cannot resolve in 51 pairs (0.18% of
+all).
+
 This is a check of the command's text, and it does not cover:
 
-- a target veil cannot resolve (`>"$OUT"`), which is left to the
-  [dynamic-argument stance](#dynamic-arguments), or the text of a `trap` action;
+- an unresolved target in a shell script veil reads, which like the rest of a
+  [script's](#script-files) unresolved words is not judged, or the text of a
+  `trap` action;
+- a skipped assignment of a name veil's environment does not hold. veil takes
+  `false && d=safe; echo x >"data/${d}x.csv"` for `data/safex.csv`, and the
+  shell, where `d` is unset, writes `data/x.csv`. A name that only the shell's
+  startup files export is the same;
 - a hard link to a protected file under an unprotected name (a `Read` through
   one is allowed too);
 - a link that the same command line makes before it writes: veil looks at the
   filesystem as it is before the command runs;
 - zsh's `**`, which veil matches one directory deep;
 - `Write` and `Edit` of a protected file, which are judged only for veil's
-  derived registry and key. `tee`, `cp` and `sed -i` are judged because they name
-  the path.
+  derived registry and key. `tee`, `cp` and `sed -i` are judged when they name
+  the path. Given `"$OUT"`, `cp` and `sed -i` are refused for the unresolved
+  argument, but `tee` is judged only where the
+  [stance](#dynamic-arguments) judges any other command.
 
 `veil sandbox` denies reads of protected paths, and renaming or removing them. It
 does not deny writing into them.
@@ -590,7 +615,8 @@ airtight. It does not see:
   (`echo 'cat .env' | sh`, `awk '{print "cat .env" | "sh"}'`);
 - a script made by anything but `>`, `>>` or `tee` earlier on the same line
   (`cp`, `mv`, `curl -o`, a file a program opens itself), a file already there
-  that is replaced through a path built at run time (`> "$OUT"`), or a script
+  that is replaced through a path built at run time (`tee "$OUT"`; a typed
+  `> "$OUT"` is [refused as a redirect](#redirected-writes)), or a script
   changed between the hook and the run;
 - a directory entry point other than a Python `__main__.py`.
 
@@ -704,6 +730,9 @@ judged by what the command is:
   recognises (`~/.ssh`, a credentials directory), or when an assignment in the
   command names a protected path or a directory inside one. `echo $x` and `make
   $target` run freely elsewhere.
+- The target of an output redirection is judged wherever it runs and whatever
+  the command is, because the shell opens it: `echo x >"$OUT"` is denied
+  anywhere ([Redirected Writes](#redirected-writes)).
 
 A denial says `dynamic_path_unresolvable` in its audit record and asks you to
 rewrite the command with a literal path. Set `[policy] dynamic_args` (or
@@ -751,7 +780,11 @@ directory; a script that computes its own paths is not read; `find . -exec cat {
 \;` and `grep -r` of a directory holding only a pack-recognised file such as
 `.env` are allowed (see the directory-scope note above); and a `$VAR` set in the
 caller's environment before the hook runs is unknown, so `cat $HOME_FILE` is
-denied even when the variable is harmless.
+denied even when the variable is harmless. veil also takes an assignment it reads
+to have happened: `false && f=notes.md; cat "$f"` is judged as reading
+`notes.md`, and the shell reads whatever `f` held before. Only
+[redirection targets](#redirected-writes), and the directory a `cd` moves to,
+allow for this.
 
 `[sensitivity] protected` patterns are held in an index (names, a trie of path
 components, and globs filed by a literal part they must contain), so a lookup

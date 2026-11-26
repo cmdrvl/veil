@@ -25,6 +25,8 @@ const DIRECTORY_SEARCH_REMEDIATION: &str = "Content search blocked: this directo
 
 const DYNAMIC_ARGS_REMEDIATION: &str = "Command blocked: an argument cannot be resolved to a path (a variable veil was not given, a `$( )` result, or names read from standard input), so veil cannot show that it stays clear of protected data. Rewrite with a literal path, one that needs no variable, substitution or pipe. If the file is protected, run `veil operator` to discover the authorized spine tools; do not build the path another way to get around this, and if no listed tool fits, stop and ask the operator.";
 
+const REDIRECT_TARGET_REMEDIATION: &str = "Command blocked: veil cannot tell which file a redirection would open (a variable veil was not given, or one the command sets that the shell may already hold, a `$( )` result, or a relative name after a `cd` veil cannot follow), so it cannot show that nothing protected is written over. Redirect to a literal path, an absolute one if the directory changes. If it must be a protected file, stop and ask the operator.";
+
 const VEIL_STATE_REMEDIATION: &str = "veil's derived registry and its key decide which files are derived output, so no tool call may read or change them. `veil derived list` and `veil derived verify <path>` report on them. Do not look for another way in; if they must change, stop and ask the operator.";
 
 const REDIRECT_WRITE_REMEDIATION: &str = "Redirected write blocked: the shell would empty or add to a protected file itself, whatever the command is. Send the output to a new file, or print it and read it from the terminal. Do not change a protected file another way to get around this; if it must change, stop and ask the operator.";
@@ -736,6 +738,10 @@ pub(crate) enum DynamicReason {
     ProtectedValue,
     /// The command could not be analysed at all.
     Unanalysable,
+    /// The target of an output redirection: the shell may open any file for
+    /// writing, so it is judged wherever the command runs and whatever it is
+    /// (bd-bow).
+    RedirectTarget,
 }
 
 /// The decision for a command with an argument veil cannot resolve to a path,
@@ -767,8 +773,16 @@ pub(crate) fn dynamic_args_decision(
              of nesting than it follows), so it cannot show that it reads nothing protected"
                 .to_owned()
         }
+        DynamicReason::RedirectTarget => format!(
+            "`{program}` redirects output to {what}, which veil cannot resolve to a path, so \
+             veil cannot show that nothing protected is written over"
+        ),
     };
     let cause = format!("{cause} {}", InformationLabel::Protected.annotation());
+    let remediation = match why {
+        DynamicReason::RedirectTarget => REDIRECT_TARGET_REMEDIATION,
+        _ => DYNAMIC_ARGS_REMEDIATION,
+    };
 
     match config.policy.dynamic_args {
         DynamicArgsMode::Allow => None,
@@ -779,13 +793,13 @@ pub(crate) fn dynamic_args_decision(
             reason: Some(format!("[policy] dynamic_args = warn: {cause}")),
             severity: None,
             confidence: None,
-            remediation: Some(DYNAMIC_ARGS_REMEDIATION.to_owned()),
+            remediation: Some(remediation.to_owned()),
         }),
         DynamicArgsMode::Deny => Some(resolve_policy(
             &config.policy.default,
             None,
             format!("{cause}; blocked by policy default"),
-            DYNAMIC_ARGS_REMEDIATION,
+            remediation,
         )),
     }
 }

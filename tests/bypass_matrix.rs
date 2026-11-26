@@ -2041,6 +2041,18 @@ fn vectors() -> Vec<Vector> {
             SB_BLOCKED,
             "a new file among veil's own protected paths can change what veil allows (bd-qe9)",
         ),
+        row(
+            "redirect-unresolved-target",
+            Wrappers,
+            Since,
+            bash("echo x >\"$OUT\""),
+            blocked("dynamic_path_unresolvable"),
+            Sandbox::Allowed(
+                Evidence::Design,
+                "the profile denies reading, renaming and removing a protected file, not writing into it",
+            ),
+            "the shell fills the target in after the hook has answered, and could name any file (bd-bow)",
+        ),
         // ---- git
         row(
             "git-add",

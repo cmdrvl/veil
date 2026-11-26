@@ -61,6 +61,9 @@ pub(super) struct Vars {
     /// The loop variables of `for name in words; do ...; done` whose words are
     /// all known: a word that uses one stands for each value in turn.
     loops: BTreeMap<String, Vec<String>>,
+    /// Names whose value was worked out from one the shell may not hold: see
+    /// [`Vars::may_be_inherited`].
+    doubtful: BTreeSet<String>,
     /// Unresolved words named so far by the current call of [`Vars::words`].
     named: Cell<usize>,
     /// The command string the names below are worked out from.
@@ -93,6 +96,7 @@ impl Vars {
         Self {
             values: BTreeMap::new(),
             loops: BTreeMap::new(),
+            doubtful: BTreeSet::new(),
             named: Cell::new(0),
             command: command.to_owned(),
             unknown: OnceCell::new(),
@@ -131,6 +135,28 @@ impl Vars {
                 self.loops.remove(name);
             }
         }
+    }
+
+    /// Whether `written` uses a value veil read from the command string that
+    /// the shell may not hold. veil reads an assignment whether or not the
+    /// shell will run it (`false && f=x`, `(f=x)`), and where it does not, the
+    /// name keeps what the shell started with. That is so for a name veil's own
+    /// environment holds, which the shell shares, and for whatever was worked
+    /// out from such a use. Redirect targets ask, and the `cd` one may be named
+    /// from; a reader's arguments do not (bd-bow).
+    pub(super) fn may_be_inherited(&self, written: &str) -> bool {
+        if self.values.is_empty() && self.loops.is_empty() {
+            return false;
+        }
+        names_used(written).any(|name| {
+            (self.values.contains_key(name) || self.loops.contains_key(name))
+                && (self.doubtful.contains(name) || std::env::var_os(name).is_some())
+        })
+    }
+
+    /// Records that what `name` is being given was worked out from such a use.
+    pub(super) fn doubt(&mut self, name: &str) {
+        self.doubtful.insert(name.to_owned());
     }
 
     /// Sets `pairs` for one command only (`f=x sh -c 'cat $f'`), and returns what
@@ -881,6 +907,18 @@ pub(super) fn exports_to_environment(raw: &[&str]) -> bool {
             .any(|option| option.contains('x')),
         _ => false,
     }
+}
+
+/// The name after each `$` of `written`, as in `$name`, `${name}` and
+/// `${#name}`.
+fn names_used(written: &str) -> impl Iterator<Item = &str> {
+    written.split('$').skip(1).filter_map(|after| {
+        let name = after.trim_start_matches(['{', '#', '!']);
+        let end = name
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .unwrap_or(name.len());
+        (end > 0).then(|| &name[..end])
+    })
 }
 
 /// Names whose value veil cannot know from reading the command once: assigned

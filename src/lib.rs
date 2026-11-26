@@ -31,8 +31,8 @@ use evaluator::{
     DynamicReason, EvaluationInput, PolicyMatchers, dynamic_args_decision, evaluate_access_with,
 };
 use extract::{
-    CommandExtraction, Origin, PathExposure, STDIN_ARGUMENTS, SUBSTITUTION, ScriptSource,
-    extract_bash_commands, extract_read_or_grep_paths,
+    CommandExtraction, Origin, PathExposure, RedirectTarget, STDIN_ARGUMENTS, SUBSTITUTION,
+    ScriptSource, extract_bash_commands, extract_read_or_grep_paths,
 };
 use hook::parse_hook_input;
 use packs::PackRegistry;
@@ -553,9 +553,18 @@ fn evaluate_commands(
         // The shell opens what a command redirects to before the command runs,
         // so this too is judged whatever the command is (bd-qe9). Writing a
         // file sends it nowhere, so the egress policy does not come into it.
+        let mut unresolved_target = None;
         for target in &command.redirect_targets {
+            let file = match target {
+                RedirectTarget::File(file) => file,
+                // one refusal says it for every such target on the command
+                RedirectTarget::Unresolved(written) => {
+                    unresolved_target.get_or_insert(written);
+                    continue;
+                }
+            };
             let refused = evaluator::evaluate_redirect_write(
-                target,
+                file,
                 hook_input.tool,
                 config,
                 registry,
@@ -674,6 +683,13 @@ fn evaluate_commands(
 
         if let Some(tool) = &withheld {
             explain_withheld_authority(&mut outcomes[first_outcome..], tool);
+        }
+
+        // Added after the words were judged, so that neither stands in for the
+        // other, and for a spine tool too: the shell opens the file, not the
+        // tool (bd-bow).
+        if let Some(written) = unresolved_target {
+            outcomes.extend(unresolved_target_outcome(config, command, written));
         }
 
         // What came out of a script says which script it was, and that reading
@@ -906,6 +922,33 @@ fn dynamic_outcome(
         reason_class: ReasonClass::DynamicPath,
         // An argument veil cannot resolve is not an attempt to send a
         // protected path, so it stays out of the egress class.
+        egress: false,
+    })
+}
+
+/// The outcome for a redirection whose target veil cannot resolve, which
+/// `written` shows as it was typed: `None` under `dynamic_args = "allow"`.
+/// Writing a file sends it nowhere, so `config` is the one without the egress
+/// policy.
+fn unresolved_target_outcome(
+    config: &config::Config,
+    command: &CommandExtraction,
+    written: &str,
+) -> Option<CandidateOutcome> {
+    let program = command
+        .argv
+        .first()
+        .map(|word| readable(command_basename(word)))
+        .unwrap_or_default();
+    let label = readable(written);
+    let what = format!("`{label}`");
+
+    Some(CandidateOutcome {
+        path: PathBuf::from(label),
+        decision: dynamic_args_decision(config, &program, &what, DynamicReason::RedirectTarget)?,
+        sensitivity: None,
+        origin: command.origin,
+        reason_class: ReasonClass::DynamicPath,
         egress: false,
     })
 }

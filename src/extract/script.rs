@@ -33,11 +33,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::{
-    ArgvPath, ArgvResolver, CommandExtraction, InterpreterKind, Origin, PathExposure, SUBSTITUTION,
-    ScriptSource, ShellEnv, SimpleCommand, command_extraction, command_name, decompose_in, exec,
-    extract_interpreter_script_paths, home_directory, ignorable_system_path, interpreter_kind,
-    is_plain_name, jq, lexical_path, normalize_candidates, path_shaped, sed,
-    strip_redirection_words,
+    ArgvPath, ArgvResolver, CommandExtraction, InterpreterKind, Origin, PathExposure,
+    RedirectTarget, SUBSTITUTION, ScriptSource, ShellEnv, SimpleCommand, command_extraction,
+    command_name, decompose_in, exec, extract_interpreter_script_paths, home_directory,
+    ignorable_system_path, interpreter_kind, is_plain_name, jq, lexical_path, normalize_candidates,
+    path_shaped, sed, strip_redirection_words,
     written::{Writes, Written},
 };
 
@@ -365,6 +365,10 @@ fn shell_commands(
         });
         found.unresolved.clear();
         found.cwd_unresolved = false;
+        // nor is a target veil cannot resolve, which is one of those words
+        found
+            .redirect_targets
+            .retain(|target| matches!(target, RedirectTarget::File(_)));
         // Keep the decomposer's opaque tail. Dropping it would let a protected
         // read after an unbalanced construct or the segment cap disappear.
         found.opaque = inner.is_opaque();
