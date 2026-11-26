@@ -323,13 +323,22 @@ pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Er
         fs::set_permissions(&broker_dir, fs::Permissions::from_mode(0o700))?;
 
         let session = broker_session_id();
-        let socket = broker_dir.join(format!("{session}.sock"));
+        let socket_name = format!(
+            "{}{session}.sock",
+            veil::sandbox::seatbelt::BROKER_SOCKET_PREFIX
+        );
+        let socket = broker_dir.join(&socket_name);
         let executable = env::current_exe()?;
         let mut profile = compiled.profile;
         profile.push_str(&veil::broker::sandbox_write_denials(
             &config,
             &env::var_os("PATH").unwrap_or_default(),
             &home.join(".cmdrvl/state/veil"),
+        )?);
+        let resolved_broker_dir = fs::canonicalize(&broker_dir)?;
+        profile.push_str(&veil::sandbox::seatbelt::broker_reach(
+            &resolved_broker_dir,
+            &resolved_broker_dir.join(&socket_name),
         )?);
         let mut broker = Command::new(executable)
             .arg("--broker")

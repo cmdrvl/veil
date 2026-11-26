@@ -136,6 +136,12 @@ one; replace the tool with a copy of its own. Each output returned is recorded
 by hash in `derived.jsonl` there, and each call is in the audit log with
 `enforcement: sandbox`, `origin: broker`.
 
+A confined command reaches no broker but its own session's. Another broker
+answers with its own session's files and policy, which this session may deny, so
+the profile refuses connections to every socket named `veil-broker-*.sock`
+except this session's, under any `HOME`, and to anything else in this `HOME`'s
+broker directory. Other programs' sockets are not affected.
+
 It does not:
 
 - deny reads of files that only a built-in pack classifies: list them under

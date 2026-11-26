@@ -374,6 +374,31 @@ fn add_rule(path: PathBuf, kind: RuleKind, rules: &mut BTreeSet<DenyRule>) -> io
 /// client reads them.
 pub const NO_FILE_WRITES_PROFILE: &str = "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n";
 
+/// How every broker socket's file name starts. The profile refuses sockets by
+/// name, so this is part of the boundary.
+pub const BROKER_SOCKET_PREFIX: &str = "veil-broker-";
+
+/// Rules, to append to a compiled profile, that let the confined process
+/// connect to its own session's broker and to no other. Another broker answers
+/// with its own session's files and policy, which this session may deny
+/// (bd-xa6). `broker_dir` is where this user's brokers listen and `own` is this
+/// session's socket, both with symlinked directories resolved.
+///
+/// A session started under another `HOME` listens elsewhere, so a socket is
+/// refused by its name wherever it is, and may not be renamed or removed.
+/// `broker_dir` is refused whole as well.
+pub fn broker_reach(broker_dir: &Path, own: &Path) -> io::Result<String> {
+    let any = format!("(regex #\"/{BROKER_SOCKET_PREFIX}[^/]*[.]sock$\")");
+    Ok(format!(
+        "(deny network-outbound {any})\n\
+         (deny network-outbound (subpath \"{}\"))\n\
+         (allow network-outbound (literal \"{}\"))\n\
+         (deny file-write* {any})\n",
+        seatbelt_string(broker_dir)?,
+        seatbelt_string(own)?,
+    ))
+}
+
 /// A path rule follows a name, not a file. These rules keep protected content
 /// from getting a name the read denials do not cover: no protected path, and no
 /// directory above one, may be renamed, swapped or removed, and no directory

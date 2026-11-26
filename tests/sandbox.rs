@@ -630,6 +630,207 @@ echo ordinary > "$root/ordinary-write.txt" && echo ORDINARY_WRITE_ALLOWED
     }
 }
 
+/// A client that speaks the broker protocol itself, so that only reaching the
+/// broker is in question. It tries one broker's socket under several names and
+/// prints what each connection got back.
+#[cfg(target_os = "macos")]
+const BROKER_CLIENT: &str = r#"
+import json, os, socket, sys
+sock, project, work, dev, ino, mode = sys.argv[1:7]
+
+def ask(label, path, cwd=None):
+    if cwd:
+        os.chdir(cwd)
+    client = socket.socket(socket.AF_UNIX)
+    client.settimeout(10)
+    try:
+        client.connect(path)
+        request = {"tool": "shape", "argv": ["secret.txt"], "cwd": project}
+        client.sendall(json.dumps(request).encode() + b"\n")
+        client.shutdown(socket.SHUT_WR)
+        reply = b""
+        while True:
+            part = client.recv(65536)
+            if not part:
+                break
+            reply += part
+        frames = [json.loads(line) for line in reply.splitlines()]
+        got = b"".join(bytes(f["chunk"]) for f in frames if "chunk" in f)
+        print(label, "ANSWERED", got.decode().strip(), flush=True)
+    except OSError as error:
+        print(label, "UNREACHABLE", error.errno, flush=True)
+    finally:
+        client.close()
+
+def symlinked():
+    link = os.path.join(work, mode + ".sock")
+    os.symlink(sock, link)
+    return link
+
+ask("direct", sock)
+ask("symlink", symlinked())
+ask("relative", os.path.basename(sock), os.path.dirname(sock))
+ask("upper-case", os.path.join(os.path.dirname(sock), os.path.basename(sock).upper()))
+ask("volfs", "/.vol/%s/%s" % (dev, ino))
+if mode == "confined":
+    # a new name for the socket, or for the directory it is in, that no rule
+    # about the old one covers
+    for label, source in [("renamed-socket", sock), ("renamed-directory", os.path.dirname(sock))]:
+        moved = os.path.join(work, label)
+        try:
+            os.rename(source, moved)
+        except OSError as error:
+            print(label, "UNMOVED", error.errno, flush=True)
+            continue
+        ask(label, moved if source == sock else os.path.join(moved, os.path.basename(sock)))
+        os.rename(moved, source)
+"#;
+
+/// A broker answers with its own session's project, policy and tools, and
+/// another session may be denied exactly those files. A confined command must
+/// reach no broker but its own (bd-xa6).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_confined_command_reaches_only_its_own_session_broker() {
+    use std::os::unix::fs::MetadataExt;
+
+    const SECRET: &str = "CROSS-SESSION-PRIVATE-8821";
+    let session = |home: &Path, project: &Path, protected: &str, tool: &str| {
+        fs::create_dir_all(project).expect("project");
+        fs::write(
+            project.join(".veil.toml"),
+            format!("[sensitivity]\nprotected = [{protected}]\n[spine]\nauthorized_tools = [\"shape\"]\n"),
+        )
+        .expect("project policy");
+        create_executable(&project.join("bin/shape"), tool);
+        let path = std::env::join_paths([
+            project.join("bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .expect("fixture PATH");
+        let mut command = veil(project);
+        command
+            .env("HOME", home)
+            .env("PATH", path)
+            .env_remove("VEIL_PROTECTED");
+        command
+    };
+    // Session A waits, with its broker listening, until the others are done.
+    let waiting = r#"
+printf '%s' "$VEIL_BROKER_SOCKET" > socket.tmp && /bin/mv socket.tmp socket.path
+tries=0
+while [ $tries -lt 1200 ] && [ ! -e go ]; do tries=$((tries + 1)); /bin/sleep 0.05; done
+"#;
+
+    // `shared_home`: whether both sessions are the same user home, as they are
+    // unless one is pointed elsewhere
+    for shared_home in [true, false] {
+        let a = fixture().join("a");
+        let a_home = short_home();
+        fs::create_dir_all(&a).expect("project a");
+        fs::write(a.join("secret.txt"), format!("{SECRET}\n")).expect("secret");
+        let mut launcher = session(
+            &a_home,
+            &a,
+            "\"secret.txt\"",
+            "#!/bin/sh\n/bin/cat \"$1\"\n",
+        )
+        .args(["sandbox", "--", "/bin/sh", "-c", waiting])
+        .spawn()
+        .expect("session a should launch");
+        assert!(
+            (0..1000).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                a.join("socket.path").exists()
+            }),
+            "session a should name its socket"
+        );
+        let socket = fs::read_to_string(a.join("socket.path")).expect("socket path");
+        let metadata = fs::metadata(&socket).expect("socket a");
+        let client = |command: &mut Command, work: &Path, mode: &str| {
+            command
+                .args([
+                    &socket,
+                    a.to_str().expect("utf-8"),
+                    work.to_str().expect("utf-8"),
+                ])
+                .args([metadata.dev().to_string(), metadata.ino().to_string()])
+                .arg(mode);
+        };
+
+        let b = fixture().join("b");
+        let b_home = if shared_home {
+            a_home.clone()
+        } else {
+            short_home()
+        };
+        fs::create_dir_all(&b).expect("project b");
+
+        // control: outside a sandbox the same client is answered. Its links
+        // go in a short directory, so that their paths fit a socket address.
+        let links = short_home();
+        let mut unconfined = Command::new("/usr/bin/python3");
+        unconfined.args(["-I", "-c", BROKER_CLIENT]);
+        client(&mut unconfined, &links, "control");
+        let control = unconfined.output().expect("control client");
+        let control = String::from_utf8_lossy(&control.stdout).into_owned();
+
+        fs::write(b.join("own.txt"), "mine\n").expect("own file");
+        let own_secret = a.join("secret.txt");
+        let mut confined = session(
+            &b_home,
+            &b,
+            &format!("\"own.txt\", \"{}\"", own_secret.display()),
+            "#!/bin/sh\necho '{\"rows\":1}'\n",
+        );
+        let script = r#"
+veil=$1 client=$2 a_secret=$3
+shift 3
+echo "OWN=$("$veil" exec shape own.txt)"
+/bin/cat "$a_secret" 2>/dev/null || echo DIRECT_READ_REFUSED
+/usr/bin/python3 -I -c "$client" "$@"
+"#;
+        confined
+            .args(["sandbox", "--", "/bin/sh", "-c", script, "sh"])
+            .args([env!("CARGO_BIN_EXE_veil"), BROKER_CLIENT])
+            .arg(&own_secret);
+        client(&mut confined, &links, "confined");
+        let output = confined.output().expect("session b should run");
+
+        fs::write(a.join("go"), "").expect("release session a");
+        assert!(launcher.wait().expect("session a should exit").success());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let context = format!(
+            "shared home: {shared_home}\ncontrol:\n{control}\nconfined:\n{stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for spelling in ["direct", "symlink", "relative"] {
+            assert!(
+                control.contains(&format!("{spelling} ANSWERED {SECRET}")),
+                "{context}"
+            );
+        }
+        assert!(output.status.success(), "{context}");
+        // its own broker still answers it
+        assert!(stdout.contains("OWN={\"rows\":1}"), "{context}");
+        assert!(stdout.contains("DIRECT_READ_REFUSED"), "{context}");
+        assert!(!stdout.contains(SECRET), "{context}");
+        assert!(!stdout.contains("ANSWERED"), "{context}");
+        for line in [
+            "direct UNREACHABLE",
+            "symlink UNREACHABLE",
+            "relative UNREACHABLE",
+            "upper-case UNREACHABLE",
+            "volfs UNREACHABLE",
+            "renamed-socket UNMOVED",
+        ] {
+            assert!(stdout.contains(line), "{line}\n{context}");
+        }
+    }
+}
+
 /// A path rule does not follow a file to its other names. A hard link made
 /// before the session would let the confined process rewrite a tool the broker
 /// runs, and the broker runs it outside the sandbox (bd-wwh).
