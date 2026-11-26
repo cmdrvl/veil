@@ -301,8 +301,7 @@ pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Er
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = command;
-        return Err("the broker launcher currently requires macOS Seatbelt".into());
+        Err("the broker launcher currently requires macOS Seatbelt".into())
     }
 
     #[cfg(target_os = "macos")]
