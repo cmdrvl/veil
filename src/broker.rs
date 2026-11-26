@@ -1136,10 +1136,10 @@ mod tests {
                 .shutdown(std::net::Shutdown::Write)
                 .expect("request half-close");
         });
-        assert_eq!(
-            read_request(&mut BufReader::new(server)),
-            Err("broker_request_too_large")
-        );
+        // the reader stays open until the writer is done: macOS fails a
+        // half-close once the other end has gone
+        let mut reader = BufReader::new(server);
+        assert_eq!(read_request(&mut reader), Err("broker_request_too_large"));
         writer.join().expect("request writer should finish");
     }
 }
