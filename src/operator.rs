@@ -366,7 +366,12 @@ pub fn launch_sandbox(command: &[OsString]) -> Result<u8, Box<dyn std::error::Er
             .status();
         let _ = broker.kill();
         let stop_result = broker.wait().map(|_| ());
-        let socket_result = fs::remove_file(&socket);
+        // `wait` closes the pipe the broker watches, and the broker removes the
+        // socket when that closes, so it may be gone before this removes it.
+        let socket_result = match fs::remove_file(&socket) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
         let status = status?;
         stop_result?;
         socket_result?;

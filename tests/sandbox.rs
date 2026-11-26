@@ -559,6 +559,66 @@ echo ordinary > "$root/ordinary-write.txt" && echo ORDINARY_WRITE_ALLOWED
     }
 }
 
+/// The broker and the launcher both remove the session socket, and the broker
+/// can get there first (CI run 45750031750). A socket already gone is not a
+/// failed session; one that cannot be removed is still an error.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_session_socket_that_is_already_gone_does_not_fail_the_launcher() {
+    // The confined command names its socket, waits for the test to act on it
+    // from outside the sandbox, and exits with a status of its own.
+    let script = r#"
+printf '%s' "$VEIL_BROKER_SOCKET" > socket.tmp && /bin/mv socket.tmp socket.path
+tries=0
+while [ $tries -lt 600 ]; do
+  if [ -e go ]; then exit 7; fi
+  tries=$((tries + 1))
+  /bin/sleep 0.05
+done
+exit 1
+"#;
+
+    for unremovable in [false, true] {
+        let root = fixture();
+        let home = short_home();
+        fs::write(root.join("protected.txt"), "private\n").expect("protected");
+        let launcher = veil(&root)
+            .args(["sandbox", "--", "/bin/sh", "-c", script])
+            .env("HOME", &home)
+            .env("VEIL_PROTECTED", "protected.txt")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("veil should launch");
+
+        let announced = root.join("socket.path");
+        assert!(
+            (0..1000).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                announced.exists()
+            }),
+            "the confined command should name its socket"
+        );
+        let socket = PathBuf::from(fs::read_to_string(&announced).expect("socket path"));
+        fs::remove_file(&socket).expect("the socket is there to remove");
+        if unremovable {
+            // a directory cannot be removed the way a socket is
+            fs::create_dir(&socket).expect("obstruction");
+        }
+        fs::write(root.join("go"), "").expect("release the confined command");
+
+        let output = launcher.wait_with_output().expect("launcher should exit");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if unremovable {
+            assert_ne!(output.status.code(), Some(7), "stderr: {stderr}");
+            assert!(stderr.contains("veil: "), "stderr: {stderr}");
+        } else {
+            assert_eq!(output.status.code(), Some(7), "stderr: {stderr}");
+            assert!(!stderr.contains("veil: "), "stderr: {stderr}");
+        }
+    }
+}
+
 /// The broker must not outlive its launcher, even one that is killed outright
 /// and so runs no cleanup.
 #[cfg(target_os = "macos")]
