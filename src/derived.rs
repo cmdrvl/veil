@@ -222,7 +222,7 @@ impl VeilState {
 /// `*` is any run, `?` and a `[...]` set are any one byte, and neither stands
 /// for the dot of a hidden name. Letter case is ignored. A set matches more here
 /// than in a shell, which only refuses more.
-fn could_expand_to(pattern: &[u8], name: &[u8]) -> bool {
+pub(crate) fn could_expand_to(pattern: &[u8], name: &[u8]) -> bool {
     if name.starts_with(b".") && !pattern.starts_with(b".") {
         return false;
     }
@@ -313,7 +313,7 @@ fn same_component(one: Component<'_>, other: Component<'_>) -> bool {
 /// `path` with `.` and `..` applied and every symlink on the way followed,
 /// including one whose target does not exist. Past 40 links the rest is kept
 /// as written.
-fn resolve_links(path: &Path) -> PathBuf {
+pub(crate) fn resolve_links(path: &Path) -> PathBuf {
     let mut pending: VecDeque<OsString> = path
         .components()
         .map(|component| component.as_os_str().to_owned())

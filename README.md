@@ -69,7 +69,7 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 210 vectors run against the real binary, **157** are blocked and **25** are still allowed: 15 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 212 vectors run against the real binary, **159** are blocked and **25** are still allowed: 15 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
@@ -81,7 +81,7 @@ Of 210 vectors run against the real binary, **157** are blocked and **25** are s
 | Egress | 17 | 13 | 2 / 0 / 0 | 15 / 0 / 0 |
 | Content search | 9 | 5 | 0 / 0 / 4 | 7 / 0 / 2 |
 | Dynamic and hidden paths | 6 | 6 | 0 / 0 / 0 | 6 / 0 / 0 |
-| Wrappers and prefixes | 7 | 7 | 0 / 0 / 0 | 7 / 0 / 0 |
+| Wrappers and prefixes | 9 | 9 | 0 / 0 / 0 | 7 / 2 / 0 |
 | Git | 8 | 2 | 2 / 3 / 0 | 3 / 4 / 0 |
 | Agent tools (Read, Grep, Glob, Notebook) | 10 | 6 | 2 / 0 / 1 | 6 / 2 / 1 |
 | MCP tools | 5 | 3 | 1 / 0 / 0 | 0 / 0 / 4 |
@@ -307,8 +307,10 @@ Read or Grep call or a command veil recognises as a reader, `argv_path` for a
 path named by any other command, `dynamic_path_unresolvable` for an argument veil
 could not resolve to a path, `mcp_argument` for a path in the arguments of an MCP
 tool call, `script_too_large_to_inspect` for a script file veil was asked to run
-and did not read (see [Script Files](#script-files)). A word that is not
-protected writes no record.
+and did not read (see [Script Files](#script-files)), `redirect_write` for a
+redirection that would write over or add to such a path (see
+[Redirected Writes](#redirected-writes)). A word that is not protected writes no
+record.
 
 A command that sends what it is given somewhere else is the **egress class**:
 `curl`, `wget`, `scp`, `rsync`, `sftp`, `ftp`, `lftp`, `rclone`, `aws`, `gsutil`,
@@ -325,8 +327,8 @@ audit record carries `class: egress` as well as its `reason_class`.
 `veil audit --class egress` lists those attempts, newest last; it answers "did
 anything try to leave". `--class` also takes a `reason_class` (`direct_read`,
 `argv_path`, `dynamic_path_unresolvable`, `mcp_argument`,
-`script_too_large_to_inspect`), and an unknown class is an error, not an empty
-list.
+`script_too_large_to_inspect`, `redirect_write`), and an unknown class is an
+error, not an empty list.
 
 veil also finds the file when the command hides it inside a longer word: curl's
 `-F name=@file;type=text/csv`, `--data-urlencode name@file`,
@@ -352,12 +354,13 @@ Limits to know about:
   denied for naming it; it is only not labelled egress.
 - An argument to an egress command that veil cannot resolve is a
   dynamic-argument denial (see below), and is not recorded as an egress attempt.
-- Output redirections are not paths when attached (`2>/dev/null`, `>out`). A bare
-  `>` is dropped but the word after it is kept, because `cut -d '>' -f1 x.csv`
-  hands the operator to the command as data; so `cmd > data/out.csv` is denied
-  while `cmd >data/out.csv` is not. Writing into a protected directory is not
-  what the rule is for, and the asymmetry goes away when the decomposer strips
-  redirections itself.
+- Among the paths a command names, an attached output redirection
+  (`2>/dev/null`, `>out`) is not one. A bare `>` is dropped but the word after it
+  is kept, because `cut -d '>' -f1 x.csv` hands the operator to the command as
+  data; so a command judged for what it names is denied for
+  `cmd > data/new.csv` and not for `cmd >data/new.csv`, though both only create
+  a file. What a redirection writes over is judged separately, however it is
+  spelled; see [Redirected Writes](#redirected-writes).
 - At most 64 words of a command are resolved against the filesystem (symlinks
   followed, existence checked). A word with a slash or a data-file extension
   past the 64th is still compared with `[sensitivity] protected` as text, but a
@@ -369,6 +372,48 @@ Limits to know about:
   dynamic-argument stance below.
 - A `cd` earlier in the line is not followed; paths resolve against the
   directory the hook started in.
+
+### Redirected Writes
+
+The shell opens the target of `>`, `>>`, `>|`, `&>`, `2>` or `<>` itself, before
+the command runs. So the hook judges the target whatever the command is:
+`echo x >>data/x.csv` is denied although `echo` reads nothing, and so is
+`shape data/x.csv >data/x.csv`, because a spine tool's authority is to read. A
+redirection is refused when:
+
+- the target exists and a `Read` of it would be refused. A symlink or a glob is
+  followed to what it opens; or
+- the target is not there yet and is among veil's own protected paths under
+  `~/.cmdrvl/`, where a new file, such as a settings file, can change what veil
+  allows.
+
+A new file anywhere else is allowed, a protected directory included: that is how
+`veil exec shape data/x.csv > data/x-shape.json` leaves a report there.
+**Writing over that report is refused** unless the session may read it as
+[derived output](#derived-outputs), so otherwise give the next one a new name. A
+quoted or escaped `>` (`grep '>' notes.md`) is data, not a redirection. Targets
+under `/dev` and copies of a descriptor (`2>&1`, `>&-`) write no file. A wrapper
+that stands in for the line (`eval`, `find -exec`) keeps its redirections, and
+one in a shell script veil reads is judged too. `[policy] default` applies; the
+egress mode does not. The audit record has `reason_class: redirect_write`. A
+command that redirects to more than 256 different files, or whose redirection
+globs are matched against more than 4096 names, is refused.
+
+This is a check of the command's text, and it does not cover:
+
+- a target veil cannot resolve (`>"$OUT"`), which is left to the
+  [dynamic-argument stance](#dynamic-arguments), or the text of a `trap` action;
+- a hard link to a protected file under an unprotected name (a `Read` through
+  one is allowed too);
+- a link that the same command line makes before it writes: veil looks at the
+  filesystem as it is before the command runs;
+- zsh's `**`, which veil matches one directory deep;
+- `Write` and `Edit` of a protected file, which are judged only for veil's
+  derived registry and key. `tee`, `cp` and `sed -i` are judged because they name
+  the path.
+
+`veil sandbox` denies reads of protected paths, and renaming or removing them. It
+does not deny writing into them.
 
 ### Script Files
 
@@ -699,8 +744,9 @@ The comparison goes by text, so a new report that shares a run of text with a
 protected file veil has *not* registered (an older report another program made,
 say) is not registered either.
 
-**Who can use a record.** Only `Read`, and `Grep` of that one file: not `cat`,
-not a search of a directory, not `veil test`. The file is hashed when the hook
+**Who can use a record.** Only `Read`, `Grep` of that one file, and a
+[redirection](#redirected-writes) that writes over it: not `cat`, not a search of
+a directory, not `veil test`. The file is hashed when the hook
 runs, so one changed byte makes it a different file, and a file over 64 MiB is
 denied as `too_large_to_verify`. A record is usable in the harness session that
 made it (Claude Code gives `veil exec` the id its hooks receive, in
@@ -761,8 +807,9 @@ With `audit_log = true` veil appends one line of JSON per path it judged to
 recognises as a reader (`cat`, `head`, `grep`...) records the file it read, allowed
 or denied; a path named by any other command is recorded when it is protected.
 A redirection and its attached target (`2>/dev/null`, `>out.txt`, `2>&1`) are never
-recorded as paths, however they are glued to the word before them
-(`cat x.csv>out.txt` reads `x.csv`).
+recorded as paths the command named, however they are glued to the word before
+them (`cat x.csv>out.txt` reads `x.csv`). A refused write has a record of its
+own, `reason_class: redirect_write`.
 
 - **Schema.** Every record carries `"schema_version": "veil.audit.v1"`. Records
   written before it have no such key and fewer fields; anything that reads the log

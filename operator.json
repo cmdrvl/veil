@@ -150,7 +150,7 @@
       "options": [
         { "name": "json", "flag": "--json", "type": "flag", "description": "Emit recent audit entries as JSON" },
         { "name": "validate", "flag": "--validate", "type": "flag", "description": "Instead of listing entries, count the audit log's lines by kind (current veil.audit.v2, legacy, unparseable) and list the first 20 unparseable line numbers; takes no --class" },
-        { "name": "class", "flag": "--class", "type": "string", "description": "Only entries of one class: egress (a command that sends a protected path off the machine), or a reason_class: direct_read, argv_path, dynamic_path_unresolvable, mcp_argument (a path handed to an MCP tool in its arguments), script_too_large_to_inspect (a script an interpreter was asked to run that veil did not read)" }
+        { "name": "class", "flag": "--class", "type": "string", "description": "Only entries of one class: egress (a command that sends a protected path off the machine), or a reason_class: direct_read, argv_path, dynamic_path_unresolvable, mcp_argument (a path handed to an MCP tool in its arguments), script_too_large_to_inspect (a script an interpreter was asked to run that veil did not read), redirect_write (a redirection that would overwrite or add to a file veil would not let the command read, or would write into veil's own protected paths)" }
       ],
       "read_only": true,
       "guard_preflight_required": true

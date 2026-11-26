@@ -112,10 +112,11 @@ fn warn_mode_would_deny(decision: &Decision) -> bool {
         })
 }
 
-/// How a path came to be judged (bd-29r, bd-2mi, bd-1wa, bd-1bk): read by
-/// something veil recognises as a reader, named in the words of some other
-/// command, not a path veil could work out at all, handed to an MCP tool in its
-/// arguments, or a script veil was asked to run and could not read.
+/// How a path came to be judged (bd-29r, bd-2mi, bd-1wa, bd-1bk, bd-qe9):
+/// read by something veil recognises as a reader, named in the words of some
+/// other command, not a path veil could work out at all, handed to an MCP tool
+/// in its arguments, a script veil was asked to run and could not read, or
+/// written over or added to by a redirection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReasonClass {
     DirectRead,
@@ -123,6 +124,7 @@ enum ReasonClass {
     DynamicPath,
     McpArgument,
     ScriptTooLarge,
+    RedirectWrite,
 }
 
 impl ReasonClass {
@@ -133,6 +135,7 @@ impl ReasonClass {
             Self::DynamicPath => "dynamic_path_unresolvable",
             Self::McpArgument => "mcp_argument",
             Self::ScriptTooLarge => "script_too_large_to_inspect",
+            Self::RedirectWrite => "redirect_write",
         }
     }
 }
@@ -319,12 +322,18 @@ fn execute_hook_mode(hook_input: &HookInput) -> io::Result<RenderedDecision> {
 }
 
 /// A Read or Grep of a file that would be refused is allowed when the file's
-/// bytes are a registered derived output (bd-3qw). Only the live hook asks:
-/// `veil test` and audit replay judge the path and say nothing of the registry.
-/// Nothing else is looked up, since a command can do more with a file than
-/// show it.
+/// bytes are a registered derived output (bd-3qw), and so is a redirect that
+/// writes over such a file, which a session that may read it may replace
+/// (bd-qe9). Only the live hook asks: `veil test` and audit replay judge the
+/// path and say nothing of the registry. Nothing else a command does with a
+/// file is looked up, since it can do more with the file than show it.
 fn apply_derived_registry(hook_input: &HookInput, outcomes: &mut [CandidateOutcome]) {
-    if !matches!(hook_input.tool, ToolKind::Read | ToolKind::Grep) {
+    let reads = matches!(hook_input.tool, ToolKind::Read | ToolKind::Grep);
+    let may_lift = |outcome: &CandidateOutcome| {
+        would_deny(&outcome.decision)
+            && (reads || outcome.reason_class == ReasonClass::RedirectWrite)
+    };
+    if !outcomes.iter().any(may_lift) {
         return;
     }
     let (Some(registry), Some(state)) = (
@@ -334,10 +343,7 @@ fn apply_derived_registry(hook_input: &HookInput, outcomes: &mut [CandidateOutco
         return;
     };
 
-    for outcome in outcomes
-        .iter_mut()
-        .filter(|outcome| would_deny(&outcome.decision))
-    {
+    for outcome in outcomes.iter_mut().filter(|outcome| may_lift(outcome)) {
         // the refusal of veil's own files is not one the registry can lift
         if state.holds(&outcome.path) {
             continue;
@@ -511,6 +517,7 @@ fn evaluate_commands(
     // matchers is linear in the number of configured patterns.
     let matchers = PolicyMatchers::new(config);
     let context = ProtectedContext::new(&hook_input.cwd, registry, &matchers);
+    let mut redirect_budget = evaluator::RedirectBudget::default();
     let mut outcomes = Vec::new();
 
     for command in commands {
@@ -542,6 +549,32 @@ fn evaluate_commands(
                 egress: false,
             })
         }));
+
+        // The shell opens what a command redirects to before the command runs,
+        // so this too is judged whatever the command is (bd-qe9). Writing a
+        // file sends it nowhere, so the egress policy does not come into it.
+        for target in &command.redirect_targets {
+            let refused = evaluator::evaluate_redirect_write(
+                target,
+                hook_input.tool,
+                config,
+                registry,
+                &matchers,
+                &mut redirect_budget,
+            );
+            outcomes.extend(
+                refused
+                    .into_iter()
+                    .map(|(path, decision)| CandidateOutcome {
+                        sensitivity: sensitivity_pack(registry, &matchers, &path),
+                        path,
+                        decision,
+                        origin: command.origin,
+                        reason_class: ReasonClass::RedirectWrite,
+                        egress: false,
+                    }),
+            );
+        }
 
         // Where the command changes how names are found, a tool's name may run
         // anything, so it is judged like any other program (bd-jn6).
@@ -625,9 +658,12 @@ fn evaluate_commands(
         // A path that was already denied needs no second reason. An authorized
         // spine tool takes a protected path and prints metadata, so an
         // argument it is given needs no resolving either.
-        let already_denied = outcomes[first_outcome..]
-            .iter()
-            .any(|outcome| would_deny(&outcome.decision));
+        // A refused redirect does not count: `warn` and `log` only report it,
+        // and the derived registry may still lift it, after which the words
+        // would have gone unjudged.
+        let already_denied = outcomes[first_outcome..].iter().any(|outcome| {
+            outcome.reason_class != ReasonClass::RedirectWrite && would_deny(&outcome.decision)
+        });
         if command.has_dynamic_args()
             && !already_denied
             && spine_invocation.is_none()
@@ -679,7 +715,9 @@ fn script_is_protected(
 /// Says why a spine tool's command was refused what the tool is allowed.
 fn explain_withheld_authority(outcomes: &mut [CandidateOutcome], tool: &str) {
     for outcome in outcomes {
-        if would_deny(&outcome.decision)
+        // no authority would have let the shell open a file
+        if outcome.reason_class != ReasonClass::RedirectWrite
+            && would_deny(&outcome.decision)
             && let Some(remediation) = outcome.decision.remediation.as_mut()
         {
             remediation.push_str(&format!(

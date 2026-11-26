@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::allowlist::{DirectoryScan, SafePathMatcher};
-use crate::config::{Config, DynamicArgsMode, PolicyMode};
-use crate::derived::VeilState;
+use crate::config::{Config, DynamicArgsMode, PolicyMode, is_cmdrvl_config_protection_pattern};
+use crate::derived::{self, VeilState};
 use crate::extract::PathExposure;
 use crate::packs::PackRegistry;
 use crate::spine::SpineInvocation;
@@ -25,6 +26,24 @@ const DIRECTORY_SEARCH_REMEDIATION: &str = "Content search blocked: this directo
 const DYNAMIC_ARGS_REMEDIATION: &str = "Command blocked: an argument cannot be resolved to a path (a variable veil was not given, a `$( )` result, or names read from standard input), so veil cannot show that it stays clear of protected data. Rewrite with a literal path, one that needs no variable, substitution or pipe. If the file is protected, run `veil operator` to discover the authorized spine tools; do not build the path another way to get around this, and if no listed tool fits, stop and ask the operator.";
 
 const VEIL_STATE_REMEDIATION: &str = "veil's derived registry and its key decide which files are derived output, so no tool call may read or change them. `veil derived list` and `veil derived verify <path>` report on them. Do not look for another way in; if they must change, stop and ask the operator.";
+
+const REDIRECT_WRITE_REMEDIATION: &str = "Redirected write blocked: the shell would empty or add to a protected file itself, whatever the command is. Send the output to a new file, or print it and read it from the terminal. Do not change a protected file another way to get around this; if it must change, stop and ask the operator.";
+
+/// How many different files the redirections of one command string are followed
+/// to, and how many directory entries their globs are matched against. Each
+/// costs a look at the disk, and a hook that runs out of time stops nothing, so
+/// a command past either is refused.
+const REDIRECT_MAX_TARGETS: usize = 256;
+const REDIRECT_MAX_GLOB_ENTRIES: usize = 4096;
+
+/// What judging the redirections of one command string has used up.
+#[derive(Default)]
+pub(crate) struct RedirectBudget {
+    targets: HashSet<PathBuf>,
+    glob_entries: usize,
+    /// The command has been refused for being past it.
+    spent: bool,
+}
 
 /// How many directory entries a content search of one directory makes veil
 /// inspect before it stops vouching for the directory. The hook runs before
@@ -93,6 +112,9 @@ impl EvaluationInput {
 pub struct PolicyMatchers {
     protected: SafePathMatcher,
     allowlist: SafePathMatcher,
+    /// The protected patterns under `.cmdrvl/`, where veil keeps what decides
+    /// its own answers.
+    own: SafePathMatcher,
     /// veil's own derived registry and key (bd-3qw); `None` without a home.
     state: Option<VeilState>,
 }
@@ -102,6 +124,13 @@ impl PolicyMatchers {
         Self {
             protected: SafePathMatcher::from_patterns(config.sensitivity.protected.iter()),
             allowlist: SafePathMatcher::from_patterns(config.allowlist.safe_patterns.iter()),
+            own: SafePathMatcher::from_patterns(
+                config
+                    .sensitivity
+                    .protected
+                    .iter()
+                    .filter(|pattern| is_cmdrvl_config_protection_pattern(pattern)),
+            ),
             state: VeilState::from_env(),
         }
     }
@@ -159,6 +188,153 @@ pub fn evaluate_access_with(
         registry,
         |directory_sensitive| Ok(registry.classify(&effective.path, directory_sensitive)),
     )
+}
+
+/// The refusals of an output redirection to `target`, one for each path it
+/// opens that may not be written, so none when the shell may go ahead (bd-qe9).
+/// The shell opens the file itself, whatever the command then does, so neither
+/// how the command uses its words nor an authorized spine tool comes into it. A
+/// file that a read would be refused may not be written. A file that is not
+/// there yet holds nothing, so it is refused only among veil's own protected
+/// paths, where a new file can change what veil answers.
+pub(crate) fn evaluate_redirect_write(
+    target: &Path,
+    tool: ToolKind,
+    config: &Config,
+    registry: &PackRegistry,
+    matchers: &PolicyMatchers,
+    budget: &mut RedirectBudget,
+) -> Vec<(PathBuf, Decision)> {
+    // a file judged once for this command string has had its answer
+    if budget.spent || !budget.targets.insert(target.to_path_buf()) {
+        return Vec::new();
+    }
+    let paths = if budget.targets.len() > REDIRECT_MAX_TARGETS {
+        None
+    } else {
+        redirect_paths(target, &mut budget.glob_entries)
+    };
+    let Some(paths) = paths else {
+        budget.spent = true;
+        let refusal = resolve_policy(
+            &config.policy.default,
+            None,
+            format!(
+                "this command redirects output to more than veil follows (over {REDIRECT_MAX_TARGETS} files, or globs matched against over {REDIRECT_MAX_GLOB_ENTRIES} names), so veil cannot show that none is protected; blocked by policy default"
+            ),
+            REDIRECT_WRITE_REMEDIATION,
+        );
+        return vec![(target.to_path_buf(), refusal)];
+    };
+
+    // each on its own: the derived registry may lift one and not another
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            refuse_redirect_to(&path, tool, config, registry, matchers)
+                .map(|refusal| (path, refusal))
+        })
+        .collect()
+}
+
+fn refuse_redirect_to(
+    path: &Path,
+    tool: ToolKind,
+    config: &Config,
+    registry: &PackRegistry,
+    matchers: &PolicyMatchers,
+) -> Option<Decision> {
+    // terminals, descriptors and the bit bucket are not files to protect
+    if path.starts_with("/dev") {
+        return None;
+    }
+
+    let (sensitivity, reason) = match fs::metadata(path) {
+        // the shell cannot open a directory for writing
+        Ok(metadata) if metadata.is_dir() => return None,
+        Ok(_) => {
+            let input = EvaluationInput::new(tool, path, PathExposure::ReadsContents);
+            let read = evaluate_access_with(&input, config, registry, matchers);
+            // under `warn` and `log` a refusal is an allow that carries a reason
+            if read.action == DecisionAction::Allow
+                && !read.reason.as_deref().is_some_and(|reason| {
+                    reason.starts_with("policy default warn:")
+                        || reason.starts_with("policy default log:")
+                })
+            {
+                return None;
+            }
+            let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let sensitivity = registry.classify(&resolved, matchers.is_protected(&resolved));
+            let subject = sensitivity.as_ref().map_or_else(
+                || "a protected path".to_owned(),
+                |found| format!("a path matched by {}", found.pack),
+            );
+            let reason = format!(
+                "this command redirects output onto {subject}, which veil would not let it read; blocked by policy default"
+            );
+            (sensitivity, reason)
+        }
+        Err(_) => {
+            // a link to a name that is not there yet creates that name
+            let resolved = derived::resolve_links(path);
+            if !matchers.own.is_safe(path) && !matchers.own.is_safe(&resolved) {
+                return None;
+            }
+            (
+                None,
+                "this command redirects output into veil's own protected paths, where a new file can change what veil allows; blocked by policy default".to_owned(),
+            )
+        }
+    };
+
+    Some(resolve_policy(
+        &config.policy.default,
+        sensitivity.as_ref(),
+        reason,
+        REDIRECT_WRITE_REMEDIATION,
+    ))
+}
+
+/// The paths a redirection to `target` can open: the name as written and, when
+/// it is a glob, everything it matches now (bash opens a glob's one match, zsh
+/// each of them). `seen` counts the entries matched against; `None` past
+/// [`REDIRECT_MAX_GLOB_ENTRIES`].
+fn redirect_paths(target: &Path, seen: &mut usize) -> Option<Vec<PathBuf>> {
+    let is_glob = |name: &[u8]| name.iter().any(|byte| matches!(byte, b'*' | b'?' | b'['));
+    let mut paths = vec![target.to_path_buf()];
+    if !is_glob(target.as_os_str().as_encoded_bytes()) {
+        return Some(paths);
+    }
+
+    let mut matches = vec![PathBuf::new()];
+    for component in target.components() {
+        let name = component.as_os_str();
+        if !is_glob(name.as_encoded_bytes()) {
+            matches.iter_mut().for_each(|path| path.push(name));
+            continue;
+        }
+        let mut next = Vec::new();
+        for directory in &matches {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                *seen += 1;
+                if *seen > REDIRECT_MAX_GLOB_ENTRIES {
+                    return None;
+                }
+                let found = entry.file_name();
+                if derived::could_expand_to(name.as_encoded_bytes(), found.as_encoded_bytes()) {
+                    next.push(directory.join(found));
+                }
+            }
+        }
+        matches = next;
+    }
+
+    paths.append(&mut matches);
+    Some(paths)
 }
 
 /// Attempts to resolve the input path to a canonical, absolute path via

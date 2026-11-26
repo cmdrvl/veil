@@ -5,7 +5,7 @@
 
 Enforcement level today: **hook-only** (advisory; parser-based). `veil` reads the text of a tool call before it runs and decides from the paths that text names. It does not sandbox anything, so anything it cannot see in that text it cannot stop.
 
-210 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **157** are blocked, **25** are still ALLOWED and are listed below (15 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
+212 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **159** are blocked, **25** are still ALLOWED and are listed below (15 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
 
 How to read the columns:
 
@@ -297,6 +297,8 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `wrap-command` | `command cat data/clients/holdings.csv` | blocked: direct_read | blocked (design, not run) | found since |  |
 | `wrap-glued-redirect` | `cat .env>out.txt` | blocked: direct_read | blocked (design, not run) | found since | a redirect glued to the word was the shell's redirect, not part of the name (bd-5zy) |
 | `wrap-redirect-spaced` | `cat data/clients/holdings.csv > out.txt 2>&1` | blocked: direct_read | blocked (design, not run) | baseline |  |
+| `redirect-append` | `echo x >>data/clients/holdings.csv` | blocked: redirect_write | **ALLOWED** (design, not run): the profile denies reading, renaming and removing a protected file, not writing into it | found since | the shell opens the file itself, though `echo` reads nothing (bd-qe9) |
+| `redirect-new-veil-settings` | `echo x >~/.cmdrvl/config/veil/config.toml` | blocked: redirect_write | **ALLOWED** (design, not run): a confined session can create a settings file that is not there yet | found since | a new file among veil's own protected paths can change what veil allows (bd-qe9) |
 
 ### Git
 

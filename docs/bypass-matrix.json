@@ -2955,6 +2955,36 @@
       "tool_name": "Bash"
     },
     {
+      "class": "Wrappers and prefixes",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "redirect_write"
+      },
+      "id": "redirect-append",
+      "sandbox": "**ALLOWED** (design, not run): the profile denies reading, renaming and removing a protected file, not writing into it",
+      "tool_input": {
+        "command": "echo x >>data/clients/holdings.csv"
+      },
+      "tool_name": "Bash"
+    },
+    {
+      "class": "Wrappers and prefixes",
+      "from": "found since",
+      "hook_only": {
+        "class": "",
+        "decision": "deny",
+        "reason_class": "redirect_write"
+      },
+      "id": "redirect-new-veil-settings",
+      "sandbox": "**ALLOWED** (design, not run): a confined session can create a settings file that is not there yet",
+      "tool_input": {
+        "command": "echo x >~/.cmdrvl/config/veil/config.toml"
+      },
+      "tool_name": "Bash"
+    },
+    {
       "class": "Git",
       "from": "found since",
       "hook_only": {

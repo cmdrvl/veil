@@ -417,6 +417,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                         cwd: command.cwd.clone(),
                         cwd_unresolved: command.cwd_unresolved,
                         redirects_in: Vec::new(),
+                        redirects_out: Vec::new(),
                         unresolved: command.unresolved.clone(),
                         computed: command.computed.clone(),
                         assigned: Vec::new(),

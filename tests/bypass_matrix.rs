@@ -2020,6 +2020,30 @@ fn vectors() -> Vec<Vector> {
             SB_BLOCKED,
             "",
         ),
+        row(
+            "redirect-append",
+            Wrappers,
+            Since,
+            bash(format!("echo x >>{H}")),
+            blocked("redirect_write"),
+            Sandbox::Allowed(
+                Evidence::Design,
+                "the profile denies reading, renaming and removing a protected file, not writing into it",
+            ),
+            "the shell opens the file itself, though `echo` reads nothing (bd-qe9)",
+        ),
+        row(
+            "redirect-new-veil-settings",
+            Wrappers,
+            Since,
+            bash("echo x >~/.cmdrvl/config/veil/config.toml"),
+            blocked("redirect_write"),
+            Sandbox::Allowed(
+                Evidence::Design,
+                "a confined session can create a settings file that is not there yet",
+            ),
+            "a new file among veil's own protected paths can change what veil allows (bd-qe9)",
+        ),
         // ---- git
         row(
             "git-add",

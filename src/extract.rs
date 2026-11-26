@@ -14,6 +14,7 @@ mod exec;
 mod expand;
 mod jq;
 mod lookup;
+mod redirect;
 mod script;
 mod sed;
 mod wrappers;
@@ -147,6 +148,10 @@ pub struct CommandExtraction {
     /// against these (bd-3qw), so a word taken for a target by mistake costs
     /// nothing.
     pub write_targets: Vec<PathBuf>,
+    /// The files the shell opens for writing on this command's line, told from
+    /// quoted `>`s. One that a read would be refused is refused, whatever the
+    /// command does with its words (bd-qe9).
+    pub redirect_targets: Vec<PathBuf>,
     /// The command string changes which program a name runs, so a command in
     /// it gets no spine-tool authority (bd-jn6).
     pub lookup_changed: bool,
@@ -199,6 +204,7 @@ impl CommandExtraction {
             egress: false,
             script: None,
             write_targets: Vec::new(),
+            redirect_targets: Vec::new(),
             lookup_changed: false,
         }
     }
@@ -297,6 +303,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
             egress: false,
             script: None,
             write_targets: Vec::new(),
+            redirect_targets: redirect_targets(command, cwd),
             lookup_changed: command.lookup_changed,
         };
     };
@@ -418,6 +425,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path) -> CommandExtraction 
         egress: egress::is_egress(program, args),
         script: None,
         write_targets: write_targets(&command.argv, cwd, home_directory().as_deref()),
+        redirect_targets: redirect_targets(command, cwd),
         lookup_changed: command.lookup_changed,
     }
 }
@@ -455,14 +463,15 @@ fn write_targets(argv: &[String], cwd: &Path, home: Option<&str>) -> Vec<PathBuf
 /// `>&`, `&>`, `<>`, with or without a file descriptor): the target, or nothing
 /// when the target is the next word.
 fn output_redirection(word: &str) -> Option<&str> {
-    let operator = match word.strip_prefix('&') {
-        Some(rest) => rest,
-        None => word.trim_start_matches(|ch: char| ch.is_ascii_digit()),
-    };
-    let rest = operator
-        .strip_prefix("<>")
-        .or_else(|| operator.strip_prefix('>'))?;
-    Some(rest.trim_start_matches(['>', '|', '&']))
+    redirect::after_operator(word).map(|rest| rest.trim_start_matches(['>', '|', '&']))
+}
+
+/// The files a command's line opens for writing, from the directory the command
+/// runs in where the decomposer did not know it.
+fn redirect_targets(command: &SimpleCommand, cwd: &Path) -> Vec<PathBuf> {
+    // not normalised: `..` after a symlink goes where the symlink goes
+    let from_cwd = |target: &String| cwd.join(target);
+    command.redirects_out.iter().map(from_cwd).collect()
 }
 
 /// What is unresolved among the files a reader will open: the words `paths`

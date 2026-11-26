@@ -26,8 +26,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::expand::{self, Vars, Word};
-use super::wrappers;
 use super::{collect_input_redirect_paths, is_env_assignment, is_redirection_word, lookup};
+use super::{redirect, wrappers};
 
 pub use super::expand::ShellEnv;
 
@@ -111,6 +111,10 @@ pub struct SimpleCommand {
     pub cwd_unresolved: bool,
     /// Files this command reads through `<`.
     pub redirects_in: Vec<String>,
+    /// Files the shell opens for writing on this command's line, absolute where
+    /// the directory is known. A wrapper that replaces the line's words leaves
+    /// them with a command that came of it (bd-qe9).
+    pub redirects_out: Vec<String>,
     /// Words that depend on something this module could not resolve: a variable
     /// it was not told the value of, a substitution, a brace list too long to
     /// expand, or ([`STDIN_ARGUMENTS`]) what `xargs` reads from standard input.
@@ -148,6 +152,7 @@ impl SimpleCommand {
             cwd: None,
             cwd_unresolved: false,
             redirects_in: Vec::new(),
+            redirects_out: Vec::new(),
             unresolved: Vec::new(),
             computed: Vec::new(),
             assigned: Vec::new(),
@@ -301,13 +306,27 @@ fn script_body(
         for body in &segment.substitutions {
             script(body, Origin::Subshell, depth + 1, run, out);
         }
+        // The shell opens what a line redirects to itself, whatever its other
+        // words turn into below (bd-qe9). Only the words as written show which
+        // `>` is an operator.
+        let redirected = segment.text.contains('>');
+        let mut writes = Vec::new();
         let words = match expand::plain_words(&segment.text) {
-            Some(words) => words,
+            Some(words) => {
+                if redirected {
+                    let raw: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+                    writes = redirect::writes(&raw, &run.vars, &run.env, directory.path.as_deref());
+                }
+                words
+            }
             None => {
                 let Some(raw) = expand::raw_words(&segment.text) else {
                     run.failed = true;
                     return;
                 };
+                if redirected {
+                    writes = redirect::writes(&raw, &run.vars, &run.env, directory.path.as_deref());
+                }
 
                 // `f=data/x.csv` runs nothing; it tells the words that follow
                 // what `$f` is. `export f=data/x.csv` also hands it to every
@@ -322,7 +341,7 @@ fn script_body(
                         }
                         run.vars.assign(&name, value);
                     }
-                    if !expand::exports_to_environment(&raw) {
+                    if !expand::exports_to_environment(&raw) && writes.is_empty() {
                         continue;
                     }
                 }
@@ -371,8 +390,12 @@ fn script_body(
         run.assigned
             .extend(prefix.iter().map(|(_, value)| value.clone()));
         let saved = run.vars.scoped(&prefix);
+        let line = (!writes.is_empty()).then(|| (out.len(), command.clone()));
         wrappers::expand(command, depth, run, out);
         run.vars.restore(saved);
+        if let Some((first, line)) = line {
+            keep_writes(writes, line, first, out);
+        }
 
         if let Some(next_directory) = next_directory
             && !segment.isolated
@@ -621,6 +644,7 @@ fn simple_command(
         cwd: cwd.path.clone(),
         cwd_unresolved: cwd.unresolved,
         redirects_in: Vec::new(),
+        redirects_out: Vec::new(),
         assigned: Vec::new(),
         origin,
         stdin_piped: segment.stdin_piped,
@@ -628,6 +652,28 @@ fn simple_command(
         heredoc_computed: segment.heredoc_computed,
         lookup_changed: false,
     })
+}
+
+/// A wrapper may put what it runs in place of the line's own words (`eval`,
+/// `find -exec`), and the shell opens the line's files all the same. They go to
+/// the first command that came of the line, from `out[first]` on, or to the
+/// line itself when none did.
+fn keep_writes(
+    writes: Vec<String>,
+    line: SimpleCommand,
+    first: usize,
+    out: &mut Vec<SimpleCommand>,
+) {
+    match out.get_mut(first) {
+        Some(command) => command.redirects_out.extend(writes),
+        None => emit(
+            SimpleCommand {
+                redirects_out: writes,
+                ..line
+            },
+            out,
+        ),
+    }
 }
 
 /// Fills in what depends on the final argv, then adds the command to `out`.

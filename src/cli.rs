@@ -61,7 +61,7 @@ pub struct AuditArgs {
     #[arg(
         long,
         value_name = "CLASS",
-        value_parser = ["egress", "direct_read", "argv_path", "dynamic_path_unresolvable", "mcp_argument", "script_too_large_to_inspect"],
+        value_parser = ["egress", "direct_read", "argv_path", "dynamic_path_unresolvable", "mcp_argument", "script_too_large_to_inspect", "redirect_write"],
         help = "Only entries of one class: `egress` (a command that sends a protected path), or a reason_class"
     )]
     pub class: Option<String>,
@@ -596,6 +596,7 @@ mod tests {
             "dynamic_path_unresolvable",
             "mcp_argument",
             "script_too_large_to_inspect",
+            "redirect_write",
         ] {
             assert_eq!(
                 parse(&["veil", "audit", "--class", class]),
