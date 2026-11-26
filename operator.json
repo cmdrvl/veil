@@ -119,7 +119,7 @@
       ],
       "read_only": false,
       "guard_preflight_required": false,
-      "notes": "Denied raw-output flags, shell metacharacters, unknown tools, oversized requests, arguments that reach veil's state directory, and detector findings are refused. Broker calls are bounded and audited with input/output hashes. Each delivered result appends one record to the derived registry. It registers stdout, and any file a direct-mode call newly made under --out or --output, only when the detectors pass it and it repeats no text of a protected file; the rest is reported on stderr as 'not registered as derived'. Output is still delivered when it is not registered."
+      "notes": "Denied raw-output flags, shell metacharacters, unknown tools, oversized requests, arguments that reach veil's state directory, and detector findings are refused. Broker calls are bounded and audited with input/output hashes. The broker gives a caller 10s to send and end its request (broker_request_timed_out), cuts off one that takes none of its answer for 10s or not all of it in 120s, and gives a tool 10 minutes to finish (broker_tool_timed_out) and then 5s for its output to end (broker_output_not_closed); the two tool limits apply outside a sandbox too, and veil exec has no limit of its own on waiting for the broker.Each delivered result appends one record to the derived registry. It registers stdout, and any file a direct-mode call newly made under --out or --output, only when the detectors pass it and it repeats no text of a protected file; the rest is reported on stderr as 'not registered as derived'. Output is still delivered when it is not registered."
     },
     {
       "name": "derived",

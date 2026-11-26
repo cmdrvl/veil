@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +34,32 @@ const MAX_SESSION_CALLS: usize = 64;
 const MAX_ARGUMENTS: usize = 256;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 const MAX_NOTE_CHARS: usize = 2000;
+
+// The broker serves one caller at a time, so a wait without an end is a hang for
+// every caller after it. No wait on a caller or on a tool is left without one.
+
+/// How long the broker sleeps on a caller's socket before it looks again. macOS
+/// can leave a reader asleep after the other end has shut down its writing side,
+/// though the end of input is there for the next read to find (bd-oml). So the
+/// broker never relies on being woken.
+const CALLER_POLL: Duration = Duration::from_millis(50);
+/// How long a caller has to send its whole request and end it, from the moment
+/// the broker turns to it. `veil exec` takes a moment.
+const REQUEST_LIMIT: Duration = Duration::from_secs(10);
+const ANSWER_LIMITS: AnswerLimits = AnswerLimits {
+    stall: Duration::from_secs(10),
+    whole: Duration::from_secs(120),
+};
+/// The most of an answer handed to one write. A blocking write goes on for as
+/// long as the caller keeps taking a little, and the limits are only looked at
+/// between writes.
+const ANSWER_PIECE: usize = 1024;
+const TOOL_LIMITS: ToolLimits = ToolLimits {
+    run: Duration::from_secs(600),
+    drain: Duration::from_secs(5),
+};
+const TOOL_POLL: Duration = Duration::from_millis(10);
+
 pub(crate) const BROKER_SOCKET_ENV: &str = "VEIL_BROKER_SOCKET";
 const BROKER_SESSION_ENV: &str = "VEIL_BROKER_SESSION";
 const DERIVED_TOOLS: &[&str] = &[
@@ -106,6 +132,88 @@ enum NamedRead {
     Stderr(BoundedRead),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AnswerLimits {
+    /// With nothing of the answer taken.
+    stall: Duration,
+    /// For the whole answer, however steadily it is taken.
+    whole: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ToolLimits {
+    /// For the tool to finish.
+    run: Duration,
+    /// For its output to end once it has: a process it left behind can hold that
+    /// open.
+    drain: Duration,
+}
+
+/// A caller's socket while the broker writes it the answer. One that stops
+/// taking it, or takes it too slowly, is given up on; what it has by then ends
+/// without a final frame.
+struct Answer<'a> {
+    stream: &'a mut UnixStream,
+    limits: AnswerLimits,
+    started: Instant,
+    moved: Instant,
+}
+
+impl<'a> Answer<'a> {
+    fn to(stream: &'a mut UnixStream, limits: AnswerLimits) -> io::Result<Self> {
+        unless_the_caller_is_gone(stream.set_write_timeout(Some(CALLER_POLL)))?;
+        let started = Instant::now();
+        Ok(Self {
+            stream,
+            limits,
+            started,
+            moved: started,
+        })
+    }
+}
+
+impl Write for Answer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            if self.moved.elapsed() >= self.limits.stall
+                || self.started.elapsed() >= self.limits.whole
+            {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match self.stream.write(&bytes[..bytes.len().min(ANSWER_PIECE)]) {
+                Ok(written) => {
+                    self.moved = Instant::now();
+                    return Ok(written);
+                }
+                Err(error) if nothing_yet(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// macOS refuses a time limit on a socket whose other end has closed. Nothing
+/// can keep a read or a write on such a socket waiting.
+fn unless_the_caller_is_gone(limit: io::Result<()>) -> io::Result<()> {
+    match limit {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        other => other,
+    }
+}
+
+/// A read or write that ran into its time limit, or was interrupted: it is tried
+/// again for as long as the caller still has time.
+fn nothing_yet(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
 impl BrokerContext {
     fn load(session: String) -> io::Result<Self> {
         let cwd = env::current_dir()?;
@@ -169,8 +277,13 @@ impl BrokerContext {
             // noted before the tool runs: what it could copy and what it makes
             let sources = Sources::before(&self.config, &self.cwd, &cwd, &request.argv);
             let targets = OutTargets::before(&cwd, &request.argv);
-            run_bounded(tool_command(executable, enforcement), &request.argv, &cwd)
-                .map(|output| (sources, targets, output))
+            run_bounded(
+                tool_command(executable, enforcement),
+                &request.argv,
+                &cwd,
+                TOOL_LIMITS,
+            )
+            .map(|output| (sources, targets, output))
         });
         let (sources, targets, (stdout, stderr, exit_code)) = match ran {
             Ok(result) => result,
@@ -633,7 +746,7 @@ fn handle_connection(mut stream: UnixStream, context: &BrokerContext, limit_reac
     let cloned = match stream.try_clone() {
         Ok(cloned) => cloned,
         Err(_) => {
-            let _ = write_final(&mut stream, &ToolResult::denied("broker_connection_failed"));
+            answer(&mut stream, ToolResult::denied("broker_connection_failed"));
             return;
         }
     };
@@ -657,7 +770,7 @@ fn handle_connection(mut stream: UnixStream, context: &BrokerContext, limit_reac
                 ),
                 code,
             );
-            let _ = write_final(&mut stream, &result);
+            answer(&mut stream, result);
             return;
         }
     };
@@ -679,7 +792,7 @@ fn handle_connection(mut stream: UnixStream, context: &BrokerContext, limit_reac
             ),
             "broker_call_limit_reached",
         );
-        let _ = write_final(&mut stream, &result);
+        answer(&mut stream, result);
         return;
     }
 
@@ -702,13 +815,18 @@ fn handle_connection(mut stream: UnixStream, context: &BrokerContext, limit_reac
                 ),
                 "broker_malformed_request",
             );
-            let _ = write_final(&mut stream, &result);
+            answer(&mut stream, result);
             return;
         }
     };
 
     let result = context.process(request, "sandbox", "broker");
-    let _ = write_result(&mut stream, result);
+    answer(&mut stream, result);
+}
+
+fn answer(stream: &mut UnixStream, result: ToolResult) {
+    // a caller that does not take its answer cannot be told anything more
+    let _ = Answer::to(stream, ANSWER_LIMITS).and_then(|mut to| write_result(&mut to, result));
 }
 
 /// Send a `veil exec` call through the session broker, or use the same
@@ -770,10 +888,15 @@ fn request_over_socket(socket: &Path, request: &BrokerRequest) -> io::Result<Too
     read_result(&mut BufReader::new(stream))
 }
 
+/// One line of request, and then the end of input.
 fn read_request(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>, &'static str> {
+    unless_the_caller_is_gone(reader.get_ref().set_read_timeout(Some(CALLER_POLL)))
+        .map_err(|_| "broker_read_failed")?;
+    let deadline = Instant::now() + REQUEST_LIMIT;
     let mut request = Vec::new();
     loop {
-        let available = reader.fill_buf().map_err(|_| "broker_read_failed")?;
+        fill_before(reader, deadline)?;
+        let available = reader.buffer();
         if available.is_empty() {
             return Err("broker_malformed_request");
         }
@@ -785,11 +908,8 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>, &'static 
         request.extend_from_slice(&available[..consumed]);
         reader.consume(consumed);
         if newline.is_some() {
-            if !reader
-                .fill_buf()
-                .map_err(|_| "broker_read_failed")?
-                .is_empty()
-            {
+            fill_before(reader, deadline)?;
+            if !reader.buffer().is_empty() {
                 return Err("broker_malformed_request");
             }
             request.pop();
@@ -798,7 +918,23 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>, &'static 
     }
 }
 
-fn write_result(stream: &mut UnixStream, result: ToolResult) -> io::Result<()> {
+/// Leaves in the buffer what the caller sent next, or nothing at the end of its
+/// input. The deadline is looked at before every read, so a caller that is never
+/// quiet for long has no more time than one that is.
+fn fill_before(reader: &mut BufReader<UnixStream>, deadline: Instant) -> Result<(), &'static str> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err("broker_request_timed_out");
+        }
+        match reader.fill_buf() {
+            Ok(_) => return Ok(()),
+            Err(error) if nothing_yet(&error) => {}
+            Err(_) => return Err("broker_read_failed"),
+        }
+    }
+}
+
+fn write_result(stream: &mut impl Write, result: ToolResult) -> io::Result<()> {
     write_notes(stream, &result.notes)?;
     if result.error.is_some() {
         return write_final(stream, &result);
@@ -818,12 +954,12 @@ fn write_result(stream: &mut UnixStream, result: ToolResult) -> io::Result<()> {
     write_final_code(stream, exit_code, None)
 }
 
-fn write_final(stream: &mut UnixStream, result: &ToolResult) -> io::Result<()> {
+fn write_final(stream: &mut impl Write, result: &ToolResult) -> io::Result<()> {
     write_final_code(stream, result.exit_code, result.error.as_ref())
 }
 
 fn write_final_code(
-    stream: &mut UnixStream,
+    stream: &mut impl Write,
     exit_code: i32,
     error: Option<&FrameError>,
 ) -> io::Result<()> {
@@ -839,7 +975,7 @@ fn write_final_code(
 
 /// One frame for each note, ahead of the final one, so that no frame grows past
 /// what the client reads.
-fn write_notes(stream: &mut UnixStream, notes: &[String]) -> io::Result<()> {
+fn write_notes(stream: &mut impl Write, notes: &[String]) -> io::Result<()> {
     for note in notes {
         let note: String = note.chars().take(MAX_NOTE_CHARS).collect();
         serde_json::to_writer(&mut *stream, &json!({"note": note}))
@@ -989,10 +1125,13 @@ fn has_shell_metacharacter(argument: &str) -> bool {
     })
 }
 
+/// Runs a tool to its end, within `limits` and the cap on its output. Output
+/// that cannot be had whole is withheld.
 fn run_bounded(
     mut command: Command,
     argv: &[String],
     cwd: &Path,
+    limits: ToolLimits,
 ) -> Result<(Vec<u8>, Vec<u8>, i32), &'static str> {
     let mut child = command
         .args(argv)
@@ -1018,8 +1157,43 @@ fn run_bounded(
     let mut stdout_bytes = None;
     let mut stderr_bytes = None;
     let mut oversized = false;
-    for _ in 0..2 {
-        match receiver.recv().map_err(|_| "broker_output_read_failed")? {
+    let mut open = 2;
+    let mut ended = None;
+    let started = Instant::now();
+    let status = loop {
+        if ended.is_none() {
+            ended = child
+                .try_wait()
+                .map_err(|_| "broker_tool_wait_failed")?
+                .map(|status| (status, Instant::now()));
+        }
+        let overdue = match ended {
+            Some((status, _)) if open == 0 => break status,
+            Some((_, at)) => (at.elapsed() >= limits.drain).then_some("broker_output_not_closed"),
+            None => (started.elapsed() >= limits.run).then_some("broker_tool_timed_out"),
+        };
+        if let Some(code) = overdue {
+            // what the tool itself started is left alone; the threads reading
+            // its output end when that lets go
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(if oversized {
+                "broker_output_too_large"
+            } else {
+                code
+            });
+        }
+        if open == 0 {
+            thread::sleep(TOOL_POLL);
+            continue;
+        }
+        let read = match receiver.recv_timeout(TOOL_POLL) {
+            Ok(read) => read,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("broker_output_read_failed"),
+        };
+        open -= 1;
+        match read {
             NamedRead::Stdout(BoundedRead::Complete(bytes)) => stdout_bytes = Some(bytes),
             NamedRead::Stderr(BoundedRead::Complete(bytes)) => stderr_bytes = Some(bytes),
             NamedRead::Stdout(BoundedRead::TooLarge) | NamedRead::Stderr(BoundedRead::TooLarge) => {
@@ -1027,8 +1201,7 @@ fn run_bounded(
                 let _ = child.kill();
             }
         }
-    }
-    let status = child.wait().map_err(|_| "broker_tool_wait_failed")?;
+    };
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
 
@@ -1096,6 +1269,87 @@ fn result_after_audit(audit: io::Result<()>, code: &'static str) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shell(script: &str, limits: ToolLimits) -> Result<(Vec<u8>, Vec<u8>, i32), &'static str> {
+        let argv = ["-c".to_owned(), script.to_owned()];
+        run_bounded(Command::new("/bin/sh"), &argv, &env::temp_dir(), limits)
+    }
+
+    #[test]
+    fn a_tool_is_waited_for_no_longer_than_its_limits() {
+        let short = Duration::from_millis(300);
+        let long = Duration::from_secs(30);
+        for (script, run, drain, expected) in [
+            ("exec sleep 20", short, long, "broker_tool_timed_out"),
+            // done with its output, and still there
+            (
+                "exec >/dev/null 2>&1; exec sleep 20",
+                short,
+                long,
+                "broker_tool_timed_out",
+            ),
+            // gone, with something else still holding its output
+            (
+                "sleep 20 & echo done",
+                long,
+                short,
+                "broker_output_not_closed",
+            ),
+        ] {
+            let started = Instant::now();
+            let limits = ToolLimits { run, drain };
+            assert_eq!(shell(script, limits), Err(expected), "{script}");
+            assert!(started.elapsed() < Duration::from_secs(10), "{script}");
+        }
+
+        // the wait for the output to end starts when the tool does, not before:
+        // a tool slower than that wait is not cut off
+        let limits = ToolLimits {
+            run: long,
+            drain: short,
+        };
+        assert_eq!(
+            shell("sleep 1; echo late; exit 3", limits),
+            Ok((b"late\n".to_vec(), Vec::new(), 3))
+        );
+    }
+
+    #[test]
+    fn an_answer_is_given_up_when_it_stalls_or_takes_too_long() {
+        let answer = vec![b'x'; 1 << 20];
+        let short = Duration::from_millis(300);
+        let long = Duration::from_secs(30);
+        // nothing is taken; then a little, often enough never to stall
+        for (stall, whole, takes) in [(short, long, false), (long, short, true)] {
+            let (mut server, mut client) = UnixStream::pair().expect("socket pair");
+            let reader = takes.then(|| {
+                let mut client = client.try_clone().expect("second handle");
+                thread::spawn(move || {
+                    while client.read(&mut [0; 512]).is_ok_and(|read| read > 0) {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                })
+            });
+            let started = Instant::now();
+            let written = Answer::to(&mut server, AnswerLimits { stall, whole })
+                .and_then(|mut to| to.write_all(&answer));
+            assert_eq!(
+                written.map_err(|error| error.kind()),
+                Err(io::ErrorKind::TimedOut),
+                "takes: {takes}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "takes: {takes}"
+            );
+            drop(server);
+            if let Some(reader) = reader {
+                reader.join().expect("reader");
+            }
+            // the other handle on the caller's end stays open until here
+            let _ = client.read(&mut [0; 1]);
+        }
+    }
 
     #[test]
     fn request_protocol_rejects_shell_strings_unknown_fields_and_path_escape() {

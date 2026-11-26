@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::allowlist::SafePathMatcher;
-use crate::audit::{ROTATE_BYTES, ROTATED_FILES, rotate_if_full, rotated_path};
+use crate::audit::{ROTATE_BYTES, ROTATED_FILES, lock_in_time, rotate_if_full, rotated_path};
 use crate::broker_output::{BrokerOutputScanner, MAX_BROKER_OUTPUT_BYTES};
 use crate::config::{Config, PolicyMode, is_cmdrvl_config_protection_pattern, project_directory};
 use crate::evaluator::{EvaluationInput, PolicyMatchers, evaluate_access_with};
@@ -502,7 +502,7 @@ impl Registry {
             .mode(0o600)
             .open(self.directory().join("derived.key.lock"))?;
         // released when `lock` is dropped
-        lock.lock()?;
+        lock_in_time(&lock)?;
         if fs::symlink_metadata(path).is_ok() {
             return Ok(());
         }
@@ -1556,6 +1556,32 @@ mod tests {
             scan.feed(piece);
         }
         !scan.found.is_empty()
+    }
+
+    #[test]
+    fn making_the_key_gives_up_on_a_lock_that_is_never_let_go() {
+        let directory = std::env::temp_dir().join(format!(
+            "veil-derived-key-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("state directory");
+        let lock = File::create(directory.join("derived.key.lock")).expect("lock file");
+        lock.lock().expect("held by this test");
+
+        let registry = Registry::at(directory.join(REGISTRY_FILE));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(registry.prepare()));
+        let made = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("an answer, with the lock still held");
+        let why = made.expect_err("no key can be made without the lock");
+        assert!(why.contains("another process holds the lock"), "{why}");
+        assert!(!directory.join(KEY_FILE).exists());
+        drop(lock);
     }
 
     #[test]

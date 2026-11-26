@@ -108,6 +108,25 @@ judges the tool itself, raw-value flags included. That holds for the word
 another program named `veil` gets nothing, and `veil exec` of anything else is
 judged as before.
 
+The broker serves one call at a time, so it limits how long a caller or a tool
+can keep it:
+
+- A caller has 10 seconds to send its whole request and end it
+  (`broker_request_timed_out`).
+- A caller that takes none of its answer for 10 seconds, or has not taken all of
+  it in 120, is cut off. What it has ends without a final frame, so `veil exec`
+  reports an error.
+- A tool has 10 minutes to finish (`broker_tool_timed_out`). Once it has
+  finished, its output has 5 seconds to end (`broker_output_not_closed`: usually
+  a process the tool left running still holds it open). The broker stops the
+  tool, not processes the tool started.
+
+The two tool limits apply to `veil exec` outside a sandbox too. None of the
+limits can be configured. `veil exec` has no limit of its own on waiting for the
+broker, which may be busy with earlier calls. macOS can leave the broker asleep
+after a caller has ended its request, so the broker does not rely on being
+woken: it looks again every 50 ms.
+
 `veil sandbox --shell` starts `$SHELL` (`/bin/sh` where that is unset or empty)
 under the same profile, for checking by hand. `--profile-out <file>` writes the
 profile being applied to a new file: it does not overwrite one, and nothing is
@@ -974,9 +993,12 @@ own, `reason_class: redirect_write`.
 - **Rotation.** When the log reaches 10 MiB the next write moves it to
   `audit.jsonl.1`, each older file up one place, and keeps five. **The oldest is
   deleted.** `audit.jsonl.lock` next to the log serialises that between hooks. A
-  failed rotation does not lose the record being written; the hook says so on
-  stderr with the rest of its audit errors. The size and the five are fixed, and
-  `veil audit` reads only the current file, so entries just before a rotation are in
+  rotation waits 2 seconds for that lock and then fails. A failed rotation does
+  not lose the record being written; the hook says so on stderr with the rest of
+  its audit errors and decides as usual, though a call that covers several paths
+  records no more of them after that error, and the broker refuses the call
+  (`broker_audit_failed`). The size and the five are fixed, and `veil audit`
+  reads only the current file, so entries just before a rotation are in
   `audit.jsonl.1`.
 
 ### Configuration

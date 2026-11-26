@@ -4,6 +4,17 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::net::Shutdown;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "macos")]
@@ -534,7 +545,7 @@ fn a_denial_inside_a_sandbox_points_at_the_broker() {
 /// A `HOME` for a broker test. The session socket lives under it, and a macOS
 /// Unix socket path must be under 104 bytes, which no directory under
 /// `temp_dir()` leaves room for.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn short_home() -> PathBuf {
     let home = PathBuf::from(format!(
         "/tmp/vb-{}-{}-{}",
@@ -547,6 +558,367 @@ fn short_home() -> PathBuf {
     ));
     fs::create_dir(&home).expect("short fixture home");
     fs::canonicalize(home).expect("canonical fixture home")
+}
+
+/// The longest any of these tests waits for the broker. Every limit of the
+/// broker's own that they run into is well inside it.
+#[cfg(unix)]
+const ANSWER_DUE: Duration = Duration::from_secs(20);
+
+#[cfg(unix)]
+const ONE_ROW: &str = "#!/bin/sh\necho '{\"rows\":1}'\n";
+
+/// A real `veil --broker` over its own project. Its one authorized tool is
+/// `shape`, as the test writes it.
+#[cfg(unix)]
+struct Broker {
+    process: std::process::Child,
+    root: PathBuf,
+    home: PathBuf,
+    socket: PathBuf,
+}
+
+#[cfg(unix)]
+impl Broker {
+    fn start(shape: &str) -> Self {
+        let root = fixture();
+        let home = short_home();
+        fs::write(root.join("protected.txt"), "MERIDIAN-VAULT-CONFIDENTIAL\n").expect("protected");
+        fs::write(
+            root.join(".veil.toml"),
+            "[sensitivity]\nprotected = [\"protected.txt\"]\n[spine]\nauthorized_tools = [\"shape\"]\n",
+        )
+        .expect("project policy");
+        create_executable(&root.join("bin/shape"), shape);
+        let path = std::env::join_paths([
+            root.join("bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .expect("fixture PATH");
+        let socket = home.join("run/broker.sock");
+        let process = veil(&root)
+            .arg("--broker")
+            .env("HOME", &home)
+            .env("PATH", path)
+            .env("VEIL_PROTECTED", "protected.txt")
+            .env("VEIL_BROKER_SOCKET", &socket)
+            .env("VEIL_BROKER_SESSION", "broker-waits")
+            // the broker exits when this closes
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("broker should start");
+        Self {
+            process,
+            root,
+            home,
+            socket,
+        }
+    }
+
+    fn connect(&self) -> UnixStream {
+        let due = Instant::now() + ANSWER_DUE;
+        loop {
+            match UnixStream::connect(&self.socket) {
+                Ok(client) => {
+                    client.set_read_timeout(Some(ANSWER_DUE)).expect("limit");
+                    return client;
+                }
+                // it is still starting
+                Err(error) => assert!(Instant::now() < due, "no broker: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Sends one request and ends it, as `veil exec` does.
+    fn send(&self, request: &str) -> UnixStream {
+        let mut client = self.connect();
+        writeln!(client, "{request}").expect("request");
+        client.shutdown(Shutdown::Write).expect("end of request");
+        client
+    }
+
+    /// A call the broker allows: `shape` on the protected file.
+    fn shape_request(&self) -> String {
+        serde_json::json!({"tool": "shape", "argv": ["protected.txt"], "cwd": self.root})
+            .to_string()
+    }
+
+    fn audited_reasons(&self) -> Vec<String> {
+        fs::read_to_string(self.home.join(".cmdrvl/logs/veil/audit.jsonl"))
+            .expect("audit log")
+            .lines()
+            .map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).expect("audit record");
+                record["reason"].as_str().unwrap_or("allowed").to_owned()
+            })
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Broker {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+}
+
+/// Everything the broker sends before it closes the connection. The test fails
+/// if the broker has not done so in time.
+#[cfg(unix)]
+fn whole_answer(mut client: UnixStream, what: &str) -> String {
+    let mut answer = Vec::new();
+    let read = client.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer).into_owned();
+    if let Err(error) = read {
+        panic!("{what}: no whole answer within {ANSWER_DUE:?} ({error}); got {answer:?}");
+    }
+    answer
+}
+
+/// The next frame of an answer. Unlike [`whole_answer`], it does not mind how
+/// the connection ends after it.
+#[cfg(unix)]
+fn one_frame(client: UnixStream, what: &str) -> String {
+    let mut frame = String::new();
+    BufReader::new(client)
+        .read_line(&mut frame)
+        .unwrap_or_else(|error| panic!("{what}: nothing within {ANSWER_DUE:?} ({error})"));
+    frame
+}
+
+/// bd-oml. macOS can leave a reader asleep after the other end shuts down its
+/// writing side, though the end of input is there for the next read. The broker
+/// waited for exactly that with nothing else to wake it, so the broker and its
+/// caller waited on each other for good. The pause before the shutdown is swept,
+/// so that it lands all around the broker going back to sleep.
+#[cfg(unix)]
+#[test]
+fn the_broker_answers_every_caller_that_ends_its_request() {
+    let broker = Broker::start(ONE_ROW);
+    for call in 0..5_000_u64 {
+        let mut client = broker.connect();
+        client.write_all(b"{}\n").expect("request");
+        let pause = Duration::from_nanos(call * 7_919 % 40_000);
+        let from = Instant::now();
+        while from.elapsed() < pause {
+            std::hint::spin_loop();
+        }
+        client.shutdown(Shutdown::Write).expect("end of request");
+        let answer = whole_answer(client, &format!("call {call}"));
+        // the request was read to its end, and refused for what it is
+        let expected = if call < 64 {
+            "broker_malformed_request"
+        } else {
+            "broker_call_limit_reached"
+        };
+        assert!(answer.contains(expected), "call {call}: {answer}");
+    }
+}
+
+/// The broker serves one caller at a time, so a caller that never finishes its
+/// request would otherwise hold every later one for good.
+#[cfg(unix)]
+#[test]
+fn a_request_that_is_not_ended_is_refused_and_the_next_caller_served() {
+    std::thread::scope(|scope| {
+        for held in ["silent", "complete but not ended", "a byte at a time"] {
+            scope.spawn(move || {
+                let broker = Broker::start(ONE_ROW);
+                let holder = broker.connect();
+                let mut writer = holder.try_clone().expect("second handle");
+                if held == "complete but not ended" {
+                    writeln!(writer, "{}", broker.shape_request()).expect("request");
+                }
+                // never idle for long, and never done
+                let trickle = (held == "a byte at a time").then(|| {
+                    std::thread::spawn(move || {
+                        let until = Instant::now() + ANSWER_DUE + ANSWER_DUE;
+                        while Instant::now() < until && writer.write_all(b" ").is_ok() {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    })
+                });
+
+                let next = whole_answer(broker.send(&broker.shape_request()), held);
+                assert!(next.contains("\"exit_code\":0"), "{held}: {next}");
+                let refusal = one_frame(holder, held);
+                assert!(
+                    refusal.contains("broker_request_timed_out"),
+                    "{held}: {refusal}"
+                );
+                assert_eq!(
+                    broker.audited_reasons(),
+                    ["broker_request_timed_out", "allowed"],
+                    "{held}"
+                );
+                if let Some(trickle) = trickle {
+                    trickle.join().expect("trickling writer");
+                }
+            });
+        }
+    });
+}
+
+/// The limit on a request is not so tight that a caller that pauses is refused.
+#[cfg(unix)]
+#[test]
+fn a_caller_that_pauses_within_its_request_is_served() {
+    let broker = Broker::start(ONE_ROW);
+    let mut client = broker.connect();
+    let request = format!("{}\n", broker.shape_request());
+    let (first, rest) = request.split_at(request.len() / 2);
+    for part in [first, rest] {
+        client
+            .write_all(part.as_bytes())
+            .expect("part of the request");
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    client.shutdown(Shutdown::Write).expect("end of request");
+    let answer = whole_answer(client, "a caller that pauses");
+    assert!(answer.contains("\"exit_code\":0"), "{answer}");
+}
+
+/// macOS refuses a time limit on a socket whose other end has closed. A request
+/// from a caller that left before its turn is still read.
+#[cfg(unix)]
+#[test]
+fn a_caller_gone_before_its_turn_has_its_request_read() {
+    let broker = Broker::start(ONE_ROW);
+    let mut holder = broker.connect();
+    holder.write_all(b"{}\n").expect("request");
+    // sent and closed while the broker is still on the first
+    drop(broker.send("{}"));
+    holder.shutdown(Shutdown::Write).expect("end of request");
+    whole_answer(holder, "the first caller");
+    whole_answer(broker.send("{}"), "the caller after the one that left");
+    assert_eq!(broker.audited_reasons(), ["broker_malformed_request"; 3]);
+}
+
+/// An answer longer than the socket holds waits for its caller to take it. One
+/// that does not must not hold the broker, and one that takes it slowly gets all
+/// of it.
+#[cfg(unix)]
+#[test]
+fn a_caller_that_stops_reading_does_not_hold_the_broker() {
+    let broker = Broker::start(
+        "#!/bin/sh\n/usr/bin/awk 'BEGIN { for (i = 0; i < 8000; i++) print \"row of ordinary output\" }'\n",
+    );
+    let mut slow = broker.send(&broker.shape_request());
+    let mut taken = Vec::new();
+    let mut part = [0; 16 * 1024];
+    let mut next_pause = 0;
+    loop {
+        let read = slow.read(&mut part).expect("the answer, in time");
+        if read == 0 {
+            break;
+        }
+        taken.extend_from_slice(&part[..read]);
+        // by bytes, not by reads: how much one read gives differs by platform
+        if taken.len() >= next_pause {
+            next_pause = taken.len() + part.len();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let taken = String::from_utf8(taken).expect("frames");
+    assert!(
+        taken.ends_with("{\"exit_code\":0}\n"),
+        "{} bytes",
+        taken.len()
+    );
+
+    let idle = broker.send(&broker.shape_request());
+    let next = whole_answer(broker.send("{}"), "the caller after one that stopped");
+    assert!(next.contains("broker_malformed_request"), "{next}");
+    // what was cut off has no final frame, so no caller takes it for the whole
+    let cut = whole_answer(idle, "what the idle caller was left with");
+    assert!(cut.len() < taken.len(), "{} bytes", cut.len());
+    assert!(!cut.contains("exit_code"), "{} bytes", cut.len());
+}
+
+/// A full audit log is rotated under a lock. A lock that is never let go must
+/// not stop the broker, which serves one caller at a time, or a hook, which its
+/// agent is waiting for.
+#[cfg(unix)]
+#[test]
+fn a_held_audit_lock_stops_neither_the_broker_nor_the_hook() {
+    let broker = Broker::start(ONE_ROW);
+    let logs = broker.home.join(".cmdrvl/logs/veil");
+    fs::create_dir_all(&logs).expect("log directory");
+    let full = format!("{}\n", "x".repeat(10 * 1024 * 1024));
+    fs::write(logs.join("audit.jsonl"), full).expect("a full log");
+    let lock = fs::File::create(logs.join("audit.jsonl.lock")).expect("lock file");
+    lock.lock().expect("held by this test");
+
+    // a call the broker cannot record as it should is refused
+    let answer = whole_answer(broker.send(&broker.shape_request()), "a call");
+    assert!(answer.contains("broker_audit_failed"), "{answer}");
+    assert!(!answer.contains("\"stream\""), "{answer}");
+
+    let payload = serde_json::json!({
+        "session_id": "held-lock",
+        "cwd": broker.root,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": { "file_path": broker.root.join("protected.txt") },
+    });
+    let mut hook = veil(&broker.root)
+        .env("HOME", &broker.home)
+        .env("VEIL_PROTECTED", "protected.txt")
+        .env("VEIL_HARNESS", "plain")
+        .env_remove("VEIL_BROKER_SOCKET")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("hook should start");
+    hook.stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(payload.to_string().as_bytes())
+        .expect("payload should be written");
+    let due = Instant::now() + ANSWER_DUE;
+    while hook.try_wait().expect("hook status").is_none() {
+        if Instant::now() >= due {
+            let _ = hook.kill();
+            let _ = hook.wait();
+            panic!("the hook gave no decision within {ANSWER_DUE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = hook.wait_with_output().expect("hook output");
+    let decision: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("a JSON decision");
+    assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Audit logging failed"), "{stderr}");
+
+    // let go, and the log is rotated and calls go through again
+    drop(lock);
+    let answer = whole_answer(broker.send(&broker.shape_request()), "after");
+    assert!(answer.contains("\"exit_code\":0"), "{answer}");
+    assert!(logs.join("audit.jsonl.1").exists());
+}
+
+/// A tool can leave a process running that still holds its output open. The
+/// broker waited for the end of that output.
+#[cfg(unix)]
+#[test]
+fn a_tool_that_leaves_its_output_open_does_not_hold_the_broker() {
+    let broker = Broker::start("#!/bin/sh\n/bin/sleep 25 &\necho '{\"rows\":1}'\n");
+    let answer = whole_answer(broker.send(&broker.shape_request()), "the call");
+    assert!(answer.contains("broker_output_not_closed"), "{answer}");
+    // output that may not be whole is withheld
+    assert!(!answer.contains("\"stream\""), "{answer}");
+    let next = whole_answer(broker.send("{}"), "the next caller");
+    assert!(next.contains("broker_malformed_request"), "{next}");
+    assert_eq!(
+        broker.audited_reasons(),
+        ["broker_output_not_closed", "broker_malformed_request"]
+    );
 }
 
 /// The broker runs tools with the operator's own permissions, so nothing the

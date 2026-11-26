@@ -2,10 +2,12 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -42,6 +44,32 @@ pub const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// newest, `audit.jsonl.5` the oldest). The one after that is deleted: that is
 /// how the log stays bounded.
 pub const ROTATED_FILES: usize = 5;
+
+/// How long a lock is waited for. What veil does under one is quick: a rotation
+/// is a few renames.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// [`File::lock`] with an end to it. These locks are advisory, so any process
+/// that can open the file can hold one for as long as it likes, and a hook or
+/// the broker waiting for it would never answer (bd-oml).
+pub(crate) fn lock_in_time(file: &File) -> io::Result<()> {
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(error)) => return Err(error),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "another process holds the lock",
+                ));
+            }
+        }
+    }
+}
 
 /// The fields a line needs to be an audit entry at all, in any generation.
 const REQUIRED_FIELDS: [&str; 4] = ["ts", "tool", "path", "decision"];
@@ -263,8 +291,9 @@ pub(crate) fn rotate_if_full(path: &Path, max_bytes: u64, keep: usize) -> io::Re
         .write(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(PathBuf::from(lock_name))?;
-    // released when `lock` is dropped, or if this process dies
-    lock.lock()?;
+    // released when `lock` is dropped, or if this process dies. Without it the
+    // record is still appended, to a log left unrotated, and the caller is told
+    lock_in_time(&lock)?;
 
     // another hook may have rotated while this one waited
     if !is_full(path, max_bytes)? {
