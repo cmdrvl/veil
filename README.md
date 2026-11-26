@@ -124,8 +124,9 @@ The broker:
   put protected bytes where the sandbox reads them. A tool that has to write
   fails, and a tool that appends a witness record reports that it could not;
 - withholds output that the secrets, PII, tabular-dump or encoded-blob detectors
-  flag, and output over 16 MiB; allows 64 calls a session; and exits when its
-  launcher does.
+  flag in stdout, in stderr, or in the two joined end to end in either order
+  (with or without the whitespace at the join), and output over 16 MiB; allows
+  64 calls a session; and exits when its launcher does.
 
 The sandbox also stops the confined command from changing the tool executables
 the broker runs and the broker's state under `~/.cmdrvl/state/veil/`. Those
@@ -140,7 +141,8 @@ It does not:
 - deny reads of files that only a built-in pack classifies: list them under
   `[sensitivity].protected`;
 - restrict the network;
-- catch protected values a tool prints that no detector flags;
+- catch protected values a tool prints that no detector flags, including a value
+  a tool encodes, or breaks apart in any other way within or across its streams;
 - protect libraries or config files a tool loads, other programs it starts from
   `PATH`, or stop a new program being planted on `PATH` for a later session;
 - contain a determined process. The profile allows everything it does not name:

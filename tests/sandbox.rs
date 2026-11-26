@@ -44,8 +44,10 @@ fn veil(root: &Path) -> Command {
     command
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn create_executable(path: &Path, source: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("executable directory");
     }
@@ -409,6 +411,75 @@ fn a_protected_path_created_later_under_a_symlinked_directory_is_still_denied() 
             !String::from_utf8_lossy(&output.stdout).contains(MOVED_CANARY),
             "{path}\n{profile}"
         );
+    }
+}
+
+/// The client receives both of a tool's streams and can put them back
+/// together, so splitting a value between them must not get it past the scanner
+/// (bd-ds7). `veil exec` outside a sandbox runs the same check the broker does,
+/// on every platform.
+#[cfg(unix)]
+#[test]
+fn a_value_split_between_stdout_and_stderr_is_withheld() {
+    // the two halves of a detector-positive example key, never whole in either
+    const HEAD: &str = "AKIAIOSFODNN7EX";
+    const TAIL: &str = "AMPLE";
+
+    for (case, tool, withheld) in [
+        (
+            "stdout holds the head",
+            format!("printf %s {HEAD}; printf %s {TAIL} >&2"),
+            true,
+        ),
+        (
+            "stderr holds the head",
+            format!("printf %s {HEAD} >&2; printf %s {TAIL}"),
+            true,
+        ),
+        (
+            "each half is printed as a line",
+            format!("echo {HEAD}; echo {TAIL} >&2"),
+            true,
+        ),
+        (
+            "control: ordinary output and a warning",
+            "echo '{\"rows\":1}'; echo 'warning: one row skipped' >&2".to_owned(),
+            false,
+        ),
+    ] {
+        let root = fixture();
+        fs::write(root.join("protected.txt"), "private\n").expect("protected");
+        fs::write(
+            root.join(".veil.toml"),
+            "[sensitivity]\nprotected = [\"protected.txt\"]\n[spine]\nauthorized_tools = [\"shape\"]\n",
+        )
+        .expect("project policy");
+        create_executable(&root.join("bin/shape"), &format!("#!/bin/sh\n{tool}\n"));
+
+        let output = veil(&root)
+            .args(["exec", "shape", "protected.txt"])
+            .env("PATH", root.join("bin"))
+            .env("VEIL_PROTECTED", "protected.txt")
+            .env_remove("VEIL_BROKER_SOCKET")
+            .output()
+            .expect("veil should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!("{case}\nstdout: {stdout}\nstderr: {stderr}");
+
+        if withheld {
+            assert_eq!(output.status.code(), Some(126), "{context}");
+            assert!(stderr.contains("broker_output_denied"), "{context}");
+            assert!(stdout.is_empty(), "{context}");
+            assert!(
+                !stderr.contains(HEAD) && !stderr.contains(TAIL),
+                "{context}"
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(0), "{context}");
+            assert_eq!(stdout, "{\"rows\":1}\n", "{context}");
+            assert_eq!(stderr, "warning: one row skipped\n", "{context}");
+        }
     }
 }
 

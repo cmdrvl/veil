@@ -194,14 +194,9 @@ impl BrokerContext {
             return ToolResult::denied("broker_output_too_large");
         }
 
-        let stdout_findings = self.scanner.scan(&stdout);
-        let stderr_findings = self.scanner.scan(&stderr);
-        let findings = match (stdout_findings, stderr_findings) {
-            (Ok(mut stdout), Ok(stderr)) => {
-                stdout.extend(stderr);
-                stdout
-            }
-            _ => {
+        let findings = match self.scanner.scan_streams(&stdout, &stderr) {
+            Ok(findings) => findings,
+            Err(_) => {
                 let output_hash = hash_streams(&stdout, &stderr);
                 if self
                     .audit(

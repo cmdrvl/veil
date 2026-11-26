@@ -52,6 +52,36 @@ impl BrokerOutputScanner {
 
         Ok(self.scanner.scan_bytes(output))
     }
+
+    /// Scan both streams of one tool call. The client receives both and can put
+    /// them back together (bd-ds7), so each is scanned alone and then the two
+    /// as one buffer in either order: once exactly, and once without the
+    /// whitespace where they meet, which line-by-line printing leaves there.
+    /// Findings from a joined buffer have spans in that buffer. A value broken
+    /// up any other way is not matched.
+    pub fn scan_streams(
+        &self,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Result<Vec<Finding>, OutputTooLarge> {
+        let mut findings = self.scan(stdout)?;
+        findings.extend(self.scan(stderr)?);
+        if !findings.is_empty() || stdout.is_empty() || stderr.is_empty() {
+            return Ok(findings);
+        }
+        for (first, second) in [(stdout, stderr), (stderr, stdout)] {
+            for joined in [
+                [first, second].concat(),
+                [first.trim_ascii_end(), second.trim_ascii_start()].concat(),
+            ] {
+                let found = self.scan(&joined)?;
+                if !found.is_empty() {
+                    return Ok(found);
+                }
+            }
+        }
+        Ok(findings)
+    }
 }
 
 impl Default for BrokerOutputScanner {
