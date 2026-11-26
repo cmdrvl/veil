@@ -734,11 +734,19 @@ output is still delivered, and `veil exec` says on standard error that it is
   24 is. Shorter output is caught when it is a whole copy. A file whose bytes the
   registry already holds does not count, so one report does not block the next.
 - veil could make that whole comparison. More than 10,000 files or 1 GiB to
-  compare, more than 100,000 directory entries to walk, or a file that changes
-  while the tool runs, registers nothing. In a project with more protected data
-  than that, nothing is registered. A bare name pattern such as `*.nport.xml`
-  covers the whole project, so veil walks all of it (build output and
-  dependencies included) from the directory that holds `.veil.toml`.
+  compare, more than 100,000 directory entries to walk, a file veil cannot read,
+  or a file that changes while the tool runs, registers nothing. In a project
+  with more protected data than that, nothing is registered. A bare name pattern
+  such as `*.nport.xml` covers the whole project, so veil walks all of it (build
+  output and dependencies included) from the directory that holds `.veil.toml`.
+
+veil reads every file it compares twice: it hashes it before the tool starts, and
+searches it after the tool exits. The search counts only if it reads bytes with
+that same hash, so a tool that rewrites a file and puts its modification time
+back registers nothing. The first read happens on each `veil exec` call,
+whatever the tool prints. On one Mac, with a release build, a call took 3.2 s
+with 195 MiB of protected data and 15.7 s with 960 MiB; the build without the
+first read took 3.1 s and 14.8 s.
 
 The comparison goes by text, so a new report that shares a run of text with a
 protected file veil has *not* registered (an older report another program made,
@@ -785,8 +793,9 @@ again.
   write slices of its input if that matters to you, or deny those options in
   `[spine.denied_flags]`.
 - Only files named on the command line and files under your `protected` patterns
-  are compared. A file that only a sensitivity pack classifies, or one in veil's
-  built-in `~/.cmdrvl/` paths, is compared only when it is named.
+  are compared, and only those that are there when the tool starts. A file that
+  only a sensitivity pack classifies, or one in veil's built-in `~/.cmdrvl/`
+  paths, is compared only when it is named.
 - Anything that writes files without a veil hook can replace the key and then
   forge records: another harness, an install without the write hooks, an MCP tool
   veil is told not to screen, a script that builds the path while it runs, or

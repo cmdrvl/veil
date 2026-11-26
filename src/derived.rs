@@ -26,6 +26,7 @@
 //! tool that drops or reorders columns, re-encodes or paraphrases is not seen
 //! as copying: the registry is no stronger than this check and the detectors.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -777,7 +778,7 @@ impl Collected {
 }
 
 /// The files veil would refuse to show that a `veil exec` call could have
-/// copied. They are noted before the tool runs and compared after it.
+/// copied. They are read before the tool runs and compared after it.
 #[derive(Clone, Debug, Default)]
 pub struct Sources {
     /// Named on the command line, or beneath a directory named there.
@@ -786,12 +787,22 @@ pub struct Sources {
     /// reach a file through a list. veil's built-in `~/.cmdrvl` patterns are
     /// left out, so a file there is compared only when it is named.
     protected: Collected,
+    /// The hash of what each file held before the tool started, by device and
+    /// inode. Whatever rewrites a file can put its stamp back, so a comparison
+    /// counts only where it reads these same bytes again (bd-5ks).
+    contents: BTreeMap<(u64, u64), blake3::Hash>,
 }
 
 impl Sources {
     /// `loaded_in` is where `config` was loaded from, which says what the
-    /// project is. The tool runs in `cwd`.
+    /// project is. The tool runs in `cwd`. Call this before the tool starts.
     pub fn before(config: &Config, loaded_in: &Path, cwd: &Path, argv: &[String]) -> Self {
+        let mut sources = Self::find(config, loaded_in, cwd, argv);
+        sources.read_contents();
+        sources
+    }
+
+    fn find(config: &Config, loaded_in: &Path, cwd: &Path, argv: &[String]) -> Self {
         let mut sources = Self::default();
 
         // "would veil refuse to show it" is what the hook says to a Read of it,
@@ -866,6 +877,31 @@ impl Sources {
         sources
     }
 
+    /// Where a file is already missing from the comparison nothing will be
+    /// registered, so there is nothing to read.
+    fn read_contents(&mut self) {
+        if self.named.gap.is_some() || self.protected.gap.is_some() {
+            return;
+        }
+        for collected in [&mut self.named, &mut self.protected] {
+            for (path, stamp) in &collected.files {
+                let Entry::Vacant(content) = self.contents.entry((stamp.device, stamp.inode))
+                else {
+                    continue;
+                };
+                match read_source(path, |_| {}) {
+                    Ok(hash) => {
+                        content.insert(hash);
+                    }
+                    Err(why) => {
+                        collected.gap = Some(why);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// For each candidate, the content hash to register or why veil will not.
     ///
     /// stdout gets the same comparison as a file under `--out`: a tool can
@@ -897,10 +933,11 @@ impl Sources {
             if verdicts.iter().all(Result::is_err) {
                 break;
             }
-            if !compared.insert((stamp.device, stamp.inode)) {
+            let file = (stamp.device, stamp.inode);
+            if !compared.insert(file) {
                 continue;
             }
-            match needles.search(path, *stamp) {
+            match needles.search(path, *stamp, self.contents.get(&file)) {
                 Ok((digest, repeated)) => {
                     let takes =
                         |index: usize, own: &String| *own == digest || repeated.contains(&index);
@@ -1179,8 +1216,14 @@ impl Needles {
     }
 
     /// The content hash of the source at `path` and which candidates repeat
-    /// text of it. `Err` when it is not the file it was before the tool ran.
-    fn search(&self, path: &Path, before: Stamp) -> Result<(String, HashSet<usize>), String> {
+    /// text of it. `Err` unless it is still the file it was before the tool ran
+    /// and the bytes searched are the ones it held then, `content`.
+    fn search(
+        &self,
+        path: &Path,
+        before: Stamp,
+        content: Option<&blake3::Hash>,
+    ) -> Result<(String, HashSet<usize>), String> {
         let changed = || {
             format!(
                 "{} changed while the tool ran, so veil cannot compare with it",
@@ -1191,25 +1234,30 @@ impl Needles {
         if !still() {
             return Err(changed());
         }
-        let mut file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
 
         let mut scan = Scan::new(self);
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = vec![0u8; 64 * 1024];
-        loop {
-            let read = file
-                .read(&mut buffer)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-            scan.feed(&buffer[..read]);
-        }
-        if !still() {
+        let searched = read_source(path, |bytes| scan.feed(bytes))?;
+        if !still() || content != Some(&searched) {
             return Err(changed());
         }
-        Ok((format!("blake3:{}", hasher.finalize().to_hex()), scan.found))
+        Ok((format!("blake3:{}", searched.to_hex()), scan.found))
+    }
+}
+
+/// Reads a file through once, handing each piece to `each`, and returns the
+/// hash of exactly what it handed over.
+fn read_source(path: &Path, mut each: impl FnMut(&[u8])) -> Result<blake3::Hash, String> {
+    let failed = |error: io::Error| format!("{}: {error}", path.display());
+    let mut file = File::open(path).map_err(failed)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(failed)?;
+        if read == 0 {
+            return Ok(hasher.finalize());
+        }
+        hasher.update(&buffer[..read]);
+        each(&buffer[..read]);
     }
 }
 

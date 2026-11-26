@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +46,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 summary() { printf '{"profile":"%s","columns":4,"null_rate":0.0}\n' "$1"; }
+# rewrites $1 in place with as many Zs as it had bytes, then puts its mtime back
+blank() {
+  touch -r "$1" ../outside/stamp
+  length=$(($(wc -c < "$1")))
+  head -c "$length" /dev/zero | tr '\000' Z > "$1"
+  touch -m -r ../outside/stamp "$1"
+}
 excerpt() { tail -c +101 "$input" | head -c 200; }
 reflowed() { excerpt | tr ' ' '\n' | tr 'a-z' 'A-Z'; }
 case $mode in
@@ -67,6 +74,9 @@ case $mode in
   print-reflow) reflowed ;;
   print-summary) summary printed ;;
   print-indirect) cat "$(cat "$input")" ;;
+  restore) cat "$input" > "$out"; blank "$input" ;;
+  indirect-restore) real=$(cat "$input"); cat "$real" > "$out"; blank "$real" ;;
+  print-restore) cat "$input"; blank "$input" ;;
 esac
 "#;
 
@@ -657,6 +667,106 @@ fn an_earlier_registered_output_does_not_block_the_next_one() {
         "data/second.json",
         "it repeats text of an unregistered file",
     );
+}
+
+/// Everything about a file that says it is as it was, and that whatever rewrote
+/// it can arrange.
+fn stamp(path: &Path) -> (u64, u64, u64, i64, i64) {
+    let metadata = fs::metadata(path).expect("metadata");
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    )
+}
+
+/// bd-5ks: a tool copies a source, overwrites it in place with as many bytes,
+/// and puts its mtime back. What veil then compares with is no longer what was
+/// copied, so nothing may be registered.
+///
+/// Each case has a project of its own, and its text is in one file only: a copy
+/// left over from another case, or a second file with the same text, would have
+/// veil refuse for that reason and show nothing here.
+#[test]
+fn a_source_rewritten_with_its_stamp_put_back_registers_nothing() {
+    let mut failures = Vec::new();
+    // mode, argument, the file copied, its text, whether the copy is printed
+    for (mode, input, source, held, printed, why) in [
+        (
+            "restore",
+            "data/memo.txt",
+            "data/memo.txt",
+            MEMO,
+            false,
+            "a protected file named on the command line",
+        ),
+        (
+            "restore",
+            ".env",
+            ".env",
+            PUBLIC_NOTE,
+            false,
+            "a named file only a sensitivity pack classifies",
+        ),
+        (
+            "indirect-restore",
+            "list.txt",
+            "data/memo.txt",
+            MEMO,
+            false,
+            "a protected file the command line does not name",
+        ),
+        (
+            "print-restore",
+            "data/memo.txt",
+            "data/memo.txt",
+            MEMO,
+            true,
+            "standard output saved to a file",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.write("list.txt", "data/memo.txt");
+        fixture.write(source, held);
+        let before = stamp(&fixture.path(source));
+        let copy = "data/copy.json";
+
+        let output = if printed {
+            fixture.exec(&["profile", mode, input])
+        } else {
+            fixture.exec(&["profile", mode, input, "--out", copy])
+        };
+        if printed {
+            fixture.write(copy, &text(&output.stdout));
+        }
+
+        assert_eq!(
+            stamp(&fixture.path(source)),
+            before,
+            "{why}: unless the tool puts the stamp back, this shows nothing"
+        );
+        let now = fs::read_to_string(fixture.path(source)).expect("source");
+        assert_ne!(now, held, "{why}: the tool rewrote the source");
+        assert_eq!(
+            fs::read_to_string(fixture.path(copy)).expect("copy"),
+            held,
+            "{why}: the tool kept the original bytes"
+        );
+
+        let verdict = fixture.read(copy);
+        if verdict.action != "deny" {
+            failures.push(format!("{why}: the copy may be read: {verdict:?}"));
+        }
+        let said = text(&output.stderr);
+        if !(said.contains("not registered") && said.contains("changed while the tool ran")) {
+            failures.push(format!(
+                "{why}: veil did not say the source changed: {said}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
