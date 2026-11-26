@@ -21,7 +21,8 @@
 //! A file run by name (`./x.py`) is read when its first line names an
 //! interpreter. A Python directory runs its `__main__.py`.
 //!
-//! An `http` or `https` address is not read as a path (bd-a5g).
+//! An `http` or `https` address is not read as a path, here or in a typed
+//! command (bd-a5g, bd-ov7).
 //!
 //! This is best effort, and the remediation says so. A script that builds a path
 //! at run time, takes it from the environment or a file, or imports a module
@@ -1234,11 +1235,11 @@ fn words(kind: InterpreterKind, text: &str, cwd: &Path) -> Vec<Word> {
 /// Split into words, `https://host/data/x` leaves `//host/data/x`, which reads
 /// as an absolute path under `data/`.
 ///
-/// An address is blanked only when it cannot also be a local path: it starts a
-/// word, names a host, climbs with no `..`, and no entry named `https:` (or
-/// `http:`) is in `cwd`. What it holds in braces is code and is kept. Borrowed
+/// An address is blanked only when it is unlikely to be a local path too: it
+/// starts a word, names a web host, climbs with no `..`, and no entry named
+/// `https:` (or `http:`) is in `cwd`. What it holds in braces is code and is kept. Borrowed
 /// means there was nothing to blank.
-fn without_web_addresses<'a>(text: &'a str, cwd: &Path) -> Cow<'a, str> {
+pub(super) fn without_web_addresses<'a>(text: &'a str, cwd: &Path) -> Cow<'a, str> {
     let bytes = text.as_bytes();
     let mut kept = String::new();
     let mut copied = 0;
@@ -1258,9 +1259,10 @@ fn without_web_addresses<'a>(text: &'a str, cwd: &Path) -> Cow<'a, str> {
         }
 
         let (end, literal, code) = web_address(text, host);
-        if literal
-            .split(['/', '?', '#', '&', '='])
-            .any(|segment| segment == "..")
+        if !names_a_web_host(&literal)
+            || literal
+                .split(['/', '?', '#', '&', '='])
+                .any(|segment| segment == "..")
         {
             continue;
         }
@@ -1276,6 +1278,19 @@ fn without_web_addresses<'a>(text: &'a str, cwd: &Path) -> Cow<'a, str> {
     }
     kept.push_str(&text[copied..]);
     Cow::Owned(kept)
+}
+
+/// Whether the address whose own characters are `address` names a host as the
+/// web does: a dotted name, `localhost` or a bracketed number. `https://data/x`
+/// may be the local `data/x`, seen through a link named `https:`.
+fn names_a_web_host(address: &str) -> bool {
+    let authority = address.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    if host.starts_with('[') {
+        return true;
+    }
+    let name = host.split(':').next().unwrap_or_default();
+    name.trim_end_matches('.').contains('.') || name.eq_ignore_ascii_case("localhost")
 }
 
 /// Where the scheme before the `://` at `separator` starts, when it is `http` or

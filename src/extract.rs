@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -718,7 +719,7 @@ fn argv_paths(
     let mut budget = ARGV_FILESYSTEM_BUDGET;
     let mut resolver = ArgvResolver::new(cwd);
 
-    for word in argv_path_words(program, args, named) {
+    for word in argv_path_words(program, args, named, cwd) {
         let mut resolve = |raw: &str, found: &mut Vec<ArgvPath>| {
             let resolved = budget > 0;
             let path = if resolved {
@@ -764,16 +765,35 @@ struct PathWord {
     certain: bool,
 }
 
+/// Whether `program` takes a web address as one: a web client, or a language
+/// interpreter, whose words are code and arguments. Any other program opens a
+/// word like `https://a.b/x` as a local path if there is one.
+fn takes_web_addresses(program: &str) -> bool {
+    matches!(program, "curl" | "wget" | "gh")
+        || interpreter_kind(program).is_some_and(|kind| kind != InterpreterKind::Shell)
+}
+
 /// The words of a command that may name a path, in order, without
 /// duplicates. Besides whole words it takes the value of `--opt=value` and
 /// `key=value` (curl's `file=@x.csv`), drops a leading `@` or `<`, and takes
 /// each quoted literal inside a longer word (`select * from 'x.csv'`,
 /// `open('x.csv')`). The script handed to a shell is skipped: the decomposer
 /// runs it as commands of its own. `named` are added last, as certain paths.
-fn argv_path_words(program: &str, args: &[String], named: &[String]) -> Vec<PathWord> {
+/// To a program that [`takes_web_addresses`] one is not a path (bd-ov7); in a
+/// word that holds one among other text, what is left is read piece by piece.
+fn argv_path_words(program: &str, args: &[String], named: &[String], cwd: &Path) -> Vec<PathWord> {
     let mut words: Vec<PathWord> = Vec::new();
+    let web = takes_web_addresses(command_name(program));
+    // what is left of `text` once its addresses are blanked, when it holds any
+    let blanked = |text: &str| match script::without_web_addresses(text, cwd) {
+        Cow::Owned(rest) if web => Some(rest),
+        _ => None,
+    };
     let mut add = |text: &str| {
         let text = text.trim_start_matches(['@', '<']);
+        if blanked(text).is_some() {
+            return;
+        }
         let shaped = path_shaped(text);
         let plain = is_plain_name(text);
 
@@ -806,26 +826,39 @@ fn argv_path_words(program: &str, args: &[String], named: &[String]) -> Vec<Path
             continue;
         }
 
-        let option = !options_ended && word.starts_with('-') && word.len() > 1;
-        if !option {
-            add(word);
-        } else if !word.starts_with("--")
-            && let Some(attached) = word.get(2..)
-            && path_shaped(attached)
-        {
-            // `-fdata/x.csv`, `-C/srv/data`: a short option with its value attached.
-            add(attached);
-        }
-        if let Some((_, value)) = word.split_once('=') {
-            add(value);
-        }
-        // `git show HEAD:data/x.csv`, `scp data/x.csv host:/tmp`, `rsync host:x .`
-        if let Some((_, tail)) = word.rsplit_once(':') {
-            add(tail);
-        }
-        if word.contains(['\'', '"']) {
-            for literal in quoted_literals(word) {
-                add(literal);
+        let rest = blanked(word);
+        let pieces: Vec<&str> = match &rest {
+            None => vec![word],
+            Some(rest) => {
+                for literal in quoted_literals(rest) {
+                    add(literal.trim());
+                }
+                rest.split_whitespace().collect()
+            }
+        };
+
+        for word in pieces {
+            let option = !options_ended && word.starts_with('-') && word.len() > 1;
+            if !option {
+                add(word);
+            } else if !word.starts_with("--")
+                && let Some(attached) = word.get(2..)
+                && path_shaped(attached)
+            {
+                // `-fdata/x.csv`, `-C/srv/data`: a short option with its value attached.
+                add(attached);
+            }
+            if let Some((_, value)) = word.split_once('=') {
+                add(value);
+            }
+            // `git show HEAD:data/x.csv`, `scp data/x.csv host:/tmp`, `rsync host:x .`
+            if let Some((_, tail)) = word.rsplit_once(':') {
+                add(tail);
+            }
+            if word.contains(['\'', '"']) {
+                for literal in quoted_literals(word) {
+                    add(literal);
+                }
             }
         }
     }
