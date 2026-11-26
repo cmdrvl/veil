@@ -146,6 +146,19 @@ impl Fixture {
         )
     }
 
+    /// What this machine's `env` prints given `args`; `None` if it fails.
+    fn env_prints(&self, args: &[&str]) -> Option<String> {
+        let output = self
+            .command("/usr/bin/env")
+            .args(args)
+            .output()
+            .expect("env should run");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
     /// Whether running the command in bash prints the protected file.
     fn leaks(&self, text: &str) -> bool {
         let output = self
@@ -314,8 +327,6 @@ fn a_word_that_assigns_is_not_taken_for_the_command() {
         "env -S 'A=1 bash -c \"cat protected/x.csv\"'",
         "env -S '-v bash -c \"cat protected/x.csv\"'",
         "env -S 'A=1' bash -c 'cat protected/x.csv'",
-        // the last `-C` is the one `env` uses
-        "env -C /tmp -C protected cat x.csv",
         "A+=1 bash -c 'cat protected/x.csv'",
         "A=1 B+=2 sh -c 'cat protected/x.csv'",
         "{ A+=1 bash -c 'cat protected/x.csv'; }",
@@ -330,18 +341,70 @@ fn a_word_that_assigns_is_not_taken_for_the_command() {
             allowed.push(command);
         }
     }
-    // Not run here: another user, long options only GNU `env` has, and an
-    // element before a command, which bash 3.2 runs and other versions were not
-    // tried with.
+    // Forms that only some `env`s take (BSD's, GNU's and the one Ubuntu ships
+    // from uutils differ). Where this machine's takes the form in the probe,
+    // the command must really read the file.
+    for (probe, command) in [
+        (
+            &["--split=echo veil-probe"][..],
+            "env --split='sh -c \"cat protected/x.csv\"'",
+        ),
+        (
+            &["--split", "echo veil-probe"],
+            "env --split 'sh -c \"cat protected/x.csv\"'",
+        ),
+        (
+            &["--ch", "/", "echo", "veil-probe"],
+            "env --ch protected cat x.csv",
+        ),
+        (
+            &["-a", "name", "echo", "veil-probe"],
+            "env -a name bash -c 'cat protected/x.csv'",
+        ),
+        (
+            &["--argv0", "name", "echo", "veil-probe"],
+            "env --argv0 name bash -c 'cat protected/x.csv'",
+        ),
+        (
+            &["--env0-from", "/dev/null", "echo", "veil-probe"],
+            "env --env0-from /dev/null bash -c 'cat protected/x.csv'",
+        ),
+        (
+            &["--quoting-style", "shell", "echo", "veil-probe"],
+            "env --quoting-style shell bash -c 'cat protected/x.csv'",
+        ),
+        (
+            &["-S=x echo veil-probe"],
+            "env -S='x bash -c \"cat protected/x.csv\"'",
+        ),
+    ] {
+        if fixture.env_prints(probe).as_deref() == Some("veil-probe") && !fixture.leaks(command) {
+            harmless.push(command);
+        }
+        if fixture.hook(command).0 != "deny" {
+            allowed.push(command);
+        }
+    }
+    // The last `-C` is the one veil follows. An `env` may use the last or
+    // refuse a second one; none may use the first.
+    let twice = fixture.env_prints(&["-C", "/usr", "-C", "/", "pwd"]);
+    assert!(
+        matches!(twice.as_deref(), None | Some("/")),
+        "`env -C /usr -C / pwd` printed {twice:?}"
+    );
+    let command = "env -C /tmp -C protected cat x.csv";
+    if twice.is_some() && !fixture.leaks(command) {
+        harmless.push(command);
+    }
+    if fixture.hook(command).0 != "deny" {
+        allowed.push(command);
+    }
+    // Not run here: another user, and an element before a command, which bash
+    // 3.2 runs and other versions were not tried with.
     for command in [
         "A[0]=1 bash -c 'cat protected/x.csv'",
         "sudo A=1 bash -c 'cat protected/x.csv'",
         "sudo A=1 -u nobody B=2 bash -c 'cat protected/x.csv'",
-        "env --split='sh -c \"cat protected/x.csv\"'",
-        "env --split 'sh -c \"cat protected/x.csv\"'",
-        "env --ch protected cat x.csv",
-        "env -a name bash -c 'cat protected/x.csv'",
-        "env --argv0 name bash -c 'cat protected/x.csv'",
     ] {
         if fixture.hook(command).0 != "deny" {
             allowed.push(command);

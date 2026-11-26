@@ -648,24 +648,27 @@ fn finish_with_directory(
     }
 }
 
-/// The option of `env` that takes a value and has this long name. GNU takes
-/// any start of a long name that no other shares, and no other starts the way
-/// these do.
+/// The option of `env` that takes a value and has this long name. GNU and the
+/// `env` from uutils take any start of a long name that no other shares, and no
+/// other starts the way these do. Only `-C` and `-S` matter here; the rest are
+/// listed so that their values are passed over. The last two are uutils' own.
 fn env_long_option(name: &str) -> Option<char> {
     [
         ("unset", 'u'),
         ("chdir", 'C'),
         ("split-string", 'S'),
         ("argv0", 'a'),
+        ("env0-from", 'e'),
+        ("quoting-style", 'q'),
     ]
     .into_iter()
     .find(|(long, _)| !name.is_empty() && long.starts_with(name))
     .map(|(_, flag)| flag)
 }
 
-/// `env [options] [-] [NAME=value]... command`, GNU and BSD, read as `env`
-/// reads it: a word with `=` in it is an assignment whatever stands before the
-/// `=`, and what `-S` splits off takes its place among `env`'s own words. A
+/// `env [options] [-] [NAME=value]... command`, BSD, GNU and uutils, read as
+/// `env` reads it: a word with `=` in it is an assignment whatever stands before
+/// the `=`, and what `-S` splits off takes its place among `env`'s own words. A
 /// word of `env`'s taken for the command would hide the command (bd-szf).
 fn env_step(args: &[String]) -> Step {
     let mut i = 0;
