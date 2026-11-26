@@ -559,6 +559,93 @@ echo ordinary > "$root/ordinary-write.txt" && echo ORDINARY_WRITE_ALLOWED
     }
 }
 
+/// A path rule does not follow a file to its other names. A hard link made
+/// before the session would let the confined process rewrite a tool the broker
+/// runs, and the broker runs it outside the sandbox (bd-wwh).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_broker_tool_with_a_second_name_cannot_be_rewritten_by_the_confined_process() {
+    const ORIGINAL: &str = "#!/bin/sh\necho '{\"rows\":1}'\n";
+    // rewrite the tool through its other name, then ask the broker to run it
+    let script = r#"
+printf '#!/bin/sh\n/bin/cat "%s/protected.txt"\n' "$2" > "$2/second-name" && echo REWRITTEN
+"$1" exec shape protected.txt
+"#;
+
+    // `aliased` names the file that gets the second name
+    for (case, through_symlink, aliased) in [
+        ("the PATH entry is the tool", false, "bin/shape"),
+        (
+            "the PATH entry links to the tool",
+            true,
+            "real-bin/shape-1.0",
+        ),
+        (
+            "control: a tool the broker will not run",
+            false,
+            "later-bin/shape",
+        ),
+    ] {
+        let root = fixture();
+        let home = short_home();
+        fs::write(root.join("protected.txt"), "MERIDIAN-VAULT-CONFIDENTIAL\n").expect("protected");
+        fs::write(
+            root.join(".veil.toml"),
+            "[sensitivity]\nprotected = [\"protected.txt\"]\n[spine]\nauthorized_tools = [\"shape\"]\n",
+        )
+        .expect("project policy");
+        create_executable(&root.join("later-bin/shape"), ORIGINAL);
+        if through_symlink {
+            create_executable(&root.join("real-bin/shape-1.0"), ORIGINAL);
+            fs::create_dir(root.join("bin")).expect("bin directory");
+            std::os::unix::fs::symlink(root.join("real-bin/shape-1.0"), root.join("bin/shape"))
+                .expect("tool symlink");
+        } else {
+            create_executable(&root.join("bin/shape"), ORIGINAL);
+        }
+        let aliased = root.join(aliased);
+        fs::hard_link(&aliased, root.join("second-name")).expect("second name");
+        let path = std::env::join_paths(
+            [root.join("bin"), root.join("later-bin")]
+                .into_iter()
+                .chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )),
+        )
+        .expect("fixture PATH should be joinable");
+
+        let output = veil(&root)
+            .args(["sandbox", "--", "/bin/sh", "-c", script, "sh"])
+            .arg(env!("CARGO_BIN_EXE_veil"))
+            .arg(&root)
+            .env("HOME", &home)
+            .env("PATH", path)
+            .env("VEIL_PROTECTED", "protected.txt")
+            .output()
+            .expect("veil should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let context = format!("{case}\nstdout: {stdout}\nstderr: {stderr}");
+
+        assert!(!stdout.contains("MERIDIAN-VAULT-CONFIDENTIAL"), "{context}");
+        if case.starts_with("control") {
+            assert!(output.status.success(), "{context}");
+            assert!(stdout.contains("{\"rows\":1}"), "{context}");
+        } else {
+            // refused before anything ran, naming the file and the reason
+            assert!(!output.status.success(), "{context}");
+            assert!(!stdout.contains("REWRITTEN"), "{context}");
+            assert_eq!(
+                fs::read_to_string(&aliased).expect("tool"),
+                ORIGINAL,
+                "{context}"
+            );
+            assert!(stderr.contains(&aliased.display().to_string()), "{context}");
+            assert!(stderr.contains("hard link"), "{context}");
+        }
+    }
+}
+
 /// The broker and the launcher both remove the session socket, and the broker
 /// can get there first (CI run 45750031750). A socket already gone is not a
 /// failed session; one that cannot be removed is still an error.

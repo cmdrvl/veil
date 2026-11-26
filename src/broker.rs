@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::audit::{AuditRecord, append_audit_record_with_enforcement};
@@ -484,6 +484,7 @@ pub fn sandbox_write_denials(
 ) -> io::Result<String> {
     let mut files = Vec::new();
     for (name, executable) in resolve_authorized_tools(config, path) {
+        refuse_second_names(&executable)?;
         files.push(executable);
         let found = env::split_paths(path)
             .map(|directory| directory.join(&name))
@@ -496,6 +497,24 @@ pub fn sandbox_write_denials(
     }
 
     seatbelt::write_denials(&files, &[fs::canonicalize(state_dir)?])
+}
+
+/// The write denials name paths, and a hard link made before the session is
+/// one more path to the same file: through it the confined process could
+/// rewrite what the broker runs (bd-wwh). The profile denies new links, so
+/// counting them before confinement covers the whole session.
+fn refuse_second_names(executable: &Path) -> io::Result<()> {
+    let links = fs::metadata(executable)?.nlink();
+    if links > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "authorized tool {} has {links} hard links, so the sandbox cannot stop the confined command from rewriting it through another of its names; replace it with a copy of its own and start the sandbox again",
+                executable.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn tool_command(executable: &Path, enforcement: &str) -> Command {

@@ -128,9 +128,12 @@ The broker:
   launcher does.
 
 The sandbox also stops the confined command from changing the tool executables
-the broker runs and the broker's state under `~/.cmdrvl/state/veil/`. Each
-output returned is recorded by hash in `derived.jsonl` there, and each call is
-in the audit log with `enforcement: sandbox`, `origin: broker`.
+the broker runs and the broker's state under `~/.cmdrvl/state/veil/`. Those
+rules name paths, and a hard link made earlier is another path to the same file,
+so `veil sandbox` does not start when a tool the broker would run has more than
+one; replace the tool with a copy of its own. Each output returned is recorded
+by hash in `derived.jsonl` there, and each call is in the audit log with
+`enforcement: sandbox`, `origin: broker`.
 
 It does not:
 
