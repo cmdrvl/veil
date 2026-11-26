@@ -2,6 +2,7 @@
 
 pub mod allowlist;
 pub mod audit;
+pub mod broker_output;
 pub mod config;
 pub mod evaluator;
 pub mod extract;
