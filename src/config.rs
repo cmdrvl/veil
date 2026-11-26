@@ -46,6 +46,7 @@ const DEFAULT_CMDRVL_CONFIG_PROTECTION_SUBTREES: &[&str] = &[
 /// Key in `[spine.denied_flags]` that sets the list applied to every tool.
 const DENIED_FLAGS_DEFAULT_KEY: &str = "default";
 
+const PROJECT_CONFIG_NAME: &str = ".veil.toml";
 const CMDRVL_ROOT_DIR: &str = ".cmdrvl";
 const VEIL_CONFIG_RELATIVE: &[&str] = &["config", "veil", "config.toml"];
 const VEIL_AUDIT_RELATIVE: &[&str] = &["logs", "veil", "audit.jsonl"];
@@ -272,13 +273,49 @@ pub(crate) fn project_directory(start_dir: &Path) -> io::Result<Option<PathBuf>>
     Ok(find_project_config(start_dir)?.and_then(|config| config.parent().map(Path::to_path_buf)))
 }
 
+/// Where [`load_config`] would look for policy when started in `start_dir`,
+/// whether or not anything is there yet.
+pub(crate) struct PolicySources {
+    /// The user's settings, the older places they are copied from, and each
+    /// place a project config is looked for from `start_dir`.
+    pub files: Vec<PathBuf>,
+    /// The directories that hold the user's settings.
+    pub directories: Vec<PathBuf>,
+}
+
+pub(crate) fn policy_sources(
+    start_dir: &Path,
+    home: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+) -> PolicySources {
+    // a later session may be started without `XDG_CONFIG_HOME`
+    let mut files = vec![
+        user_config_path(home),
+        legacy_user_config_path(home, xdg_config_home),
+        legacy_user_config_path(home, None),
+    ];
+    let directories = files
+        .iter()
+        .filter_map(|file| file.parent().map(Path::to_path_buf))
+        .collect();
+    // a link whose target is missing is passed over now, and would not be once
+    // something were put there
+    files.extend(
+        start_dir
+            .ancestors()
+            .map(|directory| directory.join(PROJECT_CONFIG_NAME)),
+    );
+
+    PolicySources { files, directories }
+}
+
 /// Find the nearest project config above `start_dir`. A nested `.veil.toml`
 /// replaces outer project configs; searching includes the filesystem root.
 fn find_project_config(start_dir: &Path) -> io::Result<Option<PathBuf>> {
     let start_dir = absolute_lexical_path(start_dir)?;
 
     for directory in start_dir.ancestors() {
-        let candidate = directory.join(".veil.toml");
+        let candidate = directory.join(PROJECT_CONFIG_NAME);
         match fs::metadata(&candidate) {
             Ok(_) => return Ok(Some(candidate)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}

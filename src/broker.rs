@@ -560,31 +560,26 @@ fn exit_with_launcher(socket: PathBuf) {
 
 /// What the confined process must not change while the broker is running: this
 /// veil, which is the broker and launches the next session; the executables the
-/// broker will run, as the paths found on `path` and as the files they resolve
-/// to; and the broker's own state. The launcher calls this.
+/// broker will run, as the paths found on `path`, as the files they resolve to
+/// and every link between; and the broker's own state. The launcher calls this.
 pub fn sandbox_write_denials(
     config: &Config,
     path: &std::ffi::OsStr,
     state_dir: &Path,
 ) -> io::Result<String> {
-    let invoked = env::current_exe()?;
+    let invoked = std::path::absolute(env::current_exe()?)?;
     let veil = fs::canonicalize(&invoked)?;
     refuse_second_names("veil itself,", &veil)?;
     let mut files = vec![veil];
-    // the name it was started by, which may be a link
-    if let (Some(parent), Some(name)) = (invoked.parent(), invoked.file_name()) {
-        files.push(fs::canonicalize(parent)?.join(name));
-    }
+    // the names the next session will go by, each of which may lead through
+    // links: the one veil was started by, the ones the tools are found by, and
+    // the one veil's state is reached by
+    let mut named = vec![invoked, std::path::absolute(state_dir)?];
     for (name, executable) in resolve_authorized_tools(config, path) {
         refuse_second_names("authorized tool", &executable)?;
         files.push(executable);
-        let found = env::split_paths(path)
-            .map(|directory| directory.join(&name))
-            .find(|candidate| candidate.is_file());
-        if let Some(found) = found
-            && let (Some(parent), Some(file)) = (found.parent(), found.file_name())
-        {
-            files.push(fs::canonicalize(parent)?.join(file));
+        if let Some(found) = find_on_path(&name, path) {
+            named.push(std::path::absolute(found)?);
         }
     }
     // a hard link made before the session is a second name for the registry or
@@ -598,7 +593,9 @@ pub fn sandbox_write_denials(
             )
         })?;
 
-    seatbelt::write_denials(&files, &[fs::canonicalize(state_dir)?])
+    let mut rules = seatbelt::write_denials(&files, &[fs::canonicalize(state_dir)?])?;
+    rules.push_str(&seatbelt::keep_resolution(&named)?);
+    Ok(rules)
 }
 
 /// The write denials name paths, and a hard link made before the session is
@@ -941,14 +938,18 @@ fn resolve_authorized_tools(config: &Config, path: &std::ffi::OsStr) -> BTreeMap
 }
 
 fn find_executable(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
-    env::split_paths(path).find_map(|directory| {
-        let candidate = directory.join(name);
-        let metadata = fs::metadata(&candidate).ok()?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            return None;
-        }
-        fs::canonicalize(candidate).ok()
-    })
+    fs::canonicalize(find_on_path(name, path)?).ok()
+}
+
+/// The path by which `name` is found on `path`, which may lead through links.
+fn find_on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    env::split_paths(path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
 }
 
 fn valid_tool_name(tool: &str) -> bool {

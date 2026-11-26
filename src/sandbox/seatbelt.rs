@@ -11,10 +11,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::allowlist::SafePathMatcher;
-use crate::config::Config;
+use crate::config::{self, Config};
 
 /// Maximum number of filesystem entries examined while expanding one policy.
 pub const MAX_GLOB_ENTRIES: usize = 100_000;
@@ -68,7 +69,74 @@ pub fn compile(config: &Config, project_root: &Path) -> io::Result<CompiledProfi
         std::env::var_os("TMUX").as_deref(),
         std::env::var_os("TMUX_TMPDIR").as_deref(),
     )?);
+    compiled
+        .profile
+        .push_str(&policy_write_denials(project_root)?);
     Ok(compiled)
+}
+
+/// Rules that keep a confined command from changing what a later session takes
+/// its policy from. A session reads the `.veil.toml` nearest to where it
+/// starts, so no file of that name may be written anywhere, in any case. The
+/// user's settings and the project config in force are refused by path too,
+/// with whatever they link to, and so is putting something else in the place of
+/// a directory or link on the way to them. One of those files with a second
+/// hard link is refused outright: the other name would stay writable.
+fn policy_write_denials(project_root: &Path) -> io::Result<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let sources = config::policy_sources(project_root, home.as_deref(), xdg_config_home.as_deref());
+    let absolute = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| absolute_path(path, project_root))
+            .collect::<io::Result<Vec<_>>>()
+    };
+    let (files, directories) = (absolute(&sources.files)?, absolute(&sources.directories)?);
+
+    let mut kept_files = Vec::new();
+    for file in &files {
+        let target = follow_links(file);
+        if let Ok(metadata) = fs::metadata(&target)
+            && metadata.is_file()
+            && metadata.nlink() > 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "veil settings file {} has {} hard links, so the sandbox cannot stop the confined command from rewriting it through another of its names; replace it with a copy of its own and start the sandbox again",
+                    target.display(),
+                    metadata.nlink()
+                ),
+            ));
+        }
+        kept_files.push(target);
+    }
+    let kept_directories = directories
+        .iter()
+        .map(|directory| follow_links(directory))
+        .collect::<Vec<_>>();
+
+    let mut rules =
+        String::from("(deny file-write* (regex #\"/[.][vV][eE][iI][lL][.][tT][oO][mM][lL]$\"))\n");
+    rules.push_str(&write_denials(&kept_files, &kept_directories)?);
+
+    let mut lines = BTreeSet::new();
+    for path in files.iter().chain(&directories) {
+        keep_links(path, &mut lines)?;
+        // and nothing may be put where there is nothing yet
+        for name in walk_links(path).1 {
+            if fs::symlink_metadata(&name).is_err() {
+                lines.insert(format!(
+                    "(deny file-write-create (literal \"{}\"))\n",
+                    seatbelt_string(&name)?
+                ));
+            }
+        }
+    }
+    rules.extend(lines);
+
+    Ok(rules)
 }
 
 /// The profile allows what it does not name, and some of that acts outside the
@@ -445,6 +513,13 @@ fn add_path(path: &Path, directory_hint: bool, rules: &mut BTreeSet<DenyRule>) -
 /// the parts that do not exist are kept as written. Past 40 links the rest is
 /// kept as written, which is what the kernel refuses to resolve too.
 fn follow_links(path: &Path) -> PathBuf {
+    walk_links(path).0
+}
+
+/// [`follow_links`], and every name passed on the way there, each with the
+/// links before it already followed.
+fn walk_links(path: &Path) -> (PathBuf, Vec<PathBuf>) {
+    let mut passed = Vec::new();
     let mut pending = path
         .components()
         .map(|component| component.as_os_str().to_owned())
@@ -452,12 +527,19 @@ fn follow_links(path: &Path) -> PathBuf {
     let mut resolved = PathBuf::new();
     let mut followed = 0;
     while let Some(part) = pending.pop_front() {
+        // a target written `./name` must not leave the `.` in the names passed
+        if part == "." {
+            continue;
+        }
         if part == ".." {
             resolved.pop();
             continue;
         }
         // joining "/" starts again from the root, as an absolute target does
         let next = resolved.join(&part);
+        if next.parent().is_some() {
+            passed.push(next.clone());
+        }
         match fs::read_link(&next) {
             Ok(target) if followed < 40 => {
                 followed += 1;
@@ -468,7 +550,36 @@ fn follow_links(path: &Path) -> PathBuf {
             _ => resolved = next,
         }
     }
-    resolved
+    (resolved, passed)
+}
+
+/// Adds the rules that keep `path` leading where it leads now: no link it
+/// passes through may be replaced, and no directory it passes through renamed
+/// or removed. A later session follows the same links, so one that is
+/// retargeted would hand it another file.
+fn keep_links(path: &Path, lines: &mut BTreeSet<String>) -> io::Result<()> {
+    for name in walk_links(path).1 {
+        let operation = match fs::symlink_metadata(&name) {
+            Ok(metadata) if metadata.is_symlink() => "file-write*",
+            _ => "file-write-unlink",
+        };
+        lines.insert(format!(
+            "(deny {operation} (literal \"{}\"))\n",
+            seatbelt_string(&name)?
+        ));
+    }
+    Ok(())
+}
+
+/// Rules, to append to a compiled profile, that keep each of `paths` leading
+/// where it leads now. Paths must be absolute. What they lead to is not made
+/// unwritable here; [`write_denials`] does that.
+pub fn keep_resolution(paths: &[PathBuf]) -> io::Result<String> {
+    let mut lines = BTreeSet::new();
+    for path in paths {
+        keep_links(path, &mut lines)?;
+    }
+    Ok(lines.into_iter().collect())
 }
 
 fn add_rule(path: PathBuf, kind: RuleKind, rules: &mut BTreeSet<DenyRule>) -> io::Result<()> {
@@ -521,6 +632,9 @@ pub fn broker_reach(broker_dir: &Path, own: &Path) -> io::Result<String> {
 fn keep_in_place(rules: &BTreeSet<DenyRule>) -> io::Result<String> {
     let mut lines = BTreeSet::new();
     for rule in rules {
+        // the rules hold each protected path as configured and as resolved,
+        // and neither names what lies between the two
+        keep_links(&rule.path, &mut lines)?;
         lines.insert(format!(
             "(deny file-write-unlink ({} \"{}\"))\n",
             rule.kind.filter(),

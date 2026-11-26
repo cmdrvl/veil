@@ -865,6 +865,277 @@ echo ordinary > ordinary.txt && echo ORDINARY_WRITE_ALLOWED
     }
 }
 
+/// A confined command may not change what a later session takes its policy
+/// from: it could drop a protection there and read the file next time.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_confined_command_cannot_change_the_policy_a_later_session_loads() {
+    use std::os::unix::fs::symlink;
+
+    const STRICT: &str = "[sensitivity]\nprotected = [\"protected.txt\"]\n";
+    const USER: &str = "[policy]\naudit_log = false\n";
+    // each line prints its name when what it tries succeeds
+    let script = r#"
+project=$1 user=$2 legacy=$3 target=$4 legacy_parent=$5
+weaken() { /bin/mkdir -p "$(/usr/bin/dirname "$1")"; printf '[sensitivity]\nprotected = []\n' > "$1"; }
+(weaken "$project/sub/.veil.toml") 2>/dev/null && echo NESTED_CREATED
+(weaken "$project/other/.VEIL.TOML") 2>/dev/null && echo OTHER_CASE_CREATED
+/bin/mkdir -p "$project/linked" && /bin/ln -s /dev/null "$project/linked/.veil.toml" 2>/dev/null && echo NESTED_LINKED
+printf 'x = 1\n' > "$project/draft" && /bin/mv "$project/draft" "$project/linked/.Veil.Toml" 2>/dev/null && echo RENAMED_INTO_PLACE
+/bin/ln -s "$project/sub" "$legacy_parent" 2>/dev/null && echo LEGACY_PARENT_LINKED
+(weaken "$legacy") 2>/dev/null && echo LEGACY_WRITTEN
+(weaken "$HOME/.config/veil/config.toml") 2>/dev/null && echo HOME_LEGACY_WRITTEN
+[ -e "$HOME/.cmdrvl/config" ] || { /bin/ln -s "$project/sub" "$HOME/.cmdrvl/config" 2>/dev/null && echo CONFIG_DIRECTORY_LINKED; }
+(weaken "$user") 2>/dev/null && echo USER_WRITTEN
+[ -n "$target" ] && (weaken "$target") 2>/dev/null && echo TARGET_WRITTEN
+(weaken "$project/.veil.toml") 2>/dev/null && echo PROJECT_WRITTEN
+/bin/mv "$project/.veil.toml" "$project/old.toml" 2>/dev/null && echo PROJECT_CONFIG_MOVED
+/bin/rm "$project/.veil.toml" 2>/dev/null && echo PROJECT_CONFIG_REMOVED
+/bin/mv "$project" "$project.moved" 2>/dev/null && echo PROJECT_MOVED
+echo ordinary > ordinary.txt && echo ORDINARY_WRITE_ALLOWED
+"#;
+
+    let mut failures = Vec::new();
+    for case in ["plain files", "linked files", "a second name"] {
+        let root = fixture();
+        let home = short_home();
+        let project = root.join("project");
+        fs::create_dir_all(&project).expect("project");
+        fs::write(project.join("protected.txt"), format!("{MOVED_CANARY}\n")).expect("protected");
+        let config = project.join(".veil.toml");
+        let user = home.join(".cmdrvl/config/veil/config.toml");
+        let legacy_parent = root.join("xdg");
+        let legacy = legacy_parent.join("veil/config.toml");
+        // the file a link leads to, which has another name altogether
+        let mut target = PathBuf::new();
+        match case {
+            "plain files" => fs::write(&config, STRICT).expect("config"),
+            "linked files" => {
+                target = project.join("policy/strict.toml");
+                fs::create_dir_all(target.parent().expect("parent")).expect("policy directory");
+                fs::write(&target, STRICT).expect("config target");
+                // where the volume ignores case, the link may spell its target
+                // in another one than the names on disk
+                let spelled = if root.join("PROJECT").is_dir() {
+                    project.join("Policy/Strict.toml")
+                } else {
+                    target.clone()
+                };
+                symlink(&spelled, &config).expect("linked config");
+                // the user's own settings, which already exist here
+                fs::create_dir_all(user.parent().expect("parent")).expect("user directory");
+                fs::write(&user, USER).expect("user config");
+            }
+            _ => {
+                fs::write(&config, STRICT).expect("config");
+                fs::hard_link(&config, root.join("second-name.toml")).expect("second name");
+            }
+        }
+        let session = |program: &[&str]| {
+            veil(&project)
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &legacy_parent)
+                .env_remove("VEIL_PROTECTED")
+                .args(["sandbox", "--"])
+                .args(program)
+                .output()
+                .expect("veil should run")
+        };
+
+        let mut command = vec!["/bin/sh", "-c", script, "policy"];
+        let words = [&project, &user, &legacy, &target, &legacy_parent]
+            .map(|path| path.to_str().expect("UTF-8 path"));
+        command.extend(words);
+        let output = session(&command);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let context = format!(
+            "{case}\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if case == "a second name" {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.success() || !stderr.contains("hard link") {
+                failures.push(context);
+            }
+            continue;
+        }
+        let user_kept =
+            case != "linked files" || fs::read_to_string(&user).is_ok_and(|kept| kept == USER);
+        if !output.status.success() || stdout != "ORDINARY_WRITE_ALLOWED\n" || !user_kept {
+            failures.push(format!("{context}\nuser config kept: {user_kept}"));
+        }
+
+        let next = session(&["/bin/cat", "protected.txt"]);
+        let printed = String::from_utf8_lossy(&next.stdout);
+        if printed.contains(MOVED_CANARY) || next.status.success() {
+            failures.push(format!(
+                "{case}: the next session read the file: {printed}\n{}",
+                String::from_utf8_lossy(&next.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// A later session follows links to find its policy, what to protect, its
+/// state, the tools its broker runs and veil itself. A path may pass through
+/// several links, and retargeting any one of them redirects the session.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_confined_command_cannot_redirect_a_link_a_later_session_follows() {
+    use std::os::unix::fs::symlink;
+
+    // arguments: every link to attack, then `--`, then directories to move
+    let script = r#"
+while [ "$1" != -- ]; do
+  /bin/ln -sfh /dev/null "$1" 2>/dev/null && echo "REPLACED $1"
+  /bin/ln -sfh /dev/null next 2>/dev/null
+  /bin/mv -fh next "$1" 2>/dev/null && echo "RENAMED_OVER $1"
+  /bin/rm "$1" 2>/dev/null && echo "REMOVED $1"
+  shift
+done
+shift
+for directory in "$@"; do
+  /bin/mv "$directory" "$directory.moved" 2>/dev/null && echo "MOVED $directory"
+done
+echo ordinary > ordinary.txt && echo ORDINARY_WRITE_ALLOWED
+"#;
+
+    let root = fixture();
+    let home = short_home();
+    let project = root.join("project");
+    let write = |path: &Path, text: &str| {
+        fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        fs::write(path, text).expect("file");
+    };
+    let mut links = Vec::new();
+    let mut link = |path: PathBuf, target: &str| {
+        fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+        symlink(target, &path).expect("link");
+        links.push((path, PathBuf::from(target)));
+    };
+
+    // something to protect
+    write(&project.join("store/x.csv"), &format!("{MOVED_CANARY}\n"));
+    link(project.join("vault"), "links/vault-current");
+    // written with `./`, as links often are
+    link(project.join("links/vault-current"), "./../store");
+    // the project's policy
+    write(
+        &project.join("config-store/strict.toml"),
+        "[sensitivity]\nprotected = [\"vault/x.csv\"]\n[spine]\nauthorized_tools = [\"shape\"]\n",
+    );
+    link(project.join(".veil.toml"), "policy/current");
+    link(project.join("policy/current"), "../via/strict.toml");
+    link(project.join("via"), "config-store");
+    // the user's settings
+    write(
+        &home.join("dotfiles/user.toml"),
+        "[policy]\naudit_log = false\n",
+    );
+    link(
+        home.join(".cmdrvl/config/veil/config.toml"),
+        "../../../dotfiles/user-current",
+    );
+    link(home.join("dotfiles/user-current"), "user.toml");
+    // veil's state, which holds what it has learned to protect
+    fs::create_dir_all(home.join("dotfiles/state")).expect("state directory");
+    link(home.join(".cmdrvl/state"), "../links/state-current");
+    link(home.join("links/state-current"), "../dotfiles/state");
+    // a tool the broker runs
+    create_executable(&root.join("tools/shape-1"), "#!/bin/sh\necho SHAPE\n");
+    link(root.join("bin/shape"), "current");
+    link(root.join("bin/current"), "../tools/shape-1");
+    // veil, copied so that a failing run cannot damage the build under test
+    fs::create_dir_all(root.join("install")).expect("install directory");
+    fs::copy(env!("CARGO_BIN_EXE_veil"), root.join("install/veil")).expect("copy of veil");
+    link(root.join("path/veil"), "./current");
+    link(root.join("path/current"), "../opt/current/veil");
+    link(root.join("opt/current"), "../install");
+
+    let directories = [
+        project.join("links"),
+        project.join("policy"),
+        project.join("config-store"),
+        home.join("dotfiles"),
+        home.join("links"),
+        root.join("tools"),
+        root.join("opt"),
+    ];
+    // an earlier file of the tool's name that cannot be run is passed over
+    write(&root.join("shadow/shape"), "not a program\n");
+    let search = format!(
+        "{}:{}:/usr/bin:/bin",
+        root.join("shadow").display(),
+        root.join("bin").display()
+    );
+    let output = Command::new(root.join("path/veil"))
+        .current_dir(&project)
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", search)
+        .args(["sandbox", "--", "/bin/sh", "-c", script, "redirect"])
+        .args(links.iter().map(|(path, _)| path))
+        .arg("--")
+        .args(&directories)
+        .output()
+        .expect("veil should run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let context = format!(
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(output.status.success(), "{context}");
+    assert_eq!(stdout, "ORDINARY_WRITE_ALLOWED\n", "{context}");
+    for (path, target) in &links {
+        assert_eq!(
+            fs::read_link(path).ok().as_ref(),
+            Some(target),
+            "{}\n{context}",
+            path.display()
+        );
+    }
+}
+
+/// The profile names a protected path as configured and as resolved. If a link
+/// between the two could be retargeted, the next session would protect where it
+/// led then, and the real file would be readable under its own name.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_protected_file_behind_two_links_stays_protected_in_the_next_session() {
+    use std::os::unix::fs::symlink;
+
+    let root = fixture();
+    let home = short_home();
+    for directory in ["store", "decoy", "links"] {
+        fs::create_dir(root.join(directory)).expect("directory");
+    }
+    fs::write(root.join("store/x.csv"), format!("{MOVED_CANARY}\n")).expect("protected");
+    fs::write(root.join("decoy/x.csv"), "decoy\n").expect("decoy");
+    symlink("links/current", root.join("vault")).expect("first link");
+    symlink("../store", root.join("links/current")).expect("second link");
+    let session = |program: &[&str]| {
+        veil(&root)
+            .env("HOME", &home)
+            .env("VEIL_PROTECTED", "vault/x.csv")
+            .args(["sandbox", "--"])
+            .args(program)
+            .output()
+            .expect("veil should run")
+    };
+    let read = ["/bin/cat", "store/x.csv"];
+
+    let first = session(&read);
+    assert!(!String::from_utf8_lossy(&first.stdout).contains(MOVED_CANARY));
+    session(&["/bin/ln", "-sfh", "../decoy", "links/current"]);
+
+    let next = session(&read);
+    let printed = String::from_utf8_lossy(&next.stdout);
+    assert!(!printed.contains(MOVED_CANARY), "{printed}");
+    assert!(!next.status.success(), "{printed}");
+}
+
 /// A client that speaks the broker protocol itself, so that only reaching the
 /// broker is in question. It tries one broker's socket under several names and
 /// prints what each connection got back.
