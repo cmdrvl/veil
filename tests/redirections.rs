@@ -12,7 +12,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use serde_json::json;
+
+mod common;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -84,15 +86,7 @@ fn denied(root: &PathBuf, command: &str) -> bool {
         .expect("payload should be written");
     let output = child.wait_with_output().expect("veil should exit");
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "veil should exit 0 for {command}, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let decision: Value =
-        serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
-    decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    common::claude_denial(&output).is_some()
 }
 
 fn assert_all_denied(root: &PathBuf, commands: &[&str]) {

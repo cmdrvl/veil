@@ -18,6 +18,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+mod common;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const HOLDINGS: &str = "data/clients/holdings.csv";
@@ -143,25 +145,11 @@ fn run(repo: &Repo, command: &str) -> Output {
 /// should run elsewhere says so: `cd clean && python3 big.py`.)
 fn call(repo: &Repo, command: &str) -> Verdict {
     let output = run(repo, command);
-
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "veil should exit 0 for {command}, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let decision: Value =
-        serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
-    let specific = &decision["hookSpecificOutput"];
+    let denial = common::claude_denial(&output);
 
     Verdict {
-        action: specific["permissionDecision"]
-            .as_str()
-            .expect("decision should carry permissionDecision")
-            .to_owned(),
-        reason: specific["permissionDecisionReason"]
-            .as_str()
-            .map(str::to_owned),
+        action: if denial.is_some() { "deny" } else { "allow" }.to_owned(),
+        reason: denial,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
 }

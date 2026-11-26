@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/cmdrvl/veil/hook-decision.schema.json",
   "title": "veil hook-mode stdout",
-  "description": "The permission decision veil prints in hook mode (`veil < hook-payload.json`). The shape depends on the hook protocol detected from the payload: Claude Code, GitHub Copilot / unknown, or Gemini CLI / Grok. Exactly one object is printed, followed by a newline. A deny reason is present only on deny. The exception: for a Claude Code tool that writes files (Write, Edit, MultiEdit, NotebookEdit), veil only refuses writes to its own derived registry and key. For any other file it prints nothing, which leaves the call to the harness's own permissions.",
+  "description": "What veil prints in hook mode (`veil < hook-payload.json`). The shape depends on the hook protocol detected from the payload. When veil has no reason to block a call, then for Claude Code, GitHub Copilot and unknown protocols it prints nothing and exits 0: no decision, so the harness's own permission rules apply. This schema describes output that is printed, so for those protocols it is only ever a deny. Gemini CLI and Grok always get a reply, `allow` or `deny`, because neither reads `allow` as approval. When something is printed, it is exactly one object followed by a newline. A deny reason is present only on deny. Warnings go to stderr. A non-zero exit status is an error, not a decision.",
   "oneOf": [
     { "$ref": "#/definitions/claude_code" },
     { "$ref": "#/definitions/copilot" },
@@ -20,7 +20,7 @@
           "additionalProperties": false,
           "properties": {
             "hookEventName": { "const": "PreToolUse" },
-            "permissionDecision": { "enum": ["allow", "deny"] },
+            "permissionDecision": { "const": "deny" },
             "permissionDecisionReason": { "type": "string" }
           }
         }
@@ -31,7 +31,7 @@
       "required": ["permissionDecision"],
       "additionalProperties": false,
       "properties": {
-        "permissionDecision": { "enum": ["allow", "deny"] },
+        "permissionDecision": { "const": "deny" },
         "permissionDecisionReason": { "type": "string" }
       }
     },

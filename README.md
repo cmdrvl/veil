@@ -298,6 +298,30 @@ Treat `veil` as an operator-first guardrail: it blocks direct reads, then points
 you to the configured authorized path for sensitive-file work instead of
 encouraging ad hoc shell commands.
 
+### What the Hook Replies
+
+veil only ever blocks. When it has no reason to block a call, it gives **no
+decision**, so installing it does not approve anything on the harness's behalf:
+the harness's own permission rules and prompts apply as they did before.
+
+| Harness | A call veil does not block | A call veil blocks |
+|---|---|---|
+| Claude Code | exit 0, no output | `hookSpecificOutput` with `permissionDecision: "deny"` and a reason |
+| GitHub Copilot, and unknown protocols | exit 0, no output | `permissionDecision: "deny"` and a reason |
+| Gemini CLI, Grok | `{"decision":"allow"}` | `{"decision":"deny","reason":"..."}` |
+
+Claude Code reads `allow` as approval that skips its permission prompt, which is
+why veil does not print it. Gemini CLI and Grok keep the `allow` reply because
+neither reads it as approval: Gemini CLI 0.65.0 treats only `ask` specially
+before a tool and sends `allow` on to its normal confirmation (read from its
+installed source), and Grok's hook guide says `allow` means only "not blocked"
+and does not auto-approve. A newer version of either could change that.
+
+Warnings still go to stderr, and the audit log still records `decision: "allow"`
+for a call veil let through. If you saw fewer permission prompts with an earlier
+veil, you may see more of them now. A hook that exits with a status other than 0
+is an error, not a decision. `veil --schema` describes what is printed.
+
 A content search of a directory reads every file beneath it, so veil walks the
 directory before allowing it and denies the search when any path under it is
 protected by `[sensitivity] protected` or a built-in sensitivity pack. Searches

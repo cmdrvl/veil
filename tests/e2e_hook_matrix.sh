@@ -265,12 +265,26 @@ for index, vector in enumerate(matrix["vectors"], start=1):
         if result.returncode != 0:
             got = f"exit {result.returncode}"
             problems.append(f"hook exited {result.returncode}: {result.stderr.strip()[:160]}")
+        elif result.stdout == "":
+            # exit 0 and not one byte: no decision, which is how veil allows
+            got = "allow"
         else:
+            # anything veil prints has to be exactly one deny
             try:
-                decision = json.loads(result.stdout)["hookSpecificOutput"]
-                got = decision["permissionDecision"]
-                reason = decision.get("permissionDecisionReason", "")
-            except (ValueError, KeyError) as error:
+                reply = json.loads(result.stdout)
+                reason = reply["hookSpecificOutput"]["permissionDecisionReason"]
+                deny = {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": reason,
+                    }
+                }
+                if reply == deny and isinstance(reason, str) and reason:
+                    got = "deny"
+                else:
+                    problems.append(f"hook output is not exactly one deny: {result.stdout[:160]}")
+            except (ValueError, KeyError, TypeError) as error:
                 problems.append(f"hook output is not a decision ({error}): {result.stdout[:160]}")
         if got != expected["decision"] and not problems:
             problems.append(f"expected {expected['decision']}, got {got}")

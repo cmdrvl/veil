@@ -22,6 +22,8 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
+mod common;
+
 const H: &str = "data/clients/holdings.csv";
 
 // ---------------------------------------------------------------- the table
@@ -2602,20 +2604,10 @@ fn run_hook(root: &Path, payload: &Value) -> Result<Outcome, String> {
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    let decision: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("veil should print JSON: {error}"))?;
-    match decision["hookSpecificOutput"]["permissionDecision"].as_str() {
-        Some("deny") => Ok(Outcome::Denied(
-            decision["hookSpecificOutput"]["permissionDecisionReason"]
-                .as_str()
-                .unwrap_or_default()
-                .chars()
-                .take(240)
-                .collect(),
-        )),
-        Some("allow") => Ok(Outcome::Allowed),
-        other => Err(format!("unexpected decision {other:?}")),
-    }
+    Ok(match common::claude_denial(&output) {
+        Some(reason) => Outcome::Denied(reason.chars().take(240).collect()),
+        None => Outcome::Allowed,
+    })
 }
 
 // ------------------------------------------------------------ the checks

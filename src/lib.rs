@@ -220,8 +220,7 @@ fn run_with_io<R: Read, W: Write, E: Write>(
 /// veil's derived registry or its key (bd-3qw). The check reads no
 /// configuration, so a broken `.veil.toml` does not turn every write into an
 /// error, the one that would repair it included. Any other file gets no output,
-/// which is no decision: `allow` would tell the harness to skip its own
-/// permission prompt.
+/// which is no decision: the harness's own permission rules apply.
 fn guard_write(hook_input: &HookInput) -> RenderedDecision {
     let refused = written_path(hook_input)
         .filter(|path| derived::VeilState::from_env().is_some_and(|state| state.holds(path)));

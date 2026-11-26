@@ -10,9 +10,12 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod common;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct Hook {
+    denial: Option<String>,
     stdout: String,
     stderr: String,
     code: Option<i32>,
@@ -20,11 +23,11 @@ struct Hook {
 
 impl Hook {
     fn denied(&self) -> bool {
-        self.stdout.contains("\"permissionDecision\":\"deny\"")
+        self.denial.is_some()
     }
 
     fn allowed(&self) -> bool {
-        self.stdout.contains("\"permissionDecision\":\"allow\"")
+        self.denial.is_none()
     }
 }
 
@@ -97,6 +100,8 @@ fn run_hook_on(repo_root: &Path, home: &Path, command: &str, search_path: Option
     let output = child.wait_with_output().expect("veil should exit");
 
     Hook {
+        // fails the test unless veil exited 0 and printed nothing or one deny
+        denial: common::claude_denial(&output),
         stdout: String::from_utf8(output.stdout).expect("stdout should be UTF-8"),
         stderr: String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
         code: output.status.code(),

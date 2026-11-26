@@ -18,6 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+mod common;
+
 const REPORT: &str = "{\"tool\":\"shape\",\"outcome\":\"COMPATIBLE\",\"rows\":3}\n";
 const LEDGER: &str = "loan_id,balance\n1,100\n2,200\n";
 
@@ -167,22 +169,10 @@ impl Fixture {
             .write_all(payload.to_string().as_bytes())
             .expect("payload");
         let output = child.wait_with_output().expect("hook exit");
-        assert!(
-            output.status.success(),
-            "hook failed on {payload}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let document: Value = serde_json::from_slice(&output.stdout).expect("hook JSON");
-        let nested = &document["hookSpecificOutput"];
+        let denial = common::claude_denial(&output);
         Verdict {
-            action: nested["permissionDecision"]
-                .as_str()
-                .expect("a decision")
-                .to_owned(),
-            reason: nested["permissionDecisionReason"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
+            action: if denial.is_some() { "deny" } else { "allow" }.to_owned(),
+            reason: denial.unwrap_or_default(),
         }
     }
 

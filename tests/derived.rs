@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+mod common;
+
 /// Prose with nothing the output detectors flag: only the copy check can tell
 /// that a copy of it is not a derived artifact.
 const MEMO: &str = "Confidential memorandum. The Meridian vault holds the restructuring terms \
@@ -80,9 +82,9 @@ case $mode in
 esac
 "#;
 
-/// A hook answer that leaves the call to the harness's own permissions: no
-/// output at all.
-const NO_DECISION: &str = "no decision";
+/// The hook allowed the call: exit 0 and no output at all, which leaves the
+/// call to the harness's own permissions.
+const ALLOWED: &str = "allow";
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -235,28 +237,10 @@ impl Fixture {
             .write_all(payload.to_string().as_bytes())
             .expect("payload");
         let output = child.wait_with_output().expect("hook exit");
-        assert!(
-            output.status.success(),
-            "hook failed on {payload}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if output.stdout.is_empty() {
-            return Verdict {
-                action: NO_DECISION.to_owned(),
-                reason: String::new(),
-            };
-        }
-        let document: Value = serde_json::from_slice(&output.stdout).expect("hook JSON");
-        let nested = &document["hookSpecificOutput"];
+        let denial = common::claude_denial(&output);
         Verdict {
-            action: nested["permissionDecision"]
-                .as_str()
-                .expect("an answer veil prints carries a decision")
-                .to_owned(),
-            reason: nested["permissionDecisionReason"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
+            action: if denial.is_some() { "deny" } else { ALLOWED }.to_owned(),
+            reason: denial.unwrap_or_default(),
         }
     }
 
@@ -1075,10 +1059,7 @@ fn write_tools_cannot_touch_the_key_or_registry() {
             for tool in ["Write", "Edit", "MultiEdit"] {
                 let verdict =
                     fixture.hook("s1", tool, json!({"file_path": target, "content": "x"}));
-                assert_eq!(
-                    verdict.action, NO_DECISION,
-                    "{tool} {target:?}: {verdict:?}"
-                );
+                assert_eq!(verdict.action, ALLOWED, "{tool} {target:?}: {verdict:?}");
             }
         }
     }

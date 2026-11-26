@@ -302,8 +302,12 @@ fn real_hook_decisions_match_the_schema_and_a_bad_one_does_not() {
         json!({"session_id":"s","cwd":cwd,"hook_event_name":"PreToolUse","tool_name":"Read",
                "tool_input":{"file_path": format!("{cwd}/protected/secret.txt")}}),
     ];
+    // the Claude Code allow is the one call here that gets no output
+    let silent = hook_stdout(&home, &payloads[2]);
+    assert_eq!(String::from_utf8_lossy(&silent), "");
+
     let mut saw_deny = 0;
-    for payload in &payloads {
+    for payload in [&payloads[0], &payloads[1], &payloads[3]] {
         let decision = run_hook(&home, payload);
         assert!(
             decision_matches_schema(&decision, &schema),
@@ -329,6 +333,9 @@ fn real_hook_decisions_match_the_schema_and_a_bad_one_does_not() {
         json!({"decision": "maybe"}),
         json!({"decision": "allow", "extra": true}),
         json!({"hookSpecificOutput": {"permissionDecision": "allow"}}),
+        // the allow replies veil no longer prints
+        json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}),
+        json!({"permissionDecision": "allow"}),
         json!({}),
     ] {
         assert!(

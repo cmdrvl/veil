@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+mod common;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct Repo {
@@ -102,25 +104,11 @@ fn run_hook(repo: &Repo, tool_name: &str, tool_input: Value) -> Verdict {
         .write_all(payload.to_string().as_bytes())
         .expect("payload should be written");
     let output = child.wait_with_output().expect("veil should exit");
-
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "veil should exit 0, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let decision: Value =
-        serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
-    let specific = &decision["hookSpecificOutput"];
+    let denial = common::claude_denial(&output);
 
     Verdict {
-        action: specific["permissionDecision"]
-            .as_str()
-            .expect("decision should carry permissionDecision")
-            .to_owned(),
-        reason: specific["permissionDecisionReason"]
-            .as_str()
-            .map(str::to_owned),
+        action: if denial.is_some() { "deny" } else { "allow" }.to_owned(),
+        reason: denial,
     }
 }
 

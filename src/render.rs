@@ -14,11 +14,26 @@ pub struct RenderedDecision {
 
 pub fn render_decision(protocol: HookProtocol, decision: &Decision) -> RenderedDecision {
     let stdout = match protocol {
+        // veil has nothing to say about a call it does not deny (bd-tmn).
+        // Claude Code reads `allow` as approval that skips the user's
+        // permission prompt, so these get no output: Claude Code documents
+        // that as no decision, and Copilot documents empty output as its
+        // default behaviour.
+        HookProtocol::ClaudeCode | HookProtocol::GitHubCopilot | HookProtocol::Unknown
+            if decision.action == DecisionAction::Allow =>
+        {
+            return render_no_decision();
+        }
         HookProtocol::ClaudeCode => render_claude_stdout(decision),
         HookProtocol::GitHubCopilot | HookProtocol::Unknown => render_permission_stdout(decision),
-        // Grok's documented PreToolUse output is `{"decision":"allow"}` /
-        // `{"decision":"deny","reason":"..."}` -- byte-identical to Gemini's
-        // shape (see `~/.grok/docs/user-guide/10-hooks.md`).
+        // These two keep their `allow` reply, because neither reads it as
+        // approval. Gemini CLI (0.65.0) treats only `ask` specially before a
+        // tool; `allow` falls through to its normal confirmation. Grok's hook
+        // guide says `allow` means only "not blocked" and does not
+        // auto-approve. Grok's documented PreToolUse output is
+        // `{"decision":"allow"}` / `{"decision":"deny","reason":"..."}` --
+        // byte-identical to Gemini's shape (see
+        // `~/.grok/docs/user-guide/10-hooks.md`).
         HookProtocol::GeminiCli | HookProtocol::Grok => render_gemini_stdout(decision),
     };
 
@@ -30,8 +45,8 @@ pub fn render_decision(protocol: HookProtocol, decision: &Decision) -> RenderedD
     RenderedDecision { stdout, stderr }
 }
 
-/// No output at all, which Claude Code documents as no decision: its own
-/// permission rules decide the call. Only a Claude Code write tool gets this.
+/// No output at all: no decision, so the harness's own permission rules decide
+/// the call.
 pub fn render_no_decision() -> RenderedDecision {
     RenderedDecision {
         stdout: String::new(),
@@ -158,14 +173,27 @@ mod tests {
     }
 
     #[test]
-    fn claude_allow_output_is_silent_on_stderr() {
+    fn claude_allow_is_no_output_at_all() {
         let rendered = render_decision(HookProtocol::ClaudeCode, &allow_decision());
 
-        assert_eq!(
-            rendered.stdout,
-            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#
-        );
+        assert_eq!(rendered.stdout, "");
         assert_eq!(rendered.stderr, None);
+    }
+
+    /// An allow that carries a reason (a warn-mode finding, a derived output)
+    /// is still no decision.
+    #[test]
+    fn an_allow_with_a_reason_is_still_no_output() {
+        let mut decision = allow_decision();
+        decision.reason = Some("policy default warn: protected".to_owned());
+
+        for protocol in [
+            HookProtocol::ClaudeCode,
+            HookProtocol::GitHubCopilot,
+            HookProtocol::Unknown,
+        ] {
+            assert_eq!(render_decision(protocol, &decision).stdout, "");
+        }
     }
 
     #[test]
@@ -245,10 +273,10 @@ mod tests {
     }
 
     #[test]
-    fn copilot_allow_output_is_silent_on_stderr() {
+    fn copilot_allow_is_no_output_at_all() {
         let rendered = render_decision(HookProtocol::GitHubCopilot, &allow_decision());
 
-        assert_eq!(rendered.stdout, r#"{"permissionDecision":"allow"}"#);
+        assert_eq!(rendered.stdout, "");
         assert_eq!(rendered.stderr, None);
     }
 

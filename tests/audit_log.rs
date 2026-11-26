@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+mod common;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const HOLDINGS: &str = "data/clients/holdings.csv";
@@ -115,15 +117,7 @@ fn hook(repo: &Repo, command: &str) -> bool {
     let output = spawn_hook(repo, command)
         .wait_with_output()
         .expect("veil should exit");
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "veil should exit 0 for {command}, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let decision: Value =
-        serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
-    decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    common::claude_denial(&output).is_some()
 }
 
 fn audit(repo: &Repo, args: &[&str]) -> std::process::Output {
@@ -269,12 +263,7 @@ fn dynamic_warn_allows_with_warning_and_records_the_counterfactual_denial() {
     let output = spawn_hook(&repo, "cat $UNSET")
         .wait_with_output()
         .expect("hook should exit");
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    let decision: Value = serde_json::from_slice(&output.stdout).expect("hook JSON");
-    assert_eq!(
-        decision["hookSpecificOutput"]["permissionDecision"],
-        "allow"
-    );
+    assert_eq!(common::claude_denial(&output), None, "{output:?}");
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("Warning: deny policy would refuse"),
         "{}",

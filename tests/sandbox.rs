@@ -1094,11 +1094,9 @@ exit 0
         assert!(output.status.success(), "{context}");
         assert!(!stdout.contains(SECRET), "{context}");
         if readable {
-            assert!(stdout.contains("HOOK_EXIT=0"), "{context}");
-            assert!(
-                stdout.contains("\"permissionDecision\":\"allow\""),
-                "{context}"
-            );
+            // allowed: the hook printed nothing before the script's next line,
+            // and exited 0
+            assert!(stdout.starts_with("HOOK_EXIT=0\n"), "{context}");
         } else {
             // the hook fails closed rather than the file becoming readable
             assert!(stdout.contains("HOOK_EXIT=2"), "{context}");

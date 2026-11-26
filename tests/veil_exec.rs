@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod common;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const VEIL: &str = env!("CARGO_BIN_EXE_veil");
@@ -84,20 +86,11 @@ fn run_hook(repo_root: &Path, home: &Path, command: &str, broker: bool) -> Hook 
         .write_all(payload.to_string().as_bytes())
         .expect("payload should be written");
     let output = child.wait_with_output().expect("veil should exit");
-    assert_eq!(output.status.code(), Some(0), "`{command}`");
-    let decision: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("a JSON decision");
-    let decision = &decision["hookSpecificOutput"];
+    let denial = common::claude_denial(&output);
 
     Hook {
-        decision: decision["permissionDecision"]
-            .as_str()
-            .expect("a decision")
-            .to_owned(),
-        reason: decision["permissionDecisionReason"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
+        decision: if denial.is_some() { "deny" } else { "allow" }.to_owned(),
+        reason: denial.unwrap_or_default(),
         stderr: String::from_utf8(output.stderr).expect("stderr should be UTF-8"),
     }
 }

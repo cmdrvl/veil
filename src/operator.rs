@@ -1589,6 +1589,7 @@ fn render_robot_docs_guide() -> String {
         "",
         "Hook mode:",
         "- Bare `veil` expects a Claude/Gemini/Copilot hook payload on stdin.",
+        "- A call veil does not block gets no decision: for Claude Code and Copilot it prints nothing and exits 0, so the harness's own permissions apply; Gemini CLI and Grok get their `allow` reply, which neither reads as approval.",
         "- Do not run bare `veil` as a discovery command; use `veil --help` or the robot surfaces above.",
         "",
         "Guard preflight:",

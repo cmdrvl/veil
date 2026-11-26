@@ -3,7 +3,7 @@
   "name": "veil",
   "tool_version": "0.4.2",
   "contract_version": "1.0.0",
-  "description": "Data exfiltration guard for AI coding agents. Bare `veil` is hook mode: it reads one Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload on stdin and prints that protocol's allow/deny decision. Subcommands include read-only discovery, diagnostics, Seatbelt sandbox launch, and brokered metadata processing, plus `install`/`uninstall` for the managed Claude hook entries.",
+  "description": "Data exfiltration guard for AI coding agents. Bare `veil` is hook mode: it reads one Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload on stdin and prints that protocol's deny decision, or nothing when it does not block a Claude Code or Copilot call (see `hook_mode.stdout`). Subcommands include read-only discovery, diagnostics, Seatbelt sandbox launch, and brokered metadata processing, plus `install`/`uninstall` for the managed Claude hook entries.",
   "repository": "https://github.com/cmdrvl/veil",
   "license": "MIT",
   "agent_guide": "veil robot-docs guide",
@@ -192,7 +192,7 @@
     }
   ],
   "exit_codes": {
-    "0": { "meaning": "success, or a hook allow/deny decision was rendered", "domain": "positive" },
+    "0": { "meaning": "success, or a hook call was judged: denied (printed) or not blocked (see hook_mode.stdout)", "domain": "positive" },
     "1": { "meaning": "doctor reported an unhealthy state (an error finding), including `doctor --json`, `doctor triage --json` and the `--robot-triage` alias; or `derived verify` found the file not registered; veil has no other verdict", "domain": "unhealthy" },
     "2": { "meaning": "usage error, malformed or empty hook payload, configuration error, guard preflight refusal, or a path command (test, explain, scan) that could not produce a decision; under --json the path commands print a veil.path-decision.v1 error document on stdout", "domain": "error" }
   },
@@ -226,7 +226,7 @@
   "hook_mode": {
     "usage": "veil < hook-payload.json",
     "stdin": "Claude Code, Gemini CLI, Grok or GitHub Copilot pre-tool hook payload JSON",
-    "stdout": "protocol-specific permission decision JSON (see `veil --schema`). For a Claude Code Write, Edit, MultiEdit or NotebookEdit call veil only refuses writes to its derived registry and key; for any other file it prints nothing (no decision)",
+    "stdout": "protocol-specific JSON (see `veil --schema`). For a call veil does not block, Claude Code, GitHub Copilot and unknown protocols get nothing at all and exit 0 (no decision, so the harness's own permissions apply); Gemini CLI and Grok get their `allow` reply, which neither reads as approval. A deny is always printed. For a Claude Code Write, Edit, MultiEdit or NotebookEdit call veil only refuses writes to its derived registry and key",
     "stderr": "diagnostics only",
     "bare_invocation": "stdin that is a terminal or empty exits 2 immediately with discovery guidance"
   },

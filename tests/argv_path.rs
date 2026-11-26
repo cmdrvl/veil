@@ -13,11 +13,13 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+
+mod common;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -31,7 +33,6 @@ struct Repo {
 struct Verdict {
     action: String,
     reason: Option<String>,
-    output: Value,
 }
 
 impl Verdict {
@@ -90,6 +91,38 @@ fn bash(repo: &Repo, command: &str) -> Verdict {
 }
 
 fn hook(repo: &Repo, payload: Value) -> Verdict {
+    let output = run_veil(repo, &payload);
+    let denial = common::claude_denial(&output);
+
+    Verdict {
+        action: if denial.is_some() { "deny" } else { "allow" }.to_owned(),
+        reason: denial,
+    }
+}
+
+/// Grok is always answered, so its reply is always there to parse.
+fn grok_hook(repo: &Repo, payload: Value) -> (Verdict, Value) {
+    let output = run_veil(repo, &payload);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "veil should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decision: Value =
+        serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
+
+    let verdict = Verdict {
+        action: decision["decision"]
+            .as_str()
+            .expect("decision should carry a permission decision")
+            .to_owned(),
+        reason: decision["reason"].as_str().map(str::to_owned),
+    };
+    (verdict, decision)
+}
+
+fn run_veil(repo: &Repo, payload: &Value) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_veil"))
         .env("HOME", &repo.root)
         .env_remove("XDG_CONFIG_HOME")
@@ -112,36 +145,11 @@ fn hook(repo: &Repo, payload: Value) -> Verdict {
         .expect("stdin should be piped")
         .write_all(payload.to_string().as_bytes())
         .expect("payload should be written");
-    let output = child.wait_with_output().expect("veil should exit");
-
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "veil should exit 0, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let decision: Value =
-        serde_json::from_slice(&output.stdout).expect("veil should print a JSON decision");
-    let specific = decision.get("hookSpecificOutput").unwrap_or(&decision);
-
-    Verdict {
-        action: specific
-            .get("permissionDecision")
-            .or_else(|| specific.get("decision"))
-            .and_then(Value::as_str)
-            .expect("decision should carry a permission decision")
-            .to_owned(),
-        reason: specific
-            .get("permissionDecisionReason")
-            .or_else(|| specific.get("reason"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        output: decision,
-    }
+    child.wait_with_output().expect("veil should exit")
 }
 
-fn assert_grok_denied(verdict: &Verdict) {
-    assert_eq!(verdict.output["decision"], "deny", "{:#}", verdict.output);
+fn assert_grok_denied((verdict, output): &(Verdict, Value)) {
+    assert_eq!(output["decision"], "deny", "{output:#}");
     assert!(verdict.denied());
     assert!(
         verdict
@@ -156,7 +164,7 @@ fn assert_grok_denied(verdict: &Verdict) {
 #[test]
 fn dual_key_grok_read_file_denies_target_file_on_real_binary() {
     let repo = repo("grok-dual-read");
-    let verdict = hook(
+    let verdict = grok_hook(
         &repo,
         json!({
             "hookEventName": "pre_tool_use",
@@ -177,7 +185,7 @@ fn dual_key_grok_read_file_denies_target_file_on_real_binary() {
 #[test]
 fn snake_case_grok_terminal_command_denies_protected_read_on_real_binary() {
     let repo = repo("grok-snake-bash");
-    let verdict = hook(
+    let verdict = grok_hook(
         &repo,
         json!({
             "session_id": "grok-session",
