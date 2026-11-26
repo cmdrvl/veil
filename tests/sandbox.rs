@@ -1386,9 +1386,11 @@ fn sandbox_shell_opens_a_confined_shell() {
 #[cfg(target_os = "macos")]
 #[test]
 fn sandbox_shell_controls_its_jobs_at_a_terminal() {
-    // Waiting goes through `expect`: a plain `sleep` reads nothing, and zsh
-    // stalls until its output is read. The jobs end by themselves, should a
-    // step fail.
+    // Each step waits for what shows it has happened, never for an amount of
+    // time: the terminal throws away what is typed ahead of Ctrl-C or Ctrl-Z,
+    // and runners differ in speed. The waiting goes through `expect`, since
+    // zsh stalls until its output is read. The jobs end by themselves, should
+    // a step fail.
     const TERMINAL: &str = r#"
 set timeout 20
 proc await {pattern step} {
@@ -1402,12 +1404,8 @@ proc line {text pattern} {
     send -- "$text\r"
     await $pattern $text
 }
-proc pause {} {
-    expect -timeout 1 timeout {}
-}
 proc job {} {
-    line {/bin/sh -c 'echo started-$((5+5)); exec /bin/sleep 30'} {started-10}
-    pause
+    line {/bin/sh -c 'trap "echo continued-$((7+7))" CONT; echo started-$((5+5)); n=0; while [ $n -lt 300 ]; do /bin/sleep 0.1; n=$((n+1)); done'} {started-10}
 }
 set veil $env(VEIL_UNDER_TEST)
 spawn -noecho $veil sandbox --shell
@@ -1420,16 +1418,18 @@ line {echo interrupted-$((2+2))} {interrupted-4}
 # Ctrl-Z stops a job, `fg` continues it, Ctrl-C ends it
 job
 send -- "\032"
-pause
+await {(Stopped|suspended)} {Ctrl-Z}
 line {jobs} {(Stopped|suspended)}
-send -- "fg\r"
-pause
+# the job says when it has been continued, and has the terminal by then
+line {fg} {continued-14}
 send -- "\003"
 line {kill -0 %1; echo job-gone-$?} {job-gone-1}
-# the shell ends a job of its own: 128 and SIGTERM's number
-line {/bin/sleep 30 & echo background-$((6+6))} {background-12}
-pause
-line {kill %1; wait %1; echo ended-$?} {ended-143}
+# the shell ends a job of its own: 128 and SIGTERM's number. It is signalled
+# once it says it runs. The shell may have dropped it by the time it waits, and
+# then knows it only by pid, so the command between makes that happen every
+# time. (The space after `!` keeps bash from reading it as history.)
+line {/bin/sh -c 'echo background-$((6+6)); exec /bin/sleep 30' & pid=$! } {background-12}
+line {kill %1; /bin/sleep 1; wait $pid; echo ended-$?} {ended-143}
 line "'$veil' exec shape open.txt" {BROKER_ANSWERED}
 send -- "exit 5\r"
 expect {
