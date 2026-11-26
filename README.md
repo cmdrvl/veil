@@ -504,13 +504,14 @@ echo x >"$OUT"`). So when a command sets a name that veil's own environment hold
 and so the shell's, a target that uses it is unresolved, and so is one that uses
 a copy of it.
 
-The cost, measured: of 28,680 distinct (command, directory) pairs from 30 days of
+The cost, measured: of 28,814 distinct (command, directory) pairs from 30 days of
 one machine's session transcripts, replayed against a scratch home, the build
-before this rule allowed 19,384; 18 of those (0.09%) are denied now, each for a
+before this rule allowed 19,494; 18 of those (0.09%) are denied now, each for a
 variable or `$( )` in a target, and nothing it denied is allowed. It denies many
 of the others only because their directories are gone since, which can hide a
-finding: the target's own text is one veil cannot resolve in 51 pairs (0.18% of
-all).
+finding: counting those too, the rule's findings name a target with a `$`, a
+backtick or a `~` in it in 59 pairs (0.20% of all). Its other findings, in 874
+pairs, are on commands the earlier build denied already.
 
 This is a check of the command's text, and it does not cover:
 
