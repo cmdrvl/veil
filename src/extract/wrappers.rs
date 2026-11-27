@@ -347,8 +347,8 @@ fn script_step(args: &[String]) -> Step {
 
     while let Some(arg) = args.get(i) {
         if arg == "--" {
-            i += 1;
-            break;
+            // nothing after it is an option, before the file or behind it
+            return also(1, i + 2, args.len());
         }
         let Some(cluster) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) else {
             break;
@@ -357,23 +357,11 @@ fn script_step(args: &[String]) -> Step {
             return Step::AlsoScript(text);
         }
         i += 1;
-        if cluster.starts_with('-') {
-            continue;
-        }
-        for (offset, flag) in cluster.char_indices() {
-            let attached = &cluster[offset + flag.len_utf8()..];
-            if flag == 'c' {
-                // `-c'cat x'`, or the next word
-                let text = (!attached.is_empty())
-                    .then(|| attached.to_owned())
-                    .or_else(|| args.get(i).cloned());
-                return text.map_or(Step::Done, Step::AlsoScript);
-            }
-            if SCRIPT.short_value.contains(&flag) {
-                i += usize::from(attached.is_empty());
-                break;
-            }
-        }
+        // an option whose value is the next word
+        let takes_next = cluster
+            .find(|flag| SCRIPT.short_value.contains(&flag))
+            .is_some_and(|at| at + 1 == cluster.len());
+        i += usize::from(takes_next && !cluster.starts_with('-'));
     }
 
     // `args[i]` is the file the session is written to. util-linux takes its
@@ -384,15 +372,34 @@ fn script_step(args: &[String]) -> Step {
     also(1, i + 1, args.len())
 }
 
-/// The string `args[index]` hands on, where it is `-c` or `--command`.
+/// The string `args[index]` hands on where that word is `script`'s command
+/// option: `--command`, `--command=x`, or a cluster holding `c`, whose value is
+/// the rest of the word or the next one (`-qc 'x'`, `-c'x'`).
 fn command_option(args: &[String], index: usize) -> Option<String> {
     let arg = args.get(index)?;
     if let Some(value) = arg.strip_prefix("--command=") {
         return Some(value.to_owned());
     }
-    matches!(arg.as_str(), "-c" | "--command")
-        .then(|| args.get(index + 1).cloned())
-        .flatten()
+    if arg == "--command" {
+        return args.get(index + 1).cloned();
+    }
+    let cluster = arg
+        .strip_prefix('-')
+        .filter(|rest| !rest.starts_with('-'))?;
+
+    for (offset, flag) in cluster.char_indices() {
+        if flag == 'c' {
+            let attached = &cluster[offset + 1..];
+            return (!attached.is_empty())
+                .then(|| attached.to_owned())
+                .or_else(|| args.get(index + 1).cloned());
+        }
+        // the rest of the word is that option's value
+        if SCRIPT.short_value.contains(&flag) {
+            break;
+        }
+    }
+    None
 }
 
 /// Makes the word at `program` the first of what is unwrapped next. The
@@ -415,7 +422,7 @@ fn advance(command: &mut SimpleCommand, start: usize, own: &[usize], program: us
         .collect();
 
     let words: Vec<String> = order.iter().map(|&i| command.argv[i].clone()).collect();
-    let operators: Vec<bool> = order.iter().map(|&i| command.operators[i]).collect();
+    let operators: Vec<_> = order.iter().map(|&i| command.operators[i]).collect();
     command.argv.splice(start..=program, words);
     command.operators.splice(start..=program, operators);
     start + passed.len()
@@ -427,9 +434,10 @@ fn pass_over(command: &mut SimpleCommand, start: usize) {
     command.operators.drain(..start);
 }
 
-/// `command` cut down to its program and its redirections, when it reads through
-/// one. For a program whose words are replaced by what they run (`eval`, `find
-/// -exec`): the shell opens the file all the same, whatever that text does.
+/// The program at `start` and its redirections, and none of the other words,
+/// when it reads through one of them. For a program whose words are replaced by
+/// what they run (`eval`, `find -exec`): the shell opens the file all the same,
+/// whatever that text does. Nothing is left to pass over in what is returned.
 fn input_redirections(command: &SimpleCommand, start: usize) -> Option<SimpleCommand> {
     let own = command.handed_words(start);
     let kept: Vec<usize> = (start..command.argv.len())
@@ -437,7 +445,7 @@ fn input_redirections(command: &SimpleCommand, start: usize) -> Option<SimpleCom
         .collect();
     let reads = kept
         .iter()
-        .any(|&i| command.operators[i] && command.argv[i].contains('<'));
+        .any(|&i| command.redirection(i).is_some() && command.argv[i].contains('<'));
 
     reads.then(|| SimpleCommand {
         argv: kept.iter().map(|&i| command.argv[i].clone()).collect(),
@@ -469,7 +477,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
     let mut start = 0;
     let mut hops = 0;
 
-    command.operators.resize(command.argv.len(), false);
+    command.operators.resize(command.argv.len(), None);
 
     loop {
         // What the program is handed. `bash 2>x -c 'cat y'` runs the script
@@ -517,7 +525,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
 
         if SHELLS.contains(&program) || program == "eval" {
             let is_eval = program == "eval";
-            let scripts = shell_scripts(&words, &command.argv[start..], is_eval, &command);
+            let scripts = shell_scripts(&words, is_eval, &command);
             // likewise the text a shell or `eval` is handed to run
             run.lookup_changed |= if is_eval {
                 !command.unresolved.is_empty()
@@ -530,8 +538,6 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                 pass_over(&mut command, start);
                 emit(command, out);
             } else if let Some(redirected) = input_redirections(&command, start) {
-                let mut redirected = redirected;
-                pass_over(&mut redirected, start);
                 emit(redirected, out);
             }
             for text in scripts {
@@ -568,9 +574,8 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
         // Where the program's words are replaced by what they run, the shell
         // still opens what the line reads from.
         if matches!(step, Step::Script(_) | Step::Exec(_))
-            && let Some(mut redirected) = input_redirections(&command, start)
+            && let Some(redirected) = input_redirections(&command, start)
         {
-            pass_over(&mut redirected, start);
             emit(redirected, out);
         }
 
@@ -600,11 +605,11 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
             }
             Step::Words(mut replacement, directory) => {
                 // the redirections go after the program, ahead of its words
-                let (kept, flags): (Vec<String>, Vec<bool>) = (start..command.argv.len())
+                let (kept, flags): (Vec<String>, Vec<_>) = (start..command.argv.len())
                     .filter(|i| !own.contains(i))
                     .map(|i| (command.argv[i].clone(), command.operators[i]))
                     .unzip();
-                let mut operators = vec![false; replacement.len()];
+                let mut operators = vec![None; replacement.len()];
                 operators.splice(1..1, flags);
                 replacement.splice(1..1, kept);
                 command.argv = replacement;
@@ -620,8 +625,8 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
             Step::Script(text) => {
                 script(&text, Origin::Wrapper, depth + 1, run, out);
                 // `sudo -s sh <<< 'cat x'`
-                if let Some(text) = here_string(&command.argv[start..]) {
-                    script(&text, Origin::Wrapper, depth + 1, run, out);
+                for text in command.here_strings() {
+                    script(text, Origin::Wrapper, depth + 1, run, out);
                 }
                 return;
             }
@@ -680,16 +685,11 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
     }
 }
 
-/// The scripts a shell (or `eval`) runs: its `-c` string, else a here-string,
-/// else a here-document, which the shell reads from standard input. `words` is
-/// what the program is handed; `written` still has the redirections, where a
-/// here-string is.
-fn shell_scripts(
-    words: &[String],
-    written: &[String],
-    eval: bool,
-    command: &SimpleCommand,
-) -> Vec<String> {
+/// The scripts a shell (or `eval`) runs: its `-c` string or the words `eval`
+/// joins, every here-string, and, for a shell without a script of its own, the
+/// here-document it reads from standard input. `words` is what the program is
+/// handed.
+fn shell_scripts(words: &[String], eval: bool, command: &SimpleCommand) -> Vec<String> {
     let args = &words[1..];
 
     let own = if eval {
@@ -697,20 +697,18 @@ fn shell_scripts(
     } else {
         command_string(args).map(str::to_owned)
     };
+    // bash reads whichever of a here-string and a here-document comes last
+    let document = command
+        .heredoc_body
+        .as_ref()
+        .filter(|_| !eval && own.is_none());
+
     // A here-string is read even beside a script of the shell's own, which can
     // start a shell that runs it: `eval bash <<< 'cat x'`.
-    let fed = here_string(written);
-
-    if own.is_none() && fed.is_none() && !eval {
-        return command.heredoc_body.iter().cloned().collect();
-    }
-    own.into_iter().chain(fed).collect()
-}
-
-/// The text of a `<<<` among a command's words.
-fn here_string(written: &[String]) -> Option<String> {
-    let position = written.iter().position(|arg| arg == "<<<")?;
-    written.get(position + 1).cloned()
+    own.into_iter()
+        .chain(command.here_strings().into_iter().map(str::to_owned))
+        .chain(document.cloned())
+        .collect()
 }
 
 /// The `-c` string of a shell invocation: `-c`, or a cluster holding `c` such

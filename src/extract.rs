@@ -267,20 +267,9 @@ fn home_directory() -> Option<String> {
 /// What standard input is for a command that reads its script from it
 /// (`sed -f -`): the text of a here-document or here-string, a file redirected
 /// in, or something veil cannot see, such as a pipe.
-fn script_stdin<'a>(command: &'a SimpleCommand, args: &'a [String]) -> sed::Stdin<'a> {
-    if let Some(body) = &command.heredoc_body {
-        return sed::Stdin::Text(body);
-    }
-
-    let mut words = args.iter();
-    while let Some(word) = words.next() {
-        if word == "<<<" {
-            if let Some(text) = words.next() {
-                return sed::Stdin::Text(text);
-            }
-        } else if let Some(text) = word.strip_prefix("<<<") {
-            return sed::Stdin::Text(text);
-        }
+fn script_stdin<'a>(command: &SimpleCommand, text: &'a str) -> sed::Stdin<'a> {
+    if command.heredoc_body.is_some() || !command.here_strings().is_empty() {
+        return sed::Stdin::Text(text);
     }
 
     if command.redirects_in.is_empty() {
@@ -337,6 +326,8 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path, names_stand: bool) ->
     // stop at a bare one: `cat > out x.csv` reads x.csv. So the words it is
     // handed are read too, which can only add to what is judged (bd-ao5).
     let handed = command.handed_args();
+    // A parser that finds its operands by position is given only these: in
+    // `python3 -c > out CODE` the code is CODE, not `>`.
     if handed.len() < args.len() {
         let more = match search_command_paths(
             program,
@@ -354,20 +345,34 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path, names_stand: bool) ->
         }
     }
     paths.extend(command.redirects_in.iter().cloned());
-    paths.extend(collect_inline_interpreter_paths(program, args));
+    paths.extend(collect_inline_interpreter_paths(program, &handed));
     if let Some(body) = &command.heredoc_body {
         paths.extend(heredoc_script_paths(program, body));
         paths.extend(egress::script_paths(program, body));
     }
-    paths.extend(egress::here_string_paths(program, args));
-    paths.extend(egress::option_script_paths(program, args));
+    for text in command.here_strings() {
+        paths.extend(heredoc_script_paths(program, text));
+    }
+    paths.extend(egress::here_string_paths(
+        program,
+        &command.redirection_words(),
+    ));
+    paths.extend(egress::option_script_paths(program, &handed));
 
     // The files a sed script reads (`r`, `R`) are read like a `cat`'s; the ones
     // it writes (`w`, `W`, the `w` flag of `s`) are named paths, judged with the
     // other words of the command (bd-pm8). A script file (`-f read.sed`) is read
     // by `script.rs`; a `-f -` is read from here, where standard input is.
+    // every text bash could put on standard input, since it takes the last
+    let fed: String = command
+        .heredoc_body
+        .as_deref()
+        .into_iter()
+        .chain(command.here_strings())
+        .collect::<Vec<_>>()
+        .join("\n");
     let sed_script = sed::is_sed(command_name(program))
-        .then(|| sed::script_files(args, script_stdin(command, args)));
+        .then(|| sed::script_files(&handed, script_stdin(command, &fed)));
     if let Some(script) = &sed_script {
         paths.extend(script.reads.iter().cloned());
     }
@@ -380,7 +385,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path, names_stand: bool) ->
     // open are named paths, judged with the other words (bd-3h5). The program
     // file of `-f` and the modules an import loads are read by `script.rs`.
     let jq_program = jq::is_jq(command_name(program))
-        .then(|| jq::inline_files(args, home_directory().as_deref()));
+        .then(|| jq::inline_files(&handed, home_directory().as_deref()));
     if let Some(imports) = &jq_program {
         named.extend(imports.files.iter().cloned());
     }
@@ -438,11 +443,12 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path, names_stand: bool) ->
     let (argv_paths, argv_exposure, argv_scans_directories) = if is_known_reader(program) {
         (Vec::new(), PathExposure::None, false)
     } else {
-        let exposure = argv_exposure(program, args);
+        // in `git > ls-files show HEAD:x` the subcommand is `show`
+        let exposure = argv_exposure(program, &handed);
         let scans_directories = BULK_TRANSFER_COMMANDS.contains(&command_name(program));
         let paths = argv_paths(
+            command,
             program,
-            args,
             script_writes,
             exposure == PathExposure::ReadsContents,
             &candidates,
@@ -467,7 +473,7 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path, names_stand: bool) ->
             || command.cwd_unresolved
             || inline_refusal.is_some(),
         assigned_paths,
-        egress: egress::is_egress(program, args),
+        egress: egress::is_egress(program, args) || egress::is_egress(program, &handed),
         script: None,
         write_targets: write_targets(&command.argv, cwd, home_directory().as_deref()),
         redirect_targets: redirect_targets(command, cwd),
@@ -731,8 +737,8 @@ fn git_subcommand(args: &[String]) -> Option<&str> {
 /// which no word of it spells (a sed script's `w .env`): each is a path whether
 /// or not it exists.
 fn argv_paths(
+    command: &SimpleCommand,
     program: &str,
-    args: &[String],
     named: &[String],
     reads: bool,
     already: &[PathBuf],
@@ -744,7 +750,10 @@ fn argv_paths(
     let mut budget = ARGV_FILESYSTEM_BUDGET;
     let mut resolver = ArgvResolver::new(cwd);
 
-    for word in argv_path_words(program, args, named, names_stand) {
+    let args = command.argv.get(1..).unwrap_or_default();
+    let handed = command.handed_args();
+
+    for word in argv_path_words(program, args, &handed, named, names_stand) {
         let mut resolve = |raw: &str, found: &mut Vec<ArgvPath>| {
             let resolved = budget > 0;
             let path = if resolved {
@@ -801,6 +810,7 @@ struct PathWord {
 fn argv_path_words(
     program: &str,
     args: &[String],
+    handed: &[String],
     named: &[String],
     names_stand: bool,
 ) -> Vec<PathWord> {
@@ -875,7 +885,13 @@ fn argv_path_words(
 
     // A file named inside a word taken whole: `-F f=@x.csv;type=text/csv`,
     // `--data-urlencode name@x.csv`, `x.csv#label` (bd-x8o).
-    for file in egress::operand_paths(program, args) {
+    // an option and its value are found by position, so also among the words
+    // the program is handed
+    let among_handed = egress::operand_paths(program, handed);
+    for file in egress::operand_paths(program, args)
+        .into_iter()
+        .chain(among_handed)
+    {
         add(&file);
     }
 

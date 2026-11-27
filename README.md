@@ -102,6 +102,9 @@ which can show a protected file:
 
 - A runner veil does not know (`xcrun bash -c '...'`) is judged only by its own
   words, so a shell string it is handed is not read.
+- A here-document is not read where the shell has a `-c` script of its own, or
+  is handed to `eval`, though a shell that script starts would run it. A
+  `<<<` here-string is read there.
 - Code that reaches one of those variables through another
   (`x='$(...)'; PS4=$x`) is not read. Neither are `PROMPT_COMMAND` and an
   assignment inside an `env -S` string.

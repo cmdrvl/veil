@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::expand::{self, Vars, Word};
+use super::expand::{self, Redirection, Vars, Word};
 use super::{RedirectTarget, redirect, wrappers};
 use super::{collect_input_redirect_paths, is_shell_assignment, lookup};
 
@@ -108,7 +108,7 @@ pub struct SimpleCommand {
     /// For each word of `argv`, whether it was written as a redirection. The
     /// text does not show it: `bash -c '>x; cat y'` has a script that starts
     /// with `>`.
-    pub operators: Vec<bool>,
+    pub operators: Vec<Option<Redirection>>,
     /// The working directory veil resolved for this command, when known.
     pub cwd: Option<PathBuf>,
     /// Its working directory depends on a path veil could not resolve.
@@ -173,25 +173,60 @@ impl SimpleCommand {
     /// but the redirections and what they name, which the shell takes out
     /// wherever they are written (bd-ao5).
     pub(super) fn handed_words(&self, start: usize) -> Vec<usize> {
-        let operator = |i: usize| self.operators.get(i) == Some(&true);
         let mut handed = Vec::new();
         let mut i = start;
 
         while i < self.argv.len() {
-            if operator(i) {
-                i += if names_the_next_word(&self.argv[i]) {
-                    2
-                } else {
-                    1
+            if let Some(redirection) = self.redirection(i) {
+                i += match redirection {
+                    Redirection::NextWord => 2,
+                    Redirection::Attached => 1,
                 };
                 continue;
             }
-            if !(operator(i + 1) && is_descriptor_variable(&self.argv[i])) {
+            if !(self.redirection(i + 1).is_some() && is_descriptor_variable(&self.argv[i])) {
                 handed.push(i);
             }
             i += 1;
         }
         handed
+    }
+
+    /// How `argv[index]` was written, where it was written as a redirection.
+    pub(super) fn redirection(&self, index: usize) -> Option<Redirection> {
+        self.operators.get(index).copied().flatten()
+    }
+
+    /// The words of the redirections, in order: all the program is not handed.
+    pub(super) fn redirection_words(&self) -> Vec<String> {
+        let handed = self.handed_words(0);
+        (0..self.argv.len())
+            .filter(|i| !handed.contains(i))
+            .map(|i| self.argv[i].clone())
+            .collect()
+    }
+
+    /// The text of each `<<<` of the command, in order. bash reads the last, but
+    /// all are read here. A quoted `<<<` is an argument and not one of them.
+    pub(super) fn here_strings(&self) -> Vec<&str> {
+        let mut found = Vec::new();
+
+        for (index, word) in self.argv.iter().enumerate() {
+            let Some(redirection) = self.redirection(index) else {
+                continue;
+            };
+            let operator = word.trim_start_matches(|c: char| c.is_ascii_digit());
+            let Some(attached) = operator.strip_prefix("<<<") else {
+                continue;
+            };
+            match redirection {
+                Redirection::NextWord => {
+                    found.extend(self.argv.get(index + 1).map(String::as_str));
+                }
+                Redirection::Attached => found.push(attached),
+            }
+        }
+        found
     }
 
     /// The arguments the program is handed.
@@ -769,14 +804,6 @@ fn simple_command(
         heredoc_computed: segment.heredoc_computed,
         lookup_changed: false,
     })
-}
-
-/// Whether the operator `word` is followed by what it names: `>` and `2>>` are,
-/// `>file` and `2>&1` carry their own.
-fn names_the_next_word(word: &str) -> bool {
-    word.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
-        .trim_start_matches(['<', '>', '|', '&'])
-        .is_empty()
 }
 
 /// bash and zsh's `{name}`, which ahead of an operator names a variable that is

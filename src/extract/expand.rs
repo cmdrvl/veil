@@ -44,12 +44,39 @@ pub struct ShellEnv {
 /// of `$x` words cost an allocation each.
 pub(super) const MAX_NAMED_UNRESOLVED: usize = 8;
 
+/// How a word written as a redirection gets what it names. It is read from the
+/// word as written: after quotes are removed `>""` looks like a bare `>`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Redirection {
+    /// `>`, `2>>`, `<<<`: what it names is the next word.
+    NextWord,
+    /// `>file`, `2>&1`, `<<<text`: the word holds it.
+    Attached,
+}
+
+impl Redirection {
+    /// `None` where the word as written is not a redirection: its first byte,
+    /// unquoted, does not start an operator.
+    fn written(word: &str) -> Option<Self> {
+        is_redirection_word(word).then(|| {
+            let target = word
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+                .trim_start_matches(['<', '>', '|', '&']);
+            if target.is_empty() {
+                Self::NextWord
+            } else {
+                Self::Attached
+            }
+        })
+    }
+}
+
 /// One word after expansion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Word {
     pub text: String,
-    /// Written as a redirection: its first byte, unquoted, starts an operator.
-    pub operator: bool,
+    /// Set where the word was written as a redirection.
+    pub operator: Option<Redirection>,
     /// Set when something in the word could not be resolved: the word as it was
     /// written for the first [`MAX_NAMED_UNRESOLVED`] of a command, an empty
     /// string after that.
@@ -226,14 +253,14 @@ impl Vars {
                 words.push(Word {
                     text: written.to_owned(),
                     unresolved: Some(self.named_unresolved(written)),
-                    operator: false,
+                    operator: None,
                 });
             } else if !needs_expansion(written) {
                 // Most words are plain text: nothing to expand or to unquote.
                 words.push(Word {
                     text: written.to_owned(),
                     unresolved: None,
-                    operator: is_redirection_word(written),
+                    operator: Redirection::written(written),
                 });
             } else if !written.contains('{') {
                 self.push_alternative(written, written, env, &mut words)?;
@@ -349,7 +376,7 @@ impl Vars {
             text: processed.text,
             unresolved,
             // as written: a quoted `>` or one out of a variable is an argument
-            operator: is_redirection_word(written),
+            operator: Redirection::written(written),
         });
         Some(())
     }
@@ -775,7 +802,7 @@ pub(super) fn plain_words(text: &str) -> Option<Vec<Word>> {
                 words.push(Word {
                     text: text[begin..i].to_owned(),
                     unresolved: None,
-                    operator: is_redirection_word(&text[begin..i]),
+                    operator: Redirection::written(&text[begin..i]),
                 });
                 start = None;
             }
@@ -788,7 +815,7 @@ pub(super) fn plain_words(text: &str) -> Option<Vec<Word>> {
         words.push(Word {
             text: text[begin..].to_owned(),
             unresolved: None,
-            operator: is_redirection_word(&text[begin..]),
+            operator: Redirection::written(&text[begin..]),
         });
     }
 

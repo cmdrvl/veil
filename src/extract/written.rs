@@ -180,8 +180,6 @@ fn is_option(word: &str) -> bool {
 struct Line<'a> {
     words: Vec<&'a str>,
     outputs: Vec<Output<'a>>,
-    /// The text after `<<<`.
-    here_string: Option<&'a str>,
     /// Standard input is a file.
     reads_file: bool,
 }
@@ -196,18 +194,16 @@ fn split(argv: &[String]) -> Line<'_> {
     let mut line = Line {
         words: Vec::new(),
         outputs: Vec::new(),
-        here_string: None,
         reads_file: false,
     };
     let mut words = argv.iter().map(String::as_str);
 
     while let Some(word) = words.next() {
+        // the text of a here-string is read by `stdin_text`
         if let Some(text) = word.strip_prefix("<<<") {
-            line.here_string = Some(if text.is_empty() {
-                words.next().unwrap_or_default()
-            } else {
-                text
-            });
+            if text.is_empty() {
+                words.next();
+            }
             continue;
         }
         if word.starts_with("<<") {
@@ -295,7 +291,8 @@ fn stdin_text(command: &SimpleCommand, line: &Line<'_>) -> Option<String> {
     }
 
     let mut text = command.heredoc_body.clone();
-    if let Some(string) = line.here_string {
+    // bash reads the last, so with more than one all of them are kept
+    for string in command.here_strings() {
         let text = text.get_or_insert_with(String::new);
         text.push_str(string);
         text.push('\n');

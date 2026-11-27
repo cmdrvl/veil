@@ -161,10 +161,11 @@ fn language_of(kind: InterpreterKind) -> Option<exec::Language> {
 /// and `-e`, an awk program, or the here-document or here-string the interpreter
 /// reads as its program.
 fn inline_programs(command: &SimpleCommand) -> (Option<exec::Language>, Vec<String>) {
-    let Some((program, args)) = command.argv.split_first() else {
+    let Some(program) = command.argv.first() else {
         return (None, Vec::new());
     };
     let name = command_name(program);
+    let args = &command.handed_args();
     let found = exec::programs(name, args);
     let Some(language) = found.language else {
         return (None, Vec::new());
@@ -173,15 +174,11 @@ fn inline_programs(command: &SimpleCommand) -> (Option<exec::Language>, Vec<Stri
 
     if texts.is_empty()
         && let Some(kind) = interpreter_kind(name)
-        && script_operand(kind, name, &command.handed_args()) == Operand::Stdin
+        && script_operand(kind, name, args) == Operand::Stdin
     {
-        if let Some(body) = &command.heredoc_body {
-            texts.push(body.clone());
-        } else if let Some(position) = args.iter().position(|arg| arg == "<<<")
-            && let Some(text) = args.get(position + 1)
-        {
-            texts.push(text.clone());
-        }
+        // bash reads whichever comes last, so all of them are read
+        texts.extend(command.heredoc_body.clone());
+        texts.extend(command.here_strings().into_iter().map(str::to_owned));
     }
     (Some(language), texts)
 }
@@ -281,9 +278,10 @@ fn inspect_awk(
     scripts: &mut Scripts,
     out: &mut Vec<CommandExtraction>,
 ) {
-    let Some((program, args)) = command.argv.split_first() else {
+    let Some(program) = command.argv.first() else {
         return;
     };
+    let args = &command.handed_args();
     let mut names = if exec::is_awk(command_name(program)) {
         exec::programs(command_name(program), args).files
     } else {
@@ -395,9 +393,10 @@ struct SedRun {
 /// file `-f -` has redirected in, or a file run by name whose first line names
 /// sed. Empty for any other command.
 fn sed_scripts(command: &SimpleCommand, cwd: &Path, scripts: &Scripts) -> Vec<SedRun> {
-    let Some((program, args)) = command.argv.split_first() else {
+    let Some(program) = command.argv.first() else {
         return Vec::new();
     };
+    let args = &command.handed_args();
 
     if sed::is_sed(command_name(program)) {
         let operands = sed::script_file_operands(args);
@@ -512,14 +511,14 @@ fn inspect_jq(
     scripts: &mut Scripts,
     out: &mut Vec<CommandExtraction>,
 ) {
-    let Some((program, args)) = command.argv.split_first() else {
+    let Some(program) = command.argv.first() else {
         return;
     };
     if !jq::is_jq(command_name(program)) {
         return;
     }
 
-    let line = jq::command_line(args);
+    let line = jq::command_line(&command.handed_args());
     let home = home_directory();
     let mut queue: Vec<JqFile> = Vec::new();
 
