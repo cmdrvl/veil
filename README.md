@@ -93,6 +93,21 @@ The sandbox columns are what a path-deny OS sandbox is expected to do. None is e
 
 <!-- bypass-matrix:end -->
 
+**Shell text handed on to run later.** veil reads the command after a leading
+redirection, a `trap` action, the body of an exported `BASH_FUNC_` function, a
+substitution written into `PS4`, `BASH_ENV` or `ENV`, and the shell string
+handed to the runners it knows, `caffeinate`, `stdbuf`, `sandbox-exec`, `arch`
+and `script` among them. Limits to know about, some of which can show a
+protected file:
+
+- A runner veil does not know (`xcrun bash -c '...'`) is judged only by its own
+  words, so a shell string it is handed is not read.
+- Code that reaches one of those variables through another
+  (`x='$(...)'; PS4=$x`) is not read. Neither are `PROMPT_COMMAND` and an
+  assignment inside an `env -S` string.
+- A `trap` action is read the way a script is: a word veil cannot resolve in it
+  is not judged, and an action veil cannot parse is not read.
+
 ---
 
 ## Sandboxed commands (macOS)

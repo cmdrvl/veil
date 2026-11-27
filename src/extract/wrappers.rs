@@ -17,9 +17,9 @@ use std::fs;
 use std::path::Path;
 
 use super::decompose::{
-    MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, action_changes_lookup, emit, script,
+    MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, emit, read_stored_code, script,
 };
-use super::{command_name, lookup};
+use super::{command_name, is_redirection_word, lookup};
 
 /// Options a wrapper takes, and which of them carry a value.
 struct Options {
@@ -285,6 +285,98 @@ enum Step {
     Script(String),
     /// `find` with `-exec`: the commands it runs, one per root and block.
     Exec(Vec<Vec<String>>),
+    /// Keep these words as a command of their own, and also read the command
+    /// that starts `count` words in. Nothing the words as a whole are judged
+    /// by is lost, so reading further can only add a reason to deny (bd-ao5).
+    Also { count: usize },
+    /// The same, for a shell string the words hand on.
+    AlsoScript(String),
+}
+
+/// The runners read beside their own words (bd-ao5). The macOS ones were
+/// checked against their man pages; `stdbuf` and the util-linux form of
+/// `script` are from their documentation.
+const CAFFEINATE: Options = Options {
+    short_value: &['t', 'w'],
+    long_value: &[],
+};
+const STDBUF: Options = Options {
+    short_value: &['i', 'o', 'e'],
+    long_value: &["input", "output", "error"],
+};
+const SANDBOX_EXEC: Options = Options {
+    short_value: &['f', 'n', 'p', 'D'],
+    long_value: &[],
+};
+const SCRIPT: Options = Options {
+    short_value: &['t', 'T', 'F'],
+    long_value: &[],
+};
+
+fn also(prefix: usize, options_end: usize, available: usize) -> Step {
+    if options_end >= available {
+        Step::Done
+    } else {
+        Step::Also {
+            count: prefix + options_end,
+        }
+    }
+}
+
+/// `arch [-arm64 | -arch name]... [-d name] [-e name=value] program`: its
+/// options are words, not clusters of letters.
+fn arch_step(args: &[String]) -> Step {
+    let mut i = 0;
+
+    while let Some(arg) = args.get(i) {
+        match arg.as_str() {
+            "-arch" | "-d" | "-e" => i += 2,
+            word if word.starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    also(1, i, args.len())
+}
+
+/// BSD `script [options] file command...`, and util-linux's
+/// `script -c 'command' file`.
+fn script_step(args: &[String]) -> Step {
+    let string = args.iter().enumerate().find_map(|(index, arg)| {
+        if let Some(value) = arg.strip_prefix("--command=") {
+            return Some(value.to_owned());
+        }
+        let short = arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c');
+        (short || arg == "--command")
+            .then(|| args.get(index + 1).cloned())
+            .flatten()
+    });
+
+    match string {
+        Some(text) => Step::AlsoScript(text),
+        // the first operand is the file the session is written to
+        None => {
+            let file = skip_options(args, &SCRIPT).end;
+            also(1, file + 1, args.len())
+        }
+    }
+}
+
+/// How many leading words are redirections and the files they name. The shell
+/// takes them out wherever they are written, ahead of the command too.
+fn leading_redirections(words: &[String]) -> usize {
+    let mut count = 0;
+
+    while let Some(word) = words.get(count)
+        && is_redirection_word(word)
+    {
+        // `>` names the next word; `>file` and `2>&1` carry their own
+        let bare = word
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+            .trim_start_matches(['<', '>', '|', '&'])
+            .is_empty();
+        count += if bare { 2 } else { 1 };
+    }
+    count
 }
 
 /// Adds `command`, and whatever it runs, to `out`. A wrapper is replaced by
@@ -333,13 +425,24 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
             continue;
         }
 
+        // `2>/dev/null bash -c '...'` runs bash (bd-ao5). A redirection means
+        // the same after the command, where veil already reads it, so those
+        // ahead of it are moved to the end.
+        let redirections = leading_redirections(words);
+        if redirections > 0 && redirections < words.len() {
+            let moved: Vec<String> = command.argv.drain(start..start + redirections).collect();
+            command.argv.extend(moved);
+            continue;
+        }
+
         // An action with something computed in it when it is set can be any
         // script; otherwise it is read.
         if program == "trap"
             && let Some(action) = lookup::trap_action(&words[1..])
         {
-            run.lookup_changed |=
-                command.computed.contains(action) || action_changes_lookup(action, depth, run);
+            let computed = command.computed.contains(action);
+            let changes = read_stored_code(action, depth, run, out);
+            run.lookup_changed |= computed || changes;
         }
 
         if SHELLS.contains(&program) || program == "eval" {
@@ -412,6 +515,19 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                 }
             }
             Step::Script(text) => {
+                script(&text, Origin::Wrapper, depth + 1, run, out);
+                return;
+            }
+            Step::Also { count } => {
+                let mut written = command.clone();
+                written.argv.drain(..start);
+                emit(written, out);
+                start += count;
+                command.origin = Origin::Wrapper;
+            }
+            Step::AlsoScript(text) => {
+                command.argv.drain(..start);
+                emit(command, out);
                 script(&text, Origin::Wrapper, depth + 1, run, out);
                 return;
             }
@@ -588,6 +704,20 @@ fn step(words: &[String]) -> Step {
         "pdm" => run_subcommand(args, &PDM),
         "deno" => run_subcommand(args, &DENO),
         "bunx" => skip(1, &BUNX, args, false),
+        "caffeinate" => {
+            let end = skip_options(args, &CAFFEINATE).end;
+            also(1, end, args.len())
+        }
+        "stdbuf" => {
+            let end = skip_options(args, &STDBUF).end;
+            also(1, end, args.len())
+        }
+        "sandbox-exec" => {
+            let end = skip_options(args, &SANDBOX_EXEC).end;
+            also(1, end, args.len())
+        }
+        "arch" => arch_step(args),
+        "script" => script_step(args),
         "npx" => {
             let skipped = skip_options(args, &NPX);
             match skipped.value_of(&["-c", "--call"]) {

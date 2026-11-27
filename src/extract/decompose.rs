@@ -237,26 +237,62 @@ pub fn decompose_in(command: &str, env: &ShellEnv) -> Vec<SimpleCommand> {
     commands
 }
 
-/// Whether a `trap` action changes how names are found. The shell stores the
-/// text and may run it before the commands that follow, so it is read as a
-/// script with variables of its own, but on the depth and segment budget of the
-/// command that holds it: an action can expand to that whole command again.
-/// Text that cannot be analysed counts as changing lookup.
-pub(super) fn action_changes_lookup(text: &str, depth: usize, run: &mut Run) -> bool {
-    let mut action = Run {
+/// Reads text the shell stores and may run later, such as a `trap` action, and
+/// adds the commands in it to `out` (bd-ao5). It is read as a script with
+/// variables of its own, but on the depth and segment budget of the command
+/// that holds it: an action can expand to that whole command again. Its values
+/// are only known when it runs, so as in a script file, a word veil cannot
+/// resolve is not an argument to judge: `trap 'rm -f "$tmp"' EXIT`.
+///
+/// Returns whether it changes how names are found. Text that cannot be analysed
+/// counts as changing lookup, and nothing in it is read.
+pub(super) fn read_stored_code(
+    text: &str,
+    depth: usize,
+    run: &mut Run,
+    out: &mut Vec<SimpleCommand>,
+) -> bool {
+    let mut stored = Run {
         segments: run.segments,
+        env: run.env.clone(),
         vars: Vars::for_command(text),
         ..Run::default()
     };
-    script(
-        text,
-        Origin::Wrapper,
-        depth + 1,
-        &mut action,
-        &mut Vec::new(),
-    );
-    run.segments = action.segments;
-    action.failed || action.truncated || action.lookup_changed
+    let mut commands = Vec::new();
+
+    script(text, Origin::Wrapper, depth + 1, &mut stored, &mut commands);
+    run.segments = stored.segments;
+
+    if !stored.failed {
+        for mut command in commands {
+            if !command.is_opaque() {
+                command.unresolved.clear();
+                out.push(command);
+            }
+        }
+    }
+    stored.failed || stored.truncated || stored.lookup_changed
+}
+
+/// The code bash runs out of a variable's value, where `word` sets one it does
+/// that with: the body of an exported function, or a substitution in `PS4`,
+/// `BASH_ENV` or `ENV`, which are expanded before use (bd-ao5).
+fn code_in_variable(word: &str) -> Option<String> {
+    let (name, value) = word.split_once('=')?;
+
+    if name.starts_with("BASH_FUNC_") {
+        return value.trim_start().strip_prefix("()").map(str::to_owned);
+    }
+    if !matches!(name, "PS4" | "BASH_ENV" | "ENV") || !(value.contains("$(") || value.contains('`'))
+    {
+        return None;
+    }
+    // inside double quotes a `'` is text, as it is when the value is expanded
+    Some(if value.contains('"') {
+        format!(": {value}")
+    } else {
+        format!(": \"{value}\"")
+    })
 }
 
 /// Decomposes one script (the whole command, a substitution body, a `-c`
@@ -356,6 +392,16 @@ fn script_body(
                         run.vars.assign(&name, value);
                     }
                     if !expand::exports_to_environment(&raw) && writes.is_empty() {
+                        // nothing more of this statement is read, and a later
+                        // `export` of the name hands its code to bash
+                        for (name, written) in expand::assignment_words(&raw).into_iter().flatten()
+                        {
+                            if let Some(value) = run.vars.value(&written, &run.env)
+                                && let Some(code) = code_in_variable(&format!("{name}={value}"))
+                            {
+                                run.lookup_changed |= read_stored_code(&code, depth, run, out);
+                            }
+                        }
                         continue;
                     }
                 }
@@ -369,6 +415,13 @@ fn script_body(
         };
 
         run.lookup_changed |= segment_changes_lookup(&words);
+        // wherever the assignment stands: ahead of a command, in `env`'s own
+        // words or after `export`
+        for word in &words {
+            if let Some(code) = code_in_variable(&word.text) {
+                run.lookup_changed |= read_stored_code(&code, depth, run, out);
+            }
+        }
 
         match words.first().map(|word| word.text.as_str()) {
             Some("if" | "while" | "until" | "for" | "select" | "case") => {
