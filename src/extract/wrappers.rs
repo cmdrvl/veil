@@ -17,9 +17,10 @@ use std::fs;
 use std::path::Path;
 
 use super::decompose::{
-    MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, emit, read_stored_code, script,
+    MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, emit, read_stored_code,
+    read_variable_code, script,
 };
-use super::{command_name, is_redirection_word, lookup};
+use super::{command_name, lookup};
 
 /// Options a wrapper takes, and which of them carry a value.
 struct Options {
@@ -339,44 +340,110 @@ fn arch_step(args: &[String]) -> Step {
 }
 
 /// BSD `script [options] file command...`, and util-linux's
-/// `script -c 'command' file`.
+/// `script [options] -c 'command' file`. Only `script`'s own options are looked
+/// at: a `-c` further on belongs to the command it runs.
 fn script_step(args: &[String]) -> Step {
-    let string = args.iter().enumerate().find_map(|(index, arg)| {
-        if let Some(value) = arg.strip_prefix("--command=") {
-            return Some(value.to_owned());
-        }
-        let short = arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c');
-        (short || arg == "--command")
-            .then(|| args.get(index + 1).cloned())
-            .flatten()
-    });
+    let mut i = 0;
 
-    match string {
-        Some(text) => Step::AlsoScript(text),
-        // the first operand is the file the session is written to
-        None => {
-            let file = skip_options(args, &SCRIPT).end;
-            also(1, file + 1, args.len())
+    while let Some(arg) = args.get(i) {
+        if arg == "--" {
+            i += 1;
+            break;
+        }
+        let Some(cluster) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) else {
+            break;
+        };
+        if let Some(text) = command_option(args, i) {
+            return Step::AlsoScript(text);
+        }
+        i += 1;
+        if cluster.starts_with('-') {
+            continue;
+        }
+        for (offset, flag) in cluster.char_indices() {
+            let attached = &cluster[offset + flag.len_utf8()..];
+            if flag == 'c' {
+                // `-c'cat x'`, or the next word
+                let text = (!attached.is_empty())
+                    .then(|| attached.to_owned())
+                    .or_else(|| args.get(i).cloned());
+                return text.map_or(Step::Done, Step::AlsoScript);
+            }
+            if SCRIPT.short_value.contains(&flag) {
+                i += usize::from(attached.is_empty());
+                break;
+            }
         }
     }
+
+    // `args[i]` is the file the session is written to. util-linux takes its
+    // option after the file too; BSD would run a command named `-c`.
+    if let Some(text) = command_option(args, i + 1) {
+        return Step::AlsoScript(text);
+    }
+    also(1, i + 1, args.len())
 }
 
-/// How many leading words are redirections and the files they name. The shell
-/// takes them out wherever they are written, ahead of the command too.
-fn leading_redirections(words: &[String]) -> usize {
-    let mut count = 0;
-
-    while let Some(word) = words.get(count)
-        && is_redirection_word(word)
-    {
-        // `>` names the next word; `>file` and `2>&1` carry their own
-        let bare = word
-            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
-            .trim_start_matches(['<', '>', '|', '&'])
-            .is_empty();
-        count += if bare { 2 } else { 1 };
+/// The string `args[index]` hands on, where it is `-c` or `--command`.
+fn command_option(args: &[String], index: usize) -> Option<String> {
+    let arg = args.get(index)?;
+    if let Some(value) = arg.strip_prefix("--command=") {
+        return Some(value.to_owned());
     }
-    count
+    matches!(arg.as_str(), "-c" | "--command")
+        .then(|| args.get(index + 1).cloned())
+        .flatten()
+}
+
+/// Makes the word at `program` the first of what is unwrapped next. The
+/// redirections between `start` and it still apply, so they are put right after
+/// it: ahead of every argument they were ahead of, which is what the rules that
+/// look at what comes before an argument go by. Returns where it now stands; the
+/// words before that are the ones being passed over.
+fn advance(command: &mut SimpleCommand, start: usize, own: &[usize], program: usize) -> usize {
+    let passed: Vec<usize> = own
+        .iter()
+        .copied()
+        .filter(|&i| i >= start && i < program)
+        .collect();
+    let redirections = (start..program).filter(|i| !passed.contains(i));
+    let order: Vec<usize> = passed
+        .iter()
+        .copied()
+        .chain([program])
+        .chain(redirections)
+        .collect();
+
+    let words: Vec<String> = order.iter().map(|&i| command.argv[i].clone()).collect();
+    let operators: Vec<bool> = order.iter().map(|&i| command.operators[i]).collect();
+    command.argv.splice(start..=program, words);
+    command.operators.splice(start..=program, operators);
+    start + passed.len()
+}
+
+/// Drops the words before `start`, which have been unwrapped.
+fn pass_over(command: &mut SimpleCommand, start: usize) {
+    command.argv.drain(..start);
+    command.operators.drain(..start);
+}
+
+/// `command` cut down to its program and its redirections, when it reads through
+/// one. For a program whose words are replaced by what they run (`eval`, `find
+/// -exec`): the shell opens the file all the same, whatever that text does.
+fn input_redirections(command: &SimpleCommand, start: usize) -> Option<SimpleCommand> {
+    let own = command.handed_words(start);
+    let kept: Vec<usize> = (start..command.argv.len())
+        .filter(|i| *i == start || !own.contains(i))
+        .collect();
+    let reads = kept
+        .iter()
+        .any(|&i| command.operators[i] && command.argv[i].contains('<'));
+
+    reads.then(|| SimpleCommand {
+        argv: kept.iter().map(|&i| command.argv[i].clone()).collect(),
+        operators: kept.iter().map(|&i| command.operators[i]).collect(),
+        ..command.clone()
+    })
 }
 
 /// Adds `command`, and whatever it runs, to `out`. A wrapper is replaced by
@@ -402,36 +469,39 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
     let mut start = 0;
     let mut hops = 0;
 
+    command.operators.resize(command.argv.len(), false);
+
     loop {
-        let words = &command.argv[start..];
-        let Some(program) = words.first().map(|word| command_name(word)) else {
+        // What the program is handed. `bash 2>x -c 'cat y'` runs the script
+        // all the same, so wrappers are read without the redirections (bd-ao5).
+        let own = command.handed_words(start);
+        let Some(&first) = own.first() else {
             break;
         };
+        if first != start {
+            start = advance(&mut command, start, &own, first);
+            continue;
+        }
+        let words: Vec<String> = own.iter().map(|&i| command.argv[i].clone()).collect();
+        let program = command_name(&words[0]);
 
         // each wrapper, and what it turns out to run, on the way down
-        let texts: Vec<&str> = words.iter().map(String::as_str).collect();
+        let texts: Vec<&str> = command.argv[start..].iter().map(String::as_str).collect();
         let unnamed = command.computed.contains(&words[0]);
         run.lookup_changed |= lookup::changes_lookup(&texts, unnamed);
 
         // The shell's `time` keyword is followed by a command, assignments and
         // all. They are passed over only once the check above has read them,
         // and before a value such as `/bin/sh` is read as a program's name.
-        let assigned = texts
+        let assigned = words
             .iter()
             .take_while(|word| super::is_shell_assignment(word))
             .count();
-        if assigned > 0 && assigned < texts.len() {
-            start += assigned;
-            continue;
-        }
-
-        // `2>/dev/null bash -c '...'` runs bash (bd-ao5). A redirection means
-        // the same after the command, where veil already reads it, so those
-        // ahead of it are moved to the end.
-        let redirections = leading_redirections(words);
-        if redirections > 0 && redirections < words.len() {
-            let moved: Vec<String> = command.argv.drain(start..start + redirections).collect();
-            command.argv.extend(moved);
+        if assigned > 0 && assigned < words.len() {
+            for word in &words[..assigned] {
+                read_variable_code(word, depth, run, out);
+            }
+            start = advance(&mut command, start, &own, own[assigned]);
             continue;
         }
 
@@ -447,7 +517,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
 
         if SHELLS.contains(&program) || program == "eval" {
             let is_eval = program == "eval";
-            let scripts = shell_scripts(words, is_eval, &command);
+            let scripts = shell_scripts(&words, &command.argv[start..], is_eval, &command);
             // likewise the text a shell or `eval` is handed to run
             run.lookup_changed |= if is_eval {
                 !command.unresolved.is_empty()
@@ -456,9 +526,13 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                     || scripts.iter().any(|text| command.computed.contains(text))
                     || lookup::shell_changes_lookup(program, &words[1..])
             };
-            command.argv.drain(..start);
             if !is_eval {
+                pass_over(&mut command, start);
                 emit(command, out);
+            } else if let Some(redirected) = input_redirections(&command, start) {
+                let mut redirected = redirected;
+                pass_over(&mut redirected, start);
+                emit(redirected, out);
             }
             for text in scripts {
                 script(&text, Origin::Wrapper, depth + 1, run, out);
@@ -466,7 +540,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
             return;
         }
 
-        let step = step(words);
+        let step = step(&words);
         // Computed text among what `env` reads as its own can be an option or
         // an assignment, or, split at its spaces, several.
         if program == "env" {
@@ -480,9 +554,29 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                 .any(|word| command.computed.contains(word));
         }
 
+        // `export`, `env` and `sudo` are handed assignments of their own
+        let handed = match (program, &step) {
+            ("export" | "declare" | "typeset" | "local" | "readonly", _) => words.get(1..),
+            ("env" | "sudo", Step::Skip { count, .. }) => words.get(1..*count),
+            ("env" | "sudo", Step::Done) => words.get(1..),
+            _ => None,
+        };
+        for word in handed.into_iter().flatten() {
+            read_variable_code(word, depth, run, out);
+        }
+
+        // Where the program's words are replaced by what they run, the shell
+        // still opens what the line reads from.
+        if matches!(step, Step::Script(_) | Step::Exec(_))
+            && let Some(mut redirected) = input_redirections(&command, start)
+        {
+            pass_over(&mut redirected, start);
+            emit(redirected, out);
+        }
+
         match step {
             Step::Done => {
-                let directories = native_directory_targets(words);
+                let directories = native_directory_targets(&words);
                 for directory in directories {
                     set_directory(&mut command, &directory);
                 }
@@ -493,7 +587,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                 dynamic,
                 directory,
             } => {
-                start += count;
+                start = advance(&mut command, start, &own, own[count]);
                 command.origin = Origin::Wrapper;
                 if dynamic {
                     command.unresolved.push(STDIN_ARGUMENTS.to_owned());
@@ -504,8 +598,17 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                     run.cwd_unresolved = command.cwd_unresolved;
                 }
             }
-            Step::Words(replacement, directory) => {
+            Step::Words(mut replacement, directory) => {
+                // the redirections go after the program, ahead of its words
+                let (kept, flags): (Vec<String>, Vec<bool>) = (start..command.argv.len())
+                    .filter(|i| !own.contains(i))
+                    .map(|i| (command.argv[i].clone(), command.operators[i]))
+                    .unzip();
+                let mut operators = vec![false; replacement.len()];
+                operators.splice(1..1, flags);
+                replacement.splice(1..1, kept);
                 command.argv = replacement;
+                command.operators = operators;
                 start = 0;
                 command.origin = Origin::Wrapper;
                 if let Some(directory) = directory {
@@ -516,17 +619,21 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
             }
             Step::Script(text) => {
                 script(&text, Origin::Wrapper, depth + 1, run, out);
+                // `sudo -s sh <<< 'cat x'`
+                if let Some(text) = here_string(&command.argv[start..]) {
+                    script(&text, Origin::Wrapper, depth + 1, run, out);
+                }
                 return;
             }
             Step::Also { count } => {
                 let mut written = command.clone();
-                written.argv.drain(..start);
+                pass_over(&mut written, start);
                 emit(written, out);
-                start += count;
+                start = advance(&mut command, start, &own, own[count]);
                 command.origin = Origin::Wrapper;
             }
             Step::AlsoScript(text) => {
-                command.argv.drain(..start);
+                pass_over(&mut command, start);
                 emit(command, out);
                 script(&text, Origin::Wrapper, depth + 1, run, out);
                 return;
@@ -538,6 +645,8 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                     // unresolved for the command it runs.
                     let inner = SimpleCommand {
                         argv,
+                        // `find` is handed these as they stand
+                        operators: Vec::new(),
                         cwd: command.cwd.clone(),
                         cwd_unresolved: command.cwd_unresolved,
                         redirects_in: Vec::new(),
@@ -566,33 +675,42 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
     }
 
     if start < command.argv.len() {
-        command.argv.drain(..start);
+        pass_over(&mut command, start);
         emit(command, out);
     }
 }
 
 /// The scripts a shell (or `eval`) runs: its `-c` string, else a here-string,
-/// else a here-document, which the shell reads from standard input.
-fn shell_scripts(words: &[String], eval: bool, command: &SimpleCommand) -> Vec<String> {
+/// else a here-document, which the shell reads from standard input. `words` is
+/// what the program is handed; `written` still has the redirections, where a
+/// here-string is.
+fn shell_scripts(
+    words: &[String],
+    written: &[String],
+    eval: bool,
+    command: &SimpleCommand,
+) -> Vec<String> {
     let args = &words[1..];
 
-    if eval {
-        let joined = args.join(" ");
-        return if joined.trim().is_empty() {
-            Vec::new()
-        } else {
-            vec![joined]
-        };
+    let own = if eval {
+        Some(args.join(" ")).filter(|joined| !joined.trim().is_empty())
+    } else {
+        command_string(args).map(str::to_owned)
+    };
+    // A here-string is read even beside a script of the shell's own, which can
+    // start a shell that runs it: `eval bash <<< 'cat x'`.
+    let fed = here_string(written);
+
+    if own.is_none() && fed.is_none() && !eval {
+        return command.heredoc_body.iter().cloned().collect();
     }
-    if let Some(text) = command_string(args) {
-        return vec![text.to_owned()];
-    }
-    if let Some(position) = args.iter().position(|arg| arg == "<<<")
-        && let Some(text) = args.get(position + 1)
-    {
-        return vec![text.clone()];
-    }
-    command.heredoc_body.iter().cloned().collect()
+    own.into_iter().chain(fed).collect()
+}
+
+/// The text of a `<<<` among a command's words.
+fn here_string(written: &[String]) -> Option<String> {
+    let position = written.iter().position(|arg| arg == "<<<")?;
+    written.get(position + 1).cloned()
 }
 
 /// The `-c` string of a shell invocation: `-c`, or a cluster holding `c` such

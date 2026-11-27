@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use super::expand::{self, Vars, Word};
 use super::{RedirectTarget, redirect, wrappers};
-use super::{collect_input_redirect_paths, is_redirection_word, is_shell_assignment, lookup};
+use super::{collect_input_redirect_paths, is_shell_assignment, lookup};
 
 pub use super::expand::ShellEnv;
 
@@ -105,6 +105,10 @@ impl Origin {
 pub struct SimpleCommand {
     /// The program and its arguments. Redirections stay in it, as written.
     pub argv: Vec<String>,
+    /// For each word of `argv`, whether it was written as a redirection. The
+    /// text does not show it: `bash -c '>x; cat y'` has a script that starts
+    /// with `>`.
+    pub operators: Vec<bool>,
     /// The working directory veil resolved for this command, when known.
     pub cwd: Option<PathBuf>,
     /// Its working directory depends on a path veil could not resolve.
@@ -149,6 +153,7 @@ impl SimpleCommand {
     pub fn opaque() -> Self {
         Self {
             argv: Vec::new(),
+            operators: Vec::new(),
             cwd: None,
             cwd_unresolved: false,
             redirects_in: Vec::new(),
@@ -162,6 +167,39 @@ impl SimpleCommand {
             heredoc_computed: false,
             lookup_changed: false,
         }
+    }
+
+    /// Where the words from `start` on that the program is handed stand: all
+    /// but the redirections and what they name, which the shell takes out
+    /// wherever they are written (bd-ao5).
+    pub(super) fn handed_words(&self, start: usize) -> Vec<usize> {
+        let operator = |i: usize| self.operators.get(i) == Some(&true);
+        let mut handed = Vec::new();
+        let mut i = start;
+
+        while i < self.argv.len() {
+            if operator(i) {
+                i += if names_the_next_word(&self.argv[i]) {
+                    2
+                } else {
+                    1
+                };
+                continue;
+            }
+            if !(operator(i + 1) && is_descriptor_variable(&self.argv[i])) {
+                handed.push(i);
+            }
+            i += 1;
+        }
+        handed
+    }
+
+    /// The arguments the program is handed.
+    pub(super) fn handed_args(&self) -> Vec<String> {
+        self.handed_words(1)
+            .into_iter()
+            .map(|i| self.argv[i].clone())
+            .collect()
     }
 
     pub fn is_opaque(&self) -> bool {
@@ -274,25 +312,31 @@ pub(super) fn read_stored_code(
     stored.failed || stored.truncated || stored.lookup_changed
 }
 
-/// The code bash runs out of a variable's value, where `word` sets one it does
-/// that with: the body of an exported function, or a substitution in `PS4`,
-/// `BASH_ENV` or `ENV`, which are expanded before use (bd-ao5).
-fn code_in_variable(word: &str) -> Option<String> {
-    let (name, value) = word.split_once('=')?;
-
-    if name.starts_with("BASH_FUNC_") {
-        return value.trim_start().strip_prefix("()").map(str::to_owned);
-    }
-    if !matches!(name, "PS4" | "BASH_ENV" | "ENV") || !(value.contains("$(") || value.contains('`'))
-    {
-        return None;
-    }
-    // inside double quotes a `'` is text, as it is when the value is expanded
-    Some(if value.contains('"') {
-        format!(": {value}")
+/// Reads the code bash runs out of a variable's value, where the assignment
+/// `word` sets one it does that with: the body of an exported function, or the
+/// substitutions in `PS4`, `BASH_ENV` or `ENV`, which are expanded before use
+/// whatever quotes stand around them (bd-ao5).
+pub(super) fn read_variable_code(
+    word: &str,
+    depth: usize,
+    run: &mut Run,
+    out: &mut Vec<SimpleCommand>,
+) {
+    let Some((name, value)) = word.split_once('=') else {
+        return;
+    };
+    let code = if name.starts_with("BASH_FUNC_") {
+        let body = value.trim_start().strip_prefix("()");
+        body.map(str::to_owned).into_iter().collect()
+    } else if matches!(name, "PS4" | "BASH_ENV" | "ENV") {
+        expansions(value)
     } else {
-        format!(": \"{value}\"")
-    })
+        Vec::new()
+    };
+
+    for text in code {
+        run.lookup_changed |= read_stored_code(&text, depth, run, out);
+    }
 }
 
 /// Decomposes one script (the whole command, a substitution body, a `-c`
@@ -396,10 +440,8 @@ fn script_body(
                         // `export` of the name hands its code to bash
                         for (name, written) in expand::assignment_words(&raw).into_iter().flatten()
                         {
-                            if let Some(value) = run.vars.value(&written, &run.env)
-                                && let Some(code) = code_in_variable(&format!("{name}={value}"))
-                            {
-                                run.lookup_changed |= read_stored_code(&code, depth, run, out);
+                            if let Some(value) = run.vars.value(&written, &run.env) {
+                                read_variable_code(&format!("{name}={value}"), depth, run, out);
                             }
                         }
                         continue;
@@ -415,13 +457,6 @@ fn script_body(
         };
 
         run.lookup_changed |= segment_changes_lookup(&words);
-        // wherever the assignment stands: ahead of a command, in `env`'s own
-        // words or after `export`
-        for word in &words {
-            if let Some(code) = code_in_variable(&word.text) {
-                run.lookup_changed |= read_stored_code(&code, depth, run, out);
-            }
-        }
 
         match words.first().map(|word| word.text.as_str()) {
             Some("if" | "while" | "until" | "for" | "select" | "case") => {
@@ -447,6 +482,14 @@ fn script_body(
         // what runs, so the script it runs sees it; the words of the command
         // itself were expanded without it.
         let prefix = prefix_assignments(&words);
+        // the assignments ahead of the command; those a builtin or `env` is
+        // handed are read where the command is unwrapped
+        for word in words
+            .iter()
+            .take_while(|word| is_shell_assignment(&word.text) || is_leading_keyword(&word.text))
+        {
+            read_variable_code(&word.text, depth, run, out);
+        }
         let Some(command) = simple_command(words, &segment, origin, &directory) else {
             continue;
         };
@@ -513,18 +556,15 @@ fn shell_directory_after(
     current: &CwdState,
     home: Option<&str>,
 ) -> Option<CwdState> {
-    let program = command.argv.first().map(|word| super::command_name(word))?;
+    // `2>/dev/null cd data` changes directory all the same
+    let handed = command.handed_words(0);
+    let (&first, rest) = handed.split_first()?;
+    let program = super::command_name(&command.argv[first]);
     if !matches!(program, "cd" | "pushd" | "popd") {
         return None;
     }
 
-    let mut args = command
-        .argv
-        .get(1..)?
-        .iter()
-        .filter(|word| !is_redirection_word(word))
-        .map(String::as_str)
-        .peekable();
+    let mut args = rest.iter().map(|&i| command.argv[i].as_str()).peekable();
     let mut end_options = false;
     let mut no_change = false;
     let mut target = None;
@@ -701,6 +741,7 @@ fn simple_command(
         words.split_off(start)
     };
     let mut argv = Vec::with_capacity(words.len());
+    let mut operators = Vec::with_capacity(words.len());
     let mut unresolved = Vec::new();
     let mut computed = Vec::new();
     for word in words {
@@ -709,12 +750,14 @@ fn simple_command(
             unresolved.push(written);
         }
         argv.push(word.text);
+        operators.push(word.operator);
     }
 
     Some(SimpleCommand {
         unresolved,
         computed,
         argv,
+        operators,
         cwd: cwd.path.clone(),
         cwd_unresolved: cwd.unresolved,
         redirects_in: Vec::new(),
@@ -726,6 +769,24 @@ fn simple_command(
         heredoc_computed: segment.heredoc_computed,
         lookup_changed: false,
     })
+}
+
+/// Whether the operator `word` is followed by what it names: `>` and `2>>` are,
+/// `>file` and `2>&1` carry their own.
+fn names_the_next_word(word: &str) -> bool {
+    word.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+        .trim_start_matches(['<', '>', '|', '&'])
+        .is_empty()
+}
+
+/// bash and zsh's `{name}`, which ahead of an operator names a variable that is
+/// given the descriptor.
+fn is_descriptor_variable(word: &str) -> bool {
+    word.strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|name| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
 }
 
 /// A wrapper may put what it runs in place of the line's own words (`eval`,

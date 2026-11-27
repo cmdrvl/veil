@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use super::decompose::SUBSTITUTION;
-use super::is_env_assignment;
+use super::{is_env_assignment, is_redirection_word};
 
 /// Brace expansion yields at most this many words from one word. A list that
 /// would yield more is left as written and reported as unresolved.
@@ -48,6 +48,8 @@ pub(super) const MAX_NAMED_UNRESOLVED: usize = 8;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Word {
     pub text: String,
+    /// Written as a redirection: its first byte, unquoted, starts an operator.
+    pub operator: bool,
     /// Set when something in the word could not be resolved: the word as it was
     /// written for the first [`MAX_NAMED_UNRESOLVED`] of a command, an empty
     /// string after that.
@@ -224,12 +226,14 @@ impl Vars {
                 words.push(Word {
                     text: written.to_owned(),
                     unresolved: Some(self.named_unresolved(written)),
+                    operator: false,
                 });
             } else if !needs_expansion(written) {
                 // Most words are plain text: nothing to expand or to unquote.
                 words.push(Word {
                     text: written.to_owned(),
                     unresolved: None,
+                    operator: is_redirection_word(written),
                 });
             } else if !written.contains('{') {
                 self.push_alternative(written, written, env, &mut words)?;
@@ -344,6 +348,8 @@ impl Vars {
         words.push(Word {
             text: processed.text,
             unresolved,
+            // as written: a quoted `>` or one out of a variable is an argument
+            operator: is_redirection_word(written),
         });
         Some(())
     }
@@ -769,6 +775,7 @@ pub(super) fn plain_words(text: &str) -> Option<Vec<Word>> {
                 words.push(Word {
                     text: text[begin..i].to_owned(),
                     unresolved: None,
+                    operator: is_redirection_word(&text[begin..i]),
                 });
                 start = None;
             }
@@ -781,6 +788,7 @@ pub(super) fn plain_words(text: &str) -> Option<Vec<Word>> {
         words.push(Word {
             text: text[begin..].to_owned(),
             unresolved: None,
+            operator: is_redirection_word(&text[begin..]),
         });
     }
 

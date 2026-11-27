@@ -333,6 +333,26 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path, names_stand: bool) ->
             PathExposure::ReadsContents,
         ),
     };
+    // The program is handed none of the redirections, and a reader below can
+    // stop at a bare one: `cat > out x.csv` reads x.csv. So the words it is
+    // handed are read too, which can only add to what is judged (bd-ao5).
+    let handed = command.handed_args();
+    if handed.len() < args.len() {
+        let more = match search_command_paths(
+            program,
+            &handed,
+            !command.redirects_in.is_empty(),
+            command.stdin_piped,
+        ) {
+            Some(search) => search.paths,
+            None => command_paths(program, &handed).unwrap_or_default(),
+        };
+        for path in more {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
     paths.extend(command.redirects_in.iter().cloned());
     paths.extend(collect_inline_interpreter_paths(program, args));
     if let Some(body) = &command.heredoc_body {

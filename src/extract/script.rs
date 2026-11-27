@@ -173,7 +173,7 @@ fn inline_programs(command: &SimpleCommand) -> (Option<exec::Language>, Vec<Stri
 
     if texts.is_empty()
         && let Some(kind) = interpreter_kind(name)
-        && script_operand(kind, name, args) == Operand::Stdin
+        && script_operand(kind, name, &command.handed_args()) == Operand::Stdin
     {
         if let Some(body) = &command.heredoc_body {
             texts.push(body.clone());
@@ -682,8 +682,10 @@ fn computed(program: &str, name: &str, source: ScriptSource) -> CommandExtractio
 // ---- which script a command runs --------------------------------------------
 
 fn find_script(command: &SimpleCommand, cwd: &Path, scripts: &Scripts) -> Option<Run> {
-    let (program, args) = command.argv.split_first()?;
+    let program = command.argv.first()?;
     let base = command_name(program);
+    // in `bash > out read.sh` the script is read.sh
+    let args = &command.handed_args();
 
     if let Some(kind) = interpreter_kind(base) {
         let name = match script_operand(kind, base, args) {
