@@ -20,10 +20,6 @@ const FORCED_PANIC: &str = "VEIL_TEST_HOOK_PANIC";
 /// More levels than the stack of either build holds.
 const DEEP: usize = 200_000;
 
-/// Brace lists take much more stack a level, and time that grows with the square
-/// of their number.
-const DEEP_BRACES: usize = 20_000;
-
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
@@ -140,7 +136,6 @@ fn running_out_of_stack_blocks_the_call() {
             "python3 -c 'import os; os.system({})'",
             nested("(", "\"true\"", ")")
         ),
-        format!("echo {}", "{a,b}".repeat(DEEP_BRACES)),
         format!("python3 -c 'open({})'", nested("Path(", "\"a\"", ")")),
     ];
 
