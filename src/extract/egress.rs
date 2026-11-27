@@ -10,6 +10,7 @@
 //! like any other word.
 
 use super::command_name;
+use super::decompose::{PROCESS_SUBSTITUTION, SUBSTITUTION};
 
 /// Programs whose purpose is to send. Any protected path one of them is given
 /// is on its way off the machine, whatever the option that carries it.
@@ -56,21 +57,20 @@ pub(super) fn operand_paths(program: &str, args: &[String]) -> Vec<String> {
     }
 }
 
-/// The short options and long options of a web client that take no value, so the
-/// word after one is an address. An option missing here fails toward judging the
+/// The short and long options of a web client that take no value, so the word
+/// after one is not its value. An option missing here fails toward judging that
 /// word as a path.
-struct AddressOptions {
-    flags: &'static str,
-    long_flags: &'static [&'static str],
-    /// Options whose value is text or an address, never a file to open: a
-    /// header, a referrer. (`-H @file` is a file, and is told by its `@`.)
-    text_values: &'static [&'static str],
+struct ValuelessOptions {
+    short: &'static str,
+    long: &'static [&'static str],
 }
 
-const CURL: AddressOptions = AddressOptions {
-    flags: "sSLfiIkvOgNJRG46#",
-    long_flags: &[
+const CURL: ValuelessOptions = ValuelessOptions {
+    short: "sSLfiIkvOgNJRG46#",
+    long: &[
         "--",
+        // takes a value, and it is an address
+        "--url",
         "--silent",
         "--show-error",
         "--location",
@@ -94,20 +94,11 @@ const CURL: AddressOptions = AddressOptions {
         "--ipv4",
         "--ipv6",
     ],
-    text_values: &[
-        "--url",
-        "-H",
-        "--header",
-        "-e",
-        "--referer",
-        "-A",
-        "--user-agent",
-    ],
 };
 
-const WGET: AddressOptions = AddressOptions {
-    flags: "qvcNSr",
-    long_flags: &[
+const WGET: ValuelessOptions = ValuelessOptions {
+    short: "qvcNSr",
+    long: &[
         "--",
         "-nv",
         "-nc",
@@ -126,13 +117,11 @@ const WGET: AddressOptions = AddressOptions {
         "--recursive",
         "--no-parent",
     ],
-    text_values: &["--header", "--referer", "-U", "--user-agent"],
 };
 
-/// `gh api` only: other `gh` commands open the files they are given.
-const GH_API: AddressOptions = AddressOptions {
-    flags: "i",
-    long_flags: &[
+const GH_API: ValuelessOptions = ValuelessOptions {
+    short: "i",
+    long: &[
         "--",
         "--include",
         "--paginate",
@@ -140,43 +129,78 @@ const GH_API: AddressOptions = AddressOptions {
         "--slurp",
         "--verbose",
     ],
-    text_values: &["-H", "--header"],
 };
 
-/// Whether `word`, which follows `before` among a web client's arguments, is one
-/// the client takes as an address or as text, never as a local file (bd-ov7).
-pub(super) fn takes_as_address(program: &str, before: &[&str], word: &str) -> bool {
-    let options = match command_name(program) {
+/// Whether `word`, which follows `before` among the arguments of `program`, is a
+/// web address that `curl`, `wget` or `gh api` only fetches, so it names no
+/// local file (bd-a5g, bd-ov7).
+///
+/// `program` is the word as written: `./curl` and `/tmp/curl` may be any
+/// program. The caller must also know that nothing in the command changes what
+/// the bare name runs. The word must be the whole address (or curl's
+/// `--url=` one) where the client takes an address, and not the value of
+/// another option, such as a file to upload.
+pub(super) fn is_fetched_address(program: &str, before: &[&str], word: &str) -> bool {
+    let options = match program {
         "curl" => &CURL,
         "wget" => &WGET,
         "gh" if before.first() == Some(&"api") => &GH_API,
         _ => return false,
     };
-    let previous = before.last().copied();
 
-    if previous.is_some_and(|option| options.text_values.contains(&option)) {
-        return !word.starts_with('@');
-    }
-    // `--url=https://...`, `--header=Referer: https://...`
-    if let Some((option, value)) = word.split_once('=')
-        && option.starts_with("--")
+    if program == "curl"
+        && let Some(value) = word.strip_prefix("--url=")
     {
-        return options.text_values.contains(&option) && !value.starts_with('@');
+        return is_whole_web_address(value);
     }
-
-    let lower = word.to_ascii_lowercase();
-    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+    if !is_whole_web_address(word) {
         return false;
     }
-    previous.is_none_or(|previous| {
-        !previous.starts_with('-')
-            || options.long_flags.contains(&previous)
-            // `-sSL`; `-qO-`, which writes to standard output
-            || previous.strip_prefix('-').is_some_and(|letters| {
-                let letters = letters.strip_suffix("O-").unwrap_or(letters);
-                !letters.is_empty() && letters.chars().all(|letter| options.flags.contains(letter))
-            })
+
+    before.last().is_none_or(|&previous| {
+        if let Some(letters) = previous.strip_prefix('-') {
+            // `-sSL`; wget's `-qO-` writes to standard output
+            let letters = match program {
+                "wget" => letters.strip_suffix("O-").unwrap_or(letters),
+                _ => letters,
+            };
+            options.long.contains(&previous)
+                || (!letters.is_empty()
+                    && letters.chars().all(|letter| options.short.contains(letter)))
+        } else {
+            // text only running the command would show may be any option
+            !previous.starts_with(['$', SUBSTITUTION, PROCESS_SUBSTITUTION])
+        }
     })
+}
+
+/// Whether the whole of `word` is one plain `http` or `https` address that names
+/// a host as the web does (a dotted name, `localhost` or a bracketed number) and
+/// has no `..`. Anything else in it, a space, a quote or something the shell
+/// computes, and it is not.
+fn is_whole_web_address(word: &str) -> bool {
+    let Some((scheme, rest)) = word.split_once("://") else {
+        return false;
+    };
+    let plain = |byte: u8| byte.is_ascii_graphic() && !b"$`'\"()<>|;\\{}".contains(&byte);
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || !rest.bytes().all(plain)
+        || rest
+            .split(['/', '?', '#', '&', '='])
+            .any(|part| part == "..")
+    {
+        return false;
+    }
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    if host.starts_with('[') {
+        return true;
+    }
+    let name = host.split(':').next().unwrap_or_default();
+
+    name.starts_with(|first: char| first.is_ascii_alphanumeric())
+        && (name.trim_end_matches('.').contains('.') || name.eq_ignore_ascii_case("localhost"))
 }
 
 /// Files an `ftp`, `sftp` or `lftp` script sends: the `put` lines of a

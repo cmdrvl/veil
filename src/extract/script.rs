@@ -21,20 +21,12 @@
 //! A file run by name (`./x.py`) is read when its first line names an
 //! interpreter. A Python directory runs its `__main__.py`.
 //!
-//! An `http` or `https` address is not read as a path in a script, in the code a
-//! command hands an interpreter, or where `curl`, `wget` or `gh api` takes one
-//! (bd-a5g, bd-ov7). A local link or directory named `https:` can make the same
-//! text a local path, so scripts and inline code are judged as paths in a call
-//! that shows signs of making one ([`may_make_a_scheme_entry`], `ln`). One made
-//! by a name or call veil cannot see is not caught.
-//!
 //! This is best effort, and the remediation says so. A script that builds a path
 //! at run time, takes it from the environment or a file, or imports a module
 //! that does, is not seen; only an OS sandbox is airtight. A script larger than
 //! [`SCRIPT_LIMIT`], or the 17th script of one command, is not read: it is denied
 //! where a protected path is in reach, and allowed with a record where none is.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -73,50 +65,13 @@ pub(super) struct Scripts {
     read: usize,
     bytes: u64,
     written: Written,
-    /// The call may make a local entry that a web address would then name, so
-    /// no address in its scripts or inline code is blanked.
-    addresses_may_be_local: bool,
 }
 
 impl Scripts {
     /// The writes of `commands`, which the scripts they run are read against.
     pub(super) fn collect_writes(&mut self, commands: &[SimpleCommand], cwd: &Path) {
         self.written.collect(commands, cwd);
-        self.addresses_may_be_local |= commands.iter().any(|command| {
-            command
-                .argv
-                .first()
-                .is_some_and(|program| matches!(command_name(program), "ln" | "link"))
-        });
     }
-
-    /// Notes what the text of a command or script shows it may make.
-    pub(super) fn note_text(&mut self, text: &str) {
-        self.addresses_may_be_local |= may_make_a_scheme_entry(text);
-    }
-
-    pub(super) fn addresses_may_be_local(&self) -> bool {
-        self.addresses_may_be_local
-    }
-}
-
-/// Whether `text` names `http:` or `https:` as something other than the start of
-/// an address (`ln -s . https:`), or calls something that makes links.
-fn may_make_a_scheme_entry(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    let links = ["symlink", "linksync", "hardlink_to", "os.link(", "ln_s"];
-
-    links.iter().any(|call| text.contains(call))
-        || text.match_indices("http").any(|(start, found)| {
-            let begins_word = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
-            let rest = &text[start + found.len()..];
-            let rest = rest.strip_prefix('s').unwrap_or(rest);
-
-            begins_word
-                && rest
-                    .strip_prefix(':')
-                    .is_some_and(|after| !after.starts_with("//"))
-        })
 }
 
 /// The script a simple command runs, when it runs one.
@@ -168,9 +123,7 @@ pub(super) fn inspect(
             let source = source(None);
             let candidates =
                 normalize_candidates(extract_interpreter_script_paths(run.kind, &text), cwd);
-            scripts.note_text(&text);
-            let local = scripts.addresses_may_be_local();
-            let argv_paths = path_words(run.kind, &text, &candidates, cwd, local);
+            let argv_paths = path_words(run.kind, &text, &candidates, cwd);
             let mut found = extraction(&run.program, &run.name, source.clone());
 
             if !candidates.is_empty() {
@@ -267,7 +220,7 @@ fn inspect_inline(
             .iter()
             .any(|text| !exec::find(language, text).commands.is_empty())
         {
-            let mut found = command_extraction(command, cwd, scripts.addresses_may_be_local());
+            let mut found = command_extraction(command, cwd, false);
 
             found.origin = Origin::Wrapper;
             found.opaque = true;
@@ -304,7 +257,7 @@ fn typed_commands(
 
     for inner in commands {
         let inner_cwd = inner.cwd.as_deref().unwrap_or(cwd);
-        let mut found = command_extraction(&inner, inner_cwd, scripts.addresses_may_be_local());
+        let mut found = command_extraction(&inner, inner_cwd, false);
 
         // run by the interpreter, as `sh -c` runs its string. Text veil cannot
         // analyse comes back opaque from `command_extraction`.
@@ -365,9 +318,7 @@ fn inspect_awk(
                 let mut found = extraction(program, &name, source.clone());
 
                 // awk's strings are the double-quoted kind, and `#` starts a comment
-                scripts.note_text(&text);
-                let local = scripts.addresses_may_be_local();
-                found.argv_paths = path_words(InterpreterKind::Perl, &text, &[], cwd, local);
+                found.argv_paths = path_words(InterpreterKind::Perl, &text, &[], cwd);
                 found.argv_exposure = PathExposure::ReadsContents;
                 out.push(found);
 
@@ -405,7 +356,7 @@ fn shell_commands(
             continue;
         }
         let inner_cwd = inner.cwd.as_deref().unwrap_or(cwd);
-        let mut found = command_extraction(&inner, inner_cwd, scripts.addresses_may_be_local());
+        let mut found = command_extraction(&inner, inner_cwd, false);
 
         found.origin = Origin::Script;
         found.script = Some(ScriptSource {
@@ -1177,19 +1128,13 @@ struct Word {
 /// script builds from literals, then the strings and words with a slash, then
 /// the bare file names. The first [`FILESYSTEM_BUDGET`] are checked against the
 /// filesystem; the rest are compared with the protected patterns as text.
-fn path_words(
-    kind: InterpreterKind,
-    text: &str,
-    already: &[PathBuf],
-    cwd: &Path,
-    local_addresses: bool,
-) -> Vec<ArgvPath> {
+fn path_words(kind: InterpreterKind, text: &str, already: &[PathBuf], cwd: &Path) -> Vec<ArgvPath> {
     let mut found = Vec::new();
     let mut seen: HashSet<PathBuf> = already.iter().cloned().collect();
     let mut resolver = ArgvResolver::new(cwd);
     let mut budget = FILESYSTEM_BUDGET;
 
-    for word in words(kind, text, cwd, local_addresses) {
+    for word in words(kind, text) {
         let resolved = budget > 0;
         let path = if resolved {
             budget -= 1;
@@ -1210,16 +1155,7 @@ fn path_words(
     found
 }
 
-fn words(kind: InterpreterKind, text: &str, cwd: &Path, local_addresses: bool) -> Vec<Word> {
-    let blanked = |text: &'_ str| -> Option<String> {
-        if local_addresses {
-            return None;
-        }
-        match without_web_addresses(text, cwd) {
-            Cow::Owned(rest) => Some(rest),
-            Cow::Borrowed(_) => None,
-        }
-    };
+fn words(kind: InterpreterKind, text: &str) -> Vec<Word> {
     let tokens = lex(kind, text);
     let folder = Folder::new(&tokens);
     let mut words: Vec<Word> = Vec::new();
@@ -1241,14 +1177,6 @@ fn words(kind: InterpreterKind, text: &str, cwd: &Path, local_addresses: bool) -
         });
     };
 
-    // a word holding a web address is not a path (bd-a5g); what else its text
-    // holds is still found word by word below
-    let mut add = |word: &str, certain: bool| {
-        if blanked(word).is_none() {
-            add(word, certain);
-        }
-    };
-
     // what the script builds out of literals
     for built in folder.built() {
         add(&built, built.contains('/'));
@@ -1265,8 +1193,6 @@ fn words(kind: InterpreterKind, text: &str, cwd: &Path, local_addresses: bool) -
 
     // any word of the text, comments and all: no reading of the syntax is
     // needed to see `data/clients/a.csv`, and none can be led astray
-    let rest = blanked(text);
-    let text = rest.as_deref().unwrap_or(text);
     let mut bare: Vec<&str> = Vec::new();
     for word in text.split(is_separator) {
         if word.contains('/') {
@@ -1290,142 +1216,6 @@ fn words(kind: InterpreterKind, text: &str, cwd: &Path, local_addresses: bool) -
     }
 
     words
-}
-
-/// bd-a5g: `text` with its `http://` and `https://` addresses blanked out.
-/// Split into words, `https://host/data/x` leaves `//host/data/x`, which reads
-/// as an absolute path under `data/`.
-///
-/// An address is blanked only when it is unlikely to be a local path too: it
-/// starts a word, names a web host, climbs with no `..`, and no entry named
-/// `https:` (or `http:`) is in `cwd`. What it holds in braces is code and is kept. Borrowed
-/// means there was nothing to blank.
-pub(super) fn without_web_addresses<'a>(text: &'a str, cwd: &Path) -> Cow<'a, str> {
-    let bytes = text.as_bytes();
-    let mut kept = String::new();
-    let mut copied = 0;
-    // where the last address looked at ends: each is read once, kept or not, so
-    // that a long word of `=http://` is not read again from every one of them
-    let mut scanned = 0;
-
-    for (separator, _) in text.match_indices("://") {
-        let Some(start) = web_scheme_start(bytes, separator) else {
-            continue;
-        };
-        let host = separator + 3;
-        if start < scanned
-            || !bytes
-                .get(host)
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'[')
-        {
-            continue;
-        }
-
-        let (end, literal, code) = web_address(text, host);
-        scanned = end;
-        if !names_a_web_host(&literal)
-            || climbs(&literal)
-            || fs::symlink_metadata(cwd.join(&text[start..=separator])).is_ok()
-        {
-            continue;
-        }
-
-        kept.push_str(&text[copied..start]);
-        kept.push(' ');
-        kept.push_str(&code);
-        copied = end;
-    }
-
-    if copied == 0 {
-        return Cow::Borrowed(text);
-    }
-    kept.push_str(&text[copied..]);
-    Cow::Owned(kept)
-}
-
-fn climbs(address: &str) -> bool {
-    address
-        .split(['/', '?', '#', '&', '='])
-        .any(|segment| segment == "..")
-}
-
-/// Whether the whole of `text` is one `http` or `https` address, as a library
-/// that fetches addresses (pandas) takes it.
-pub(super) fn is_web_address(text: &str) -> bool {
-    let Some(separator) = text.find("://") else {
-        return false;
-    };
-
-    web_scheme_start(text.as_bytes(), separator) == Some(0)
-        && !text.contains(char::is_whitespace)
-        && names_a_web_host(&text[separator + 3..])
-        && !climbs(&text[separator + 3..])
-}
-
-/// Whether the address whose own characters are `address` names a host as the
-/// web does: a dotted name, `localhost` or a bracketed number. `https://data/x`
-/// may be the local `data/x`, seen through a link named `https:`.
-fn names_a_web_host(address: &str) -> bool {
-    let authority = address.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or_default();
-    if host.starts_with('[') {
-        return true;
-    }
-    let name = host.split(':').next().unwrap_or_default();
-    name.trim_end_matches('.').contains('.') || name.eq_ignore_ascii_case("localhost")
-}
-
-/// Where the scheme before the `://` at `separator` starts, when it is `http` or
-/// `https` and begins a word.
-fn web_scheme_start(bytes: &[u8], separator: usize) -> Option<usize> {
-    ["https", "http"].iter().find_map(|scheme| {
-        let start = separator.checked_sub(scheme.len())?;
-        let begins_word = start == 0 || {
-            let before = bytes[start - 1];
-            !before.is_ascii_alphanumeric() && !b"+-._/".contains(&before)
-        };
-        (begins_word && bytes[start..separator].eq_ignore_ascii_case(scheme.as_bytes()))
-            .then_some(start)
-    })
-}
-
-/// The address whose host starts at `from`: where it ends, its own characters,
-/// and the code between its braces.
-fn web_address(text: &str, from: usize) -> (usize, String, String) {
-    let mut literal = String::new();
-    let mut code = String::new();
-    let mut depth = 0_usize;
-
-    for (offset, character) in text[from..].char_indices() {
-        let index = from + offset;
-        match character {
-            '\n' => return (index, literal, code),
-            '{' => {
-                depth += 1;
-                code.push(' ');
-            }
-            '}' if depth > 0 => {
-                depth -= 1;
-                code.push(' ');
-            }
-            _ if depth > 0 => code.push(character),
-            '\'' | '"' | '`' | '(' | ')' | '<' | '>' | ';' | '|' | '\\' | ',' | '}' => {
-                return (index, literal, code);
-            }
-            // `&` joins the parts of a query; `&&` and `& ` end a command
-            '&' if text[index + 1..]
-                .chars()
-                .next()
-                .is_none_or(|next| next == '&' || next.is_whitespace()) =>
-            {
-                return (index, literal, code);
-            }
-            _ if character.is_whitespace() => return (index, literal, code),
-            _ => literal.push(character),
-        }
-    }
-
-    (text.len(), literal, code)
 }
 
 fn is_separator(character: char) -> bool {
@@ -2014,7 +1804,7 @@ mod tests {
     }
 
     fn texts(kind: InterpreterKind, script: &str) -> Vec<String> {
-        words(kind, script, Path::new("."), false)
+        words(kind, script)
             .into_iter()
             .map(|word| word.text)
             .collect()
@@ -2327,24 +2117,6 @@ p = os.path.join(BASE, "a.csv")"#
     }
 
     #[test]
-    fn addresses_made_to_be_read_again_and_again_are_read_in_linear_time() {
-        // each `://` of one long word used to be read on to the end of the word,
-        // when the address it began was kept
-        let word = "=http://a".repeat(30_000);
-
-        let started = std::time::Instant::now();
-        assert!(matches!(
-            without_web_addresses(&word, Path::new(".")),
-            Cow::Borrowed(_)
-        ));
-        assert!(
-            started.elapsed().as_secs() < 2,
-            "took {:?}",
-            started.elapsed()
-        );
-    }
-
-    #[test]
     fn a_file_built_to_make_the_builder_slow_is_still_read_in_linear_time() {
         // Without a bound on the work at each token, `join(` repeated makes
         // every token scan the rest of the file.
@@ -2467,7 +2239,7 @@ p = os.path.join(BASE, "a.csv")"#
         }
         script.push_str("y = open('data/clients/a.csv')\n");
 
-        let paths = path_words(InterpreterKind::Python, &script, &[], &dir, false);
+        let paths = path_words(InterpreterKind::Python, &script, &[], &dir);
         let wanted = dir.join("data/clients/a.csv");
 
         assert!(

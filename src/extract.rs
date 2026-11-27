@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -52,20 +51,6 @@ const PYTHON_DIRECT_READ_CALLS: &[&str] = &[
     "genfromtxt",
 ];
 const PYTHON_PATH_READ_METHODS: &[&str] = &["read_text", "read_bytes", "open"];
-/// pandas readers that fetch a string which is a web address. `open` and the
-/// rest open it as a local path.
-const PYTHON_ADDRESS_READ_CALLS: &[&str] = &[
-    "read_csv",
-    "read_table",
-    "read_fwf",
-    "read_json",
-    "read_excel",
-    "read_parquet",
-    "read_feather",
-    "read_orc",
-    "read_stata",
-    "read_xml",
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InterpreterKind {
@@ -254,17 +239,13 @@ pub fn extract_bash_commands(command: &str, cwd: &Path) -> Vec<CommandExtraction
     let simple_commands = decompose_in(command, &env);
     // A script the string writes is read as written, not as it is on disk now.
     scripts.collect_writes(&simple_commands, cwd);
-    scripts.note_text(command);
     let lookup_changed = simple_commands.iter().any(|simple| simple.lookup_changed);
 
     for simple in simple_commands {
         let cwd = simple.cwd.as_deref().unwrap_or(cwd);
 
-        commands.push(command_extraction(
-            &simple,
-            cwd,
-            scripts.addresses_may_be_local(),
-        ));
+        // a change anywhere in the string can reach any name in it
+        commands.push(command_extraction(&simple, cwd, !lookup_changed));
         // An interpreter run on a script file: what is in the file is read too.
         script::inspect(&simple, cwd, &env, 0, &mut scripts, &mut commands);
     }
@@ -309,13 +290,10 @@ fn script_stdin<'a>(command: &'a SimpleCommand, args: &'a [String]) -> sed::Stdi
     }
 }
 
-/// `local_addresses`: the call may make a local entry that a web address in
-/// interpreter code would name.
-fn command_extraction(
-    command: &SimpleCommand,
-    cwd: &Path,
-    local_addresses: bool,
-) -> CommandExtraction {
+/// `names_stand`: the command is in the string the agent typed, and nothing in
+/// that string changes what a name runs. A command read from a script or from
+/// interpreter code is never so.
+fn command_extraction(command: &SimpleCommand, cwd: &Path, names_stand: bool) -> CommandExtraction {
     let assigned_paths = assigned_paths(&command.assigned, cwd);
 
     let Some((program, args)) = command.argv.split_first() else {
@@ -449,7 +427,7 @@ fn command_extraction(
             exposure == PathExposure::ReadsContents,
             &candidates,
             cwd,
-            local_addresses,
+            names_stand,
         );
         (paths, exposure, scans_directories)
     };
@@ -739,14 +717,14 @@ fn argv_paths(
     reads: bool,
     already: &[PathBuf],
     cwd: &Path,
-    local_addresses: bool,
+    names_stand: bool,
 ) -> Vec<ArgvPath> {
     let mut found: Vec<ArgvPath> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = already.iter().cloned().collect();
     let mut budget = ARGV_FILESYSTEM_BUDGET;
     let mut resolver = ArgvResolver::new(cwd);
 
-    for word in argv_path_words(program, args, named, cwd, local_addresses) {
+    for word in argv_path_words(program, args, named, names_stand) {
         let mut resolve = |raw: &str, found: &mut Vec<ArgvPath>| {
             let resolved = budget > 0;
             let path = if resolved {
@@ -792,42 +770,21 @@ struct PathWord {
     certain: bool,
 }
 
-/// The code a language interpreter is handed in its own words (`-c`, `-e`).
-/// Its other arguments are not code: the program may open any of them.
-fn interpreter_code(program: &str, args: &[String]) -> Vec<String> {
-    let mut code = exec::programs(program, args).inline;
-
-    // Python takes one `-c`; a later one is an argument of the code
-    if interpreter_kind(program) == Some(InterpreterKind::Python) {
-        code.truncate(1);
-    }
-    code
-}
-
 /// The words of a command that may name a path, in order, without
 /// duplicates. Besides whole words it takes the value of `--opt=value` and
 /// `key=value` (curl's `file=@x.csv`), drops a leading `@` or `<`, and takes
 /// each quoted literal inside a longer word (`select * from 'x.csv'`,
 /// `open('x.csv')`). The script handed to a shell is skipped: the decomposer
 /// runs it as commands of its own. `named` are added last, as certain paths.
-/// A web address is not a path where a web client takes it as an address
-/// ([`egress::takes_as_address`]) or in an interpreter's inline code, unless
-/// `local_addresses` (bd-ov7). What else such a word holds is read piece by
-/// piece. Everywhere else, a file a client uploads or an interpreter's argument
-/// included, the word is judged as any other.
+/// A web address `curl`, `wget` or `gh api` only fetches is not a path, where
+/// `names_stand` ([`egress::is_fetched_address`]).
 fn argv_path_words(
     program: &str,
     args: &[String],
     named: &[String],
-    cwd: &Path,
-    local_addresses: bool,
+    names_stand: bool,
 ) -> Vec<PathWord> {
     let mut words: Vec<PathWord> = Vec::new();
-    let code = if local_addresses {
-        Vec::new()
-    } else {
-        interpreter_code(command_name(program), args)
-    };
     let mut add = |text: &str| {
         let text = text.trim_start_matches(['@', '<']);
         let shaped = path_shaped(text);
@@ -863,45 +820,30 @@ fn argv_path_words(
             continue;
         }
 
-        let address = code.iter().any(|text| text == word)
-            || egress::takes_as_address(program, &operands[..index], word);
-        // what is left of an address word once its addresses are blanked
-        let rest = match script::without_web_addresses(word, cwd) {
-            Cow::Owned(rest) if address => Some(rest),
-            _ => None,
-        };
-        let pieces: Vec<&str> = match &rest {
-            None => vec![word],
-            Some(rest) => {
-                for literal in quoted_literals(rest) {
-                    add(literal.trim());
-                }
-                rest.split_whitespace().collect()
-            }
-        };
+        if names_stand && egress::is_fetched_address(program, &operands[..index], word) {
+            continue;
+        }
 
-        for word in pieces {
-            let option = !options_ended && word.starts_with('-') && word.len() > 1;
-            if !option {
-                add(word);
-            } else if !word.starts_with("--")
-                && let Some(attached) = word.get(2..)
-                && path_shaped(attached)
-            {
-                // `-fdata/x.csv`, `-C/srv/data`: a short option with its value attached.
-                add(attached);
-            }
-            if let Some((_, value)) = word.split_once('=') {
-                add(value);
-            }
-            // `git show HEAD:data/x.csv`, `scp data/x.csv host:/tmp`, `rsync host:x .`
-            if let Some((_, tail)) = word.rsplit_once(':') {
-                add(tail);
-            }
-            if word.contains(['\'', '"']) {
-                for literal in quoted_literals(word) {
-                    add(literal);
-                }
+        let option = !options_ended && word.starts_with('-') && word.len() > 1;
+        if !option {
+            add(word);
+        } else if !word.starts_with("--")
+            && let Some(attached) = word.get(2..)
+            && path_shaped(attached)
+        {
+            // `-fdata/x.csv`, `-C/srv/data`: a short option with its value attached.
+            add(attached);
+        }
+        if let Some((_, value)) = word.split_once('=') {
+            add(value);
+        }
+        // `git show HEAD:data/x.csv`, `scp data/x.csv host:/tmp`, `rsync host:x .`
+        if let Some((_, tail)) = word.rsplit_once(':') {
+            add(tail);
+        }
+        if word.contains(['\'', '"']) {
+            for literal in quoted_literals(word) {
+                add(literal);
             }
         }
     }
@@ -1879,13 +1821,7 @@ fn extract_python_script_paths(script: &str) -> Vec<String> {
                         && let Some((path, call_end)) =
                             parse_first_python_path_argument(script, after_name + 1)
                     {
-                        // a `Path` of an address is a local path
-                        let fetched = PYTHON_ADDRESS_READ_CALLS.contains(&suffix)
-                            && script::is_web_address(&path)
-                            && !script[after_name..call_end].contains("Path");
-                        if !fetched {
-                            paths.push(path);
-                        }
+                        paths.push(path);
                         index = call_end;
                         continue;
                     }
