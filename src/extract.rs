@@ -809,8 +809,13 @@ fn argv_path_words(
         add(program);
     }
 
-    let operands = strip_redirection_words(args);
-    for (index, &word) in operands.iter().enumerate() {
+    // as written: what a word follows includes the redirections
+    let written: Vec<&str> = args.iter().map(String::as_str).collect();
+    for (index, &word) in written.iter().enumerate() {
+        if is_redirection_word(word) {
+            continue;
+        }
+
         if word == "--" && !options_ended {
             options_ended = true;
             continue;
@@ -820,7 +825,7 @@ fn argv_path_words(
             continue;
         }
 
-        if names_stand && egress::is_fetched_address(program, &operands[..index], word) {
+        if names_stand && egress::is_fetched_address(program, &written[..index], word) {
             continue;
         }
 

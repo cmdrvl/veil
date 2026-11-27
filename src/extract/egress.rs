@@ -9,6 +9,8 @@
 //! those files. Each is only a candidate: it is denied when it is protected,
 //! like any other word.
 
+use std::net::Ipv6Addr;
+
 use super::command_name;
 use super::decompose::{PROCESS_SUBSTITUTION, SUBSTITUTION};
 
@@ -131,15 +133,32 @@ const GH_API: ValuelessOptions = ValuelessOptions {
     ],
 };
 
+/// What may make the shell turn one written word into others: a glob, a brace
+/// list or something it computes.
+const MAY_BE_REWRITTEN: &[char] = &[
+    '*',
+    '?',
+    '[',
+    '{',
+    '}',
+    '(',
+    '`',
+    '$',
+    SUBSTITUTION,
+    PROCESS_SUBSTITUTION,
+];
+
 /// Whether `word`, which follows `before` among the arguments of `program`, is a
-/// web address that `curl`, `wget` or `gh api` only fetches, so it names no
-/// local file (bd-a5g, bd-ov7).
+/// web address that `curl`, `wget` or `gh api` takes to fetch, and so is not
+/// judged as the name of a local file (bd-a5g, bd-ov7).
 ///
 /// `program` is the word as written: `./curl` and `/tmp/curl` may be any
-/// program. The caller must also know that nothing in the command changes what
-/// the bare name runs. The word must be the whole address (or curl's
-/// `--url=` one) where the client takes an address, and not the value of
-/// another option, such as a file to upload.
+/// program. `before` is every argument ahead of `word`, redirections included.
+/// The caller must also know that nothing in the command changes what the bare
+/// name runs; veil cannot see what was changed before the command. The word
+/// must be a whole address (or curl's `--url=` one), must not follow an option
+/// that may take it as a value, such as a file to upload, and must not follow a
+/// word the shell may rewrite. This says nothing about what a client writes.
 pub(super) fn is_fetched_address(program: &str, before: &[&str], word: &str) -> bool {
     let options = match program {
         "curl" => &CURL,
@@ -148,12 +167,19 @@ pub(super) fn is_fetched_address(program: &str, before: &[&str], word: &str) -> 
         _ => return false,
     };
 
-    if program == "curl"
-        && let Some(value) = word.strip_prefix("--url=")
-    {
-        return is_whole_web_address(value);
+    // The shell takes redirections and what they name out of the arguments, so
+    // the word written before another may not be the one the client gets before
+    // it. Each form has a `<` or a `>`: with one anywhere ahead, veil does not
+    // work out which word that is.
+    if before.iter().any(|earlier| earlier.contains(['<', '>'])) {
+        return false;
     }
-    if !is_whole_web_address(word) {
+    let address = match word.strip_prefix("--url=") {
+        // after `--` it is not an option
+        Some(value) if program == "curl" && !before.contains(&"--") => value,
+        _ => word,
+    };
+    if !is_whole_web_address(address) {
         return false;
     }
 
@@ -168,21 +194,21 @@ pub(super) fn is_fetched_address(program: &str, before: &[&str], word: &str) -> 
                 || (!letters.is_empty()
                     && letters.chars().all(|letter| options.short.contains(letter)))
         } else {
-            // text only running the command would show may be any option
-            !previous.starts_with(['$', SUBSTITUTION, PROCESS_SUBSTITUTION])
+            // what the shell rewrites may come out as any option
+            !previous.contains(MAY_BE_REWRITTEN)
         }
     })
 }
 
 /// Whether the whole of `word` is one plain `http` or `https` address that names
-/// a host as the web does (a dotted name, `localhost` or a bracketed number) and
-/// has no `..`. Anything else in it, a space, a quote or something the shell
-/// computes, and it is not.
+/// a host as the web does (a dotted name, `localhost` or an IPv6 address in
+/// brackets) and has no `..` segment. A space, a quote, `*`, a bracket that is
+/// not around that host, or what could be shell syntax, and it is not.
 fn is_whole_web_address(word: &str) -> bool {
     let Some((scheme, rest)) = word.split_once("://") else {
         return false;
     };
-    let plain = |byte: u8| byte.is_ascii_graphic() && !b"$`'\"()<>|;\\{}".contains(&byte);
+    let plain = |byte: u8| byte.is_ascii_graphic() && !b"$`'\"()<>|;\\{}*".contains(&byte);
     if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
         || !rest.bytes().all(plain)
         || rest
@@ -194,13 +220,24 @@ fn is_whole_web_address(word: &str) -> bool {
 
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let host = authority.rsplit('@').next().unwrap_or_default();
-    if host.starts_with('[') {
-        return true;
+    let brackets = rest.matches(['[', ']']).count();
+
+    if let Some(bracketed) = host.strip_prefix('[') {
+        return brackets == 2
+            && bracketed.split_once(']').is_some_and(|(number, port)| {
+                number.parse::<Ipv6Addr>().is_ok()
+                    && (port.is_empty() || port.strip_prefix(':').is_some_and(is_port))
+            });
     }
     let name = host.split(':').next().unwrap_or_default();
 
-    name.starts_with(|first: char| first.is_ascii_alphanumeric())
+    brackets == 0
+        && name.starts_with(|first: char| first.is_ascii_alphanumeric())
         && (name.trim_end_matches('.').contains('.') || name.eq_ignore_ascii_case("localhost"))
+}
+
+fn is_port(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Files an `ftp`, `sftp` or `lftp` script sends: the `put` lines of a
@@ -659,6 +696,141 @@ mod tests {
         assert!(lftp(&["host"]).is_empty());
         // only lftp takes its script this way
         assert!(option_script_paths("sftp", &["-c".to_owned(), "put .env".to_owned()]).is_empty());
+    }
+
+    const ADDRESS: &str = "https://a.example/data/x";
+
+    fn fetched(program: &str, before: &[&str], word: &str) -> bool {
+        is_fetched_address(program, before, word)
+    }
+
+    #[test]
+    fn only_the_bare_web_clients_fetch_an_address() {
+        assert!(fetched("curl", &[], ADDRESS));
+        assert!(fetched("wget", &[], ADDRESS));
+        assert!(fetched("gh", &["api"], ADDRESS));
+
+        for program in ["./curl", "/usr/bin/curl", "CURL", "base64", "http"] {
+            assert!(!fetched(program, &[], ADDRESS), "{program}");
+        }
+        assert!(!fetched("gh", &[], ADDRESS));
+        assert!(!fetched("gh", &["repo", "view"], ADDRESS));
+        assert!(!fetched("gh", &["-R", "o/r", "api"], ADDRESS));
+    }
+
+    #[test]
+    fn the_word_before_an_address_must_not_take_it_as_a_value() {
+        for previous in ["-s", "-sSL", "--silent", "--url", "page.htm", "--"] {
+            assert!(fetched("curl", &[previous], ADDRESS), "{previous}");
+        }
+        assert!(fetched("wget", &["-qO-"], ADDRESS));
+
+        for previous in ["-T", "-sST", "-d", "--upload-file", "-K", "-", "-qO-"] {
+            assert!(!fetched("curl", &[previous], ADDRESS), "{previous}");
+        }
+        for previous in ["-i", "-O", "--post-file", "--url", "-"] {
+            assert!(!fetched("wget", &[previous], ADDRESS), "{previous}");
+        }
+    }
+
+    #[test]
+    fn a_word_the_shell_may_rewrite_must_not_come_before_an_address() {
+        let substitution = format!("a{SUBSTITUTION}");
+        let process = format!("a{PROCESS_SUBSTITUTION}");
+
+        for previous in [
+            "x*",
+            "x?",
+            "x[ab]",
+            "{-s,-T}",
+            "x}",
+            "x(y)",
+            "`x`",
+            "$x",
+            "x$y",
+            &substitution,
+            &process,
+        ] {
+            assert!(!fetched("curl", &[previous], ADDRESS), "{previous:?}");
+        }
+    }
+
+    #[test]
+    fn a_redirection_anywhere_ahead_stops_the_exception() {
+        for before in [
+            &["-T", ">", "out"][..],
+            &["-T", ">&", "out"],
+            &["-T", "{fd}>", "out"],
+            &["-T", "<", "in"],
+            &["2>/dev/null"],
+            &[">", "-T"],
+            &["2>&1", "-s"],
+        ] {
+            assert!(!fetched("curl", before, ADDRESS), "{before:?}");
+        }
+    }
+
+    #[test]
+    fn curls_url_option_is_checked_like_a_bare_address() {
+        let option = format!("--url={ADDRESS}");
+
+        assert!(fetched("curl", &[], &option));
+        assert!(fetched("curl", &["-s"], &option));
+        for before in [
+            &["-T"][..],
+            &["--upload-file"],
+            &["--"],
+            &["--", "x"],
+            &["$x"],
+            &["-T", ">", "out"],
+        ] {
+            assert!(!fetched("curl", before, &option), "{before:?}");
+        }
+        assert!(!fetched("wget", &[], &option));
+        assert!(!fetched("curl", &[], "--url=file:///data/x"));
+        assert!(!fetched("curl", &[], "--upload-file=https://a.example/x"));
+    }
+
+    #[test]
+    fn a_whole_web_address_names_a_web_host_and_holds_no_pattern() {
+        for address in [
+            ADDRESS,
+            "HTTP://A.EXAMPLE/x",
+            "http://localhost:8080/x",
+            "https://user@www.example.com:443/x?a=1&b=2#part",
+            "http://[::1]/x",
+            "http://[2001:db8::1]:8080/x",
+            "http://user@[::1]",
+        ] {
+            assert!(is_whole_web_address(address), "{address}");
+        }
+        for address in [
+            "data/x",
+            "file:///data/x",
+            "ftp://a.example/x",
+            "https://data/x",
+            "https://../x",
+            "https://a.example/../x",
+            "https://a.example/?f=..",
+            "https://a.example/a b",
+            "https://a.example/a;b",
+            "https://a.example/$x",
+            "https://a.example/{a,b}",
+            "https://a.example/data/*",
+            "https://*.example/x",
+            "https://a.example/[ab]",
+            "https://a.example/x]",
+            "https://x[::1]/y",
+            "https://[data]/x",
+            "https://[::1/x",
+            "https://[::1]x/y",
+            "https://[::1]:/y",
+            "https://[::1]:8o/y",
+            "https://[::1]/[y]",
+            "https://[]/y",
+        ] {
+            assert!(!is_whole_web_address(address), "{address}");
+        }
     }
 
     #[test]

