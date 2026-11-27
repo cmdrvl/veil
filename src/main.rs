@@ -5,6 +5,7 @@ use std::process::ExitCode;
 mod cli;
 mod hooks;
 mod operator;
+mod supervise;
 
 fn main() -> ExitCode {
     match dispatch() {
@@ -22,7 +23,15 @@ fn dispatch() -> Result<u8, Box<dyn std::error::Error>> {
             veil::broker::run_broker_from_env()?;
             Ok(0)
         }
-        Ok(cli::Dispatch::HookMode) => veil::run(),
+        Ok(cli::Dispatch::HookMode) => Ok(supervise::run_hook()),
+        Ok(cli::Dispatch::HookWorker) => {
+            // tests/hook_crash.rs forces a panic with this. Setting it can only
+            // get calls blocked.
+            if std::env::var_os("VEIL_TEST_HOOK_PANIC").is_some() {
+                panic!("forced by VEIL_TEST_HOOK_PANIC"); // ubs:ignore — deliberate, so a test can crash this process.
+            }
+            veil::run()
+        }
         Ok(cli::Dispatch::Describe) => {
             println!("{}", operator::run_describe());
             Ok(0)

@@ -128,6 +128,16 @@ jobs:
       - name: Install veil
         run: cargo install --path . --locked --root "$RUNNER_TEMP/veil-install"
 
+      # bd-chg. The installed binary is a release build, which aborts on a panic.
+      - name: A crash in the installed hook blocks the call
+        shell: bash
+        run: |
+          status=0
+          echo '{}' | VEIL_TEST_HOOK_PANIC=1 "$RUNNER_TEMP/veil-install/bin/veil" 2> "$RUNNER_TEMP/crash.err" || status=$?
+          cat "$RUNNER_TEMP/crash.err"
+          test "$status" -eq 2
+          grep -q 'veil crashed while checking this call, so it is blocked' "$RUNNER_TEMP/crash.err"
+
       - name: Run every matrix row through the installed hook
         # `shell: bash` is what turns on pipefail: without it `| tee` would hide
         # the script's exit status and a mismatch would pass the job.

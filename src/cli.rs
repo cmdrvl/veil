@@ -5,6 +5,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+/// Runs hook mode in this process. `veil` passes it to the second veil that
+/// judges a hook call (see `supervise`).
+pub const HOOK_WORKER_FLAG: &str = "--hook-worker";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "veil",
@@ -14,6 +18,8 @@ use clap::{Args, Parser, Subcommand};
 pub struct Cli {
     #[arg(long = "broker", hide = true)]
     broker_mode: bool,
+    #[arg(long = "hook-worker", hide = true)]
+    hook_worker: bool,
     #[arg(long = "robot-triage", help = "Emit read-only JSON triage for agents")]
     robot_triage: bool,
     #[arg(
@@ -255,6 +261,7 @@ pub enum OperatorCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Dispatch {
     HookMode,
+    HookWorker,
     BrokerMode,
     Describe,
     Schema,
@@ -265,6 +272,10 @@ impl Cli {
     pub fn dispatch(self) -> Dispatch {
         if self.broker_mode {
             return Dispatch::BrokerMode;
+        }
+
+        if self.hook_worker {
+            return Dispatch::HookWorker;
         }
 
         if self.describe {
@@ -459,6 +470,11 @@ mod tests {
     #[test]
     fn hidden_broker_flag_selects_internal_mode() {
         assert_eq!(parse(&["veil", "--broker"]), Dispatch::BrokerMode);
+    }
+
+    #[test]
+    fn hidden_hook_worker_flag_selects_internal_mode() {
+        assert_eq!(parse(&["veil", HOOK_WORKER_FLAG]), Dispatch::HookWorker);
     }
 
     #[test]

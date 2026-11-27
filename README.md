@@ -337,8 +337,16 @@ and does not auto-approve. A newer version of either could change that.
 
 Warnings still go to stderr, and the audit log still records `decision: "allow"`
 for a call veil let through. If you saw fewer permission prompts with an earlier
-veil, you may see more of them now. A hook that exits with a status other than 0
-is an error, not a decision. `veil --schema` describes what is printed.
+veil, you may see more of them now. `veil --schema` describes what is printed.
+
+veil exits 2, which blocks the call, when it cannot answer: a payload or a config
+file it cannot read, or a crash. A harness may let a call through when its hook
+dies, so the `veil` it starts runs a second `veil` that judges the call, and
+exits 2 when that one ends in any way but with an answer: a panic, running out of
+stack or memory, or being killed. The second process took about 4 ms more per
+call in a release build on an Intel Mac. Two things are not covered: the first
+process being killed, and a check that takes longer than the harness waits for a
+hook. Some very long or deeply nested commands take veil tens of seconds.
 
 A content search of a directory reads every file beneath it, so veil walks the
 directory before allowing it and denies the search when any path under it is
