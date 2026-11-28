@@ -863,7 +863,8 @@ fn options(kind: InterpreterKind, name: &str) -> Options {
             subcommand: Subcommand::None,
         },
         (InterpreterKind::Shell, _) => Options {
-            with_value: &["-o", "+o", "-O", "+O", "--rcfile", "--init-file"],
+            // a shell bundles its options: see `shell_option_values`
+            with_value: &[],
             inline: &["-c"],
             subcommand: Subcommand::None,
         },
@@ -885,7 +886,7 @@ enum Operand<'a> {
 /// Whether an interpreter run with `args` takes its program from standard
 /// input: it names no script, or names standard input itself.
 pub(super) fn reads_program_from_stdin(kind: InterpreterKind, name: &str, args: &[String]) -> bool {
-    if kind == InterpreterKind::Shell && has_stdin_flag(args) {
+    if kind == InterpreterKind::Shell && has_stdin_flag(name, args) {
         return true;
     }
     match script_operand(kind, name, args) {
@@ -897,27 +898,48 @@ pub(super) fn reads_program_from_stdin(kind: InterpreterKind, name: &str, args: 
 
 /// `bash -s a b`: with `-s` the words after the options are parameters, not a
 /// script.
-fn has_stdin_flag(args: &[String]) -> bool {
-    let mut words = args.iter().map(String::as_str);
+fn has_stdin_flag(shell: &str, args: &[String]) -> bool {
+    let mut index = 0;
 
-    while let Some(word) = words.next() {
-        match word {
-            "--" => return false,
-            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file" => {
-                words.next();
-            }
-            _ if word.starts_with("--") || word.starts_with('+') => {}
-            _ => match word.strip_prefix('-') {
-                Some(cluster) if !cluster.is_empty() => {
-                    if cluster.contains('s') {
-                        return true;
-                    }
-                }
-                _ => return false,
-            },
+    while let Some(word) = args.get(index).map(String::as_str) {
+        if word == "--" || word.len() < 2 || !word.starts_with(['-', '+']) {
+            return false;
         }
+        if !word.starts_with("--") && word.starts_with('-') && word.contains('s') {
+            return true;
+        }
+        index += 1 + shell_option_values(shell, word, &args[index + 1..]);
     }
     false
+}
+
+/// How many of the words `following` a shell's option are that option's values.
+/// In `bash -euo pipefail` the `o` takes `pipefail`, and every further `o` in
+/// the bundle takes one more.
+///
+/// A word that looks like an option is never taken: bash refuses one as a name,
+/// so nothing runs, and ksh reads it as an option (`ksh -eo -c '...'` runs).
+pub(super) fn shell_option_values<T: AsRef<str>>(
+    shell: &str,
+    option: &str,
+    following: &[T],
+) -> usize {
+    let bundle = option.strip_prefix(['-', '+']).unwrap_or_default();
+    let values = if matches!(option, "--rcfile" | "--init-file") {
+        1
+    } else if option.starts_with("--") {
+        0
+    } else if matches!(shell, "zsh" | "ksh") {
+        // these also take the name attached, as in `-oerrexit`
+        usize::from(bundle.ends_with(['o', 'O']))
+    } else {
+        bundle.chars().filter(|c| matches!(c, 'o' | 'O')).count()
+    };
+    following
+        .iter()
+        .take(values)
+        .take_while(|word| !word.as_ref().starts_with(['-', '+']))
+        .count()
 }
 
 /// The script file among an interpreter's arguments: the first word that is not
@@ -938,14 +960,18 @@ fn script_operand<'a>(kind: InterpreterKind, name: &str, args: &'a [String]) -> 
             continue;
         }
 
-        if !options_ended && word.starts_with('-') && word.len() > 1 {
+        let shell = kind == InterpreterKind::Shell;
+        let option = word.starts_with('-') || (shell && word.starts_with('+'));
+        if !options_ended && option && word.len() > 1 {
             // `-cCODE`, `-mmodule`: the value attached to a short option.
             let attached =
                 |flag: &&str| flag.len() == 2 && !flag.starts_with("--") && word.starts_with(*flag);
             if options.inline.contains(&word) || options.inline.iter().any(attached) {
                 return Operand::Inline;
             }
-            if options.with_value.contains(&word) {
+            if shell {
+                index += shell_option_values(name, word, &words[index..]);
+            } else if options.with_value.contains(&word) {
                 index += 1;
             }
             continue;

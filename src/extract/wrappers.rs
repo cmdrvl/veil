@@ -693,10 +693,11 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
 fn shell_scripts(words: &[String], eval: bool, command: &SimpleCommand) -> Vec<String> {
     let args = &words[1..];
 
+    let (has_c, string) = command_string(command_name(&words[0]), args);
     let own = if eval {
         Some(args.join(" ")).filter(|joined| !joined.trim().is_empty())
     } else {
-        command_string(args).map(str::to_owned)
+        string.map(str::to_owned)
     };
     // bash reads whichever of a here-string and a here-document comes last
     let document = command
@@ -709,7 +710,7 @@ fn shell_scripts(words: &[String], eval: bool, command: &SimpleCommand) -> Vec<S
     let from_xargs = command.unresolved.iter().any(|w| w == STDIN_ARGUMENTS);
     let piped = command.piped_program().filter(|_| {
         !eval
-            && ((from_xargs && matches!(own.as_deref(), None | Some("{}")))
+            && ((from_xargs && has_c && matches!(own.as_deref(), None | Some("{}")))
                 || (own.is_none()
                     && scripts::reads_program_from_stdin(
                         InterpreterKind::Shell,
@@ -727,42 +728,27 @@ fn shell_scripts(words: &[String], eval: bool, command: &SimpleCommand) -> Vec<S
         .collect()
 }
 
-/// The `-c` string of a shell invocation: `-c`, or a cluster holding `c` such
-/// as `-lc`, then the first word that is not an option.
-fn command_string(args: &[String]) -> Option<&str> {
+/// Whether a shell is given `-c`, alone or in a cluster such as `-lc`, and the
+/// string it runs: the first word that is no option and no option's value.
+fn command_string<'a>(shell: &str, args: &'a [String]) -> (bool, Option<&'a str>) {
     let mut has_c = false;
     let mut i = 0;
 
     while i < args.len() {
         let arg = args[i].as_str();
-        match arg {
-            "--" => {
-                i += 1;
-                break;
-            }
-            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file" => {
-                i += 2;
-                continue;
-            }
-            _ => {}
-        }
-        if arg.starts_with("--") || arg.starts_with('+') {
+        if arg == "--" {
             i += 1;
-        } else if let Some(cluster) = arg.strip_prefix('-')
-            && !cluster.is_empty()
-        {
-            has_c |= cluster.contains('c');
-            i += 1;
-        } else {
             break;
         }
+        if arg.len() < 2 || !arg.starts_with(['-', '+']) {
+            break;
+        }
+        has_c |= arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c');
+        i += 1 + scripts::shell_option_values(shell, arg, &args[i + 1..]);
     }
 
-    if has_c {
-        args.get(i).map(String::as_str)
-    } else {
-        None
-    }
+    let string = args.get(i).map(String::as_str);
+    (has_c, string.filter(|_| has_c))
 }
 
 fn step(words: &[String]) -> Step {

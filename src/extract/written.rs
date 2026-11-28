@@ -292,8 +292,13 @@ pub(super) fn piped_output(command: &SimpleCommand) -> Option<String> {
         _ => false,
     };
 
-    if passes_on && !line.reads_file && command.piped_program().is_some() {
-        return command.piped_program().map(str::to_owned);
+    if passes_on {
+        // a here-document or here-string takes the pipe's place, in bash. zsh
+        // reads both, so this is not said of what is written to a file
+        return match command.piped_program() {
+            Some(text) => (!line.reads_file).then(|| text.to_owned()),
+            None => own_input(command, &line),
+        };
     }
     stdout_text(program, args, command, &line)
 }
@@ -301,11 +306,15 @@ pub(super) fn piped_output(command: &SimpleCommand) -> Option<String> {
 /// What a command reads from standard input, when it is a here-document or a
 /// here-string with nothing in it the shell computes.
 fn stdin_text(command: &SimpleCommand, line: &Line<'_>) -> Option<String> {
-    if command.stdin_piped
-        || line.reads_file
-        || command.heredoc_computed
-        || !command.unresolved.is_empty()
-    {
+    if command.stdin_piped {
+        return None;
+    }
+    own_input(command, line)
+}
+
+/// The text of a command's own here-documents and here-strings.
+fn own_input(command: &SimpleCommand, line: &Line<'_>) -> Option<String> {
+    if line.reads_file || command.heredoc_computed || !command.unresolved.is_empty() {
         return None;
     }
 
@@ -674,6 +683,9 @@ mod tests {
             "cat notes.md > x",
             "cat notes.md | tee x",
             "echo hi | tee x",
+            // zsh writes both what is piped and the here-string
+            "date | cat > x <<< 'echo hi'",
+            "date | tee x <<< 'echo hi'",
             "cat x2 > x",
             "cat < notes.md > x",
             "cat > x <<< \"$BODY\"",

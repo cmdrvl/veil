@@ -773,6 +773,9 @@ Anything else a pipe brings is **allowed today**:
 - a shell that is not the first command to receive the pipe: `| { true; sh; }`,
   `| bash -c sh`, `| eval sh`;
 - `xargs` with another replacement string (`-I% sh -c '%'`);
+- a pipe into a shell that has a here-string or here-document of its own:
+  `echo 'cat .env' | sh <<< true`. bash runs only the here-string, which veil
+  reads; zsh, as the shell running the line, runs both;
 - `sh < <(echo 'cat .env')`.
 
 ### MCP Tools

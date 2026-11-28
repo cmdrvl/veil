@@ -613,6 +613,21 @@ fn text_piped_into_a_shell_is_read_as_its_script() {
             "cat <<< 'cat protected/x.csv' | sh",
             "(echo 'cat protected/x.csv') | sh",
             "echo 'cat protected/x.csv' | (sh)",
+            // `+` options, and bundles in which `o` takes the next word
+            "echo 'cat protected/x.csv' | sh +e",
+            "echo 'cat protected/x.csv' | bash +u",
+            "echo 'cat protected/x.csv' | bash +x",
+            "echo 'cat protected/x.csv' | bash +o posix",
+            "echo 'cat protected/x.csv' | bash +O extglob",
+            "echo 'cat protected/x.csv' | bash -eo pipefail",
+            "echo 'cat protected/x.csv' | bash -euo pipefail",
+            "echo 'cat protected/x.csv' | bash +eo posix",
+            "echo 'cat protected/x.csv' | bash -eo pipefail -s",
+            // a here-string or here-document replaces the pipe `cat` or `tee` has
+            "echo hi | cat <<< 'cat protected/x.csv' | sh",
+            "date | cat <<< 'cat protected/x.csv' | sh",
+            "echo hi | tee copy.txt <<< 'cat protected/x.csv' | sh",
+            "date | cat <<'EOF' | sh\ncat protected/x.csv\nEOF",
             // xargs hands what it reads to the shell as the `-c` string
             "echo 'cat protected/x.csv' | xargs -0 sh -c",
             "echo 'cat protected/x.csv' | xargs -I{} sh -c '{}'",
@@ -653,6 +668,47 @@ fn a_directory_change_behind_a_pipe_is_followed_as_before() {
     );
 }
 
+/// `bash -euo pipefail -c '...'` was allowed: `pipefail` was read as the script,
+/// so neither the `-c` string nor a script file after it was judged.
+#[test]
+fn the_value_of_a_shell_option_is_not_taken_for_its_script() {
+    let fixture = Fixture::new();
+
+    assert_refused(
+        &fixture,
+        &[
+            "bash -eo pipefail -c 'cat protected/x.csv'",
+            "bash -euo pipefail -c 'cat protected/x.csv'",
+            "bash -oe pipefail -c 'cat protected/x.csv'",
+            "bash -oo errexit nounset -c 'cat protected/x.csv'",
+            "bash -co pipefail 'cat protected/x.csv'",
+            "echo 'cat protected/x.csv' > r.sh; bash -eo pipefail r.sh",
+            "echo 'cat protected/x.csv' > r.sh; bash -euo pipefail r.sh",
+            "echo 'cat protected/x.csv' > r.sh; bash +e r.sh",
+            "echo 'cat protected/x.csv' > r.sh; bash +o posix r.sh",
+        ],
+        |_| true,
+    );
+    // to ksh, `-o` before another option takes nothing
+    assert_refused(
+        &fixture,
+        &[
+            "ksh -eo -c 'cat protected/x.csv'",
+            "ksh -o -c 'cat protected/x.csv'",
+        ],
+        |_| installed("ksh"),
+    );
+    // zsh also takes the value attached, and then the next word is its own
+    assert_refused(
+        &fixture,
+        &[
+            "zsh -oerrexit -c 'cat protected/x.csv'",
+            "zsh -eo errexit -c 'cat protected/x.csv'",
+        ],
+        |_| installed("zsh"),
+    );
+}
+
 #[test]
 fn text_piped_into_something_that_does_not_run_it_stays_allowed() {
     let fixture = Fixture::new();
@@ -673,6 +729,11 @@ fn text_piped_into_something_that_does_not_run_it_stays_allowed() {
         "echo 'cat protected/x.csv' || sh -n count.sh",
         "echo 'cat protected/x.csv'; sh count.sh",
         "echo 'cat protected/x.csv' | wc -c; echo done | sh",
+        // with a script file and no `-c`, what xargs reads is arguments, not code
+        "echo 'cat protected/x.csv' | xargs sh count.sh",
+        "echo 'cat protected/x.csv' | xargs -n1 bash count.sh",
+        "echo \"it's here\" | xargs -0 sh count.sh",
+        "echo \"it's here\" | xargs -0 bash -e count.sh",
         // here the `-c` string is xargs's own, and what is piped is its data
         "echo notes.txt | xargs -I{} sh -c 'wc -l {}'",
         // a here-document of the shell's own is what it reads
