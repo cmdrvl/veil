@@ -71,7 +71,7 @@ decoded from text, a task runner that reads the file itself, and a `git add`,
 <!-- bypass-matrix:begin -->
 <!-- GENERATED from tests/bypass_matrix.rs; do not edit by hand. -->
 
-Of 213 vectors run against the real binary, **160** are blocked and **25** are still allowed: 15 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
+Of 217 vectors run against the real binary, **162** are blocked and **27** are still allowed: 17 can let contents out, 3 are one step of a chain that can, and 7 reveal only names, sizes or counts. The rest are controls that must stay allowed.
 
 | Class | Vectors | Blocked | Still allowed: contents / chain step / names | Sandbox expected: blocked / allowed / not addressed |
 |---|---|---|---|---|
@@ -79,7 +79,7 @@ Of 213 vectors run against the real binary, **160** are blocked and **25** are s
 | Other readers and tools | 70 | 55 | 1 / 0 / 2 | 57 / 0 / 1 |
 | Shell indirection | 12 | 12 | 0 / 0 / 0 | 12 / 0 / 0 |
 | Copies and aliases | 10 | 8 | 2 / 0 / 0 | 7 / 3 / 0 |
-| Interpreters and scripts | 45 | 31 | 5 / 0 / 0 | 36 / 0 / 0 |
+| Interpreters and scripts | 49 | 33 | 7 / 0 / 0 | 40 / 0 / 0 |
 | Egress | 17 | 13 | 2 / 0 / 0 | 15 / 0 / 0 |
 | Content search | 9 | 5 | 0 / 0 / 4 | 7 / 0 / 2 |
 | Dynamic and hidden paths | 6 | 6 | 0 / 0 / 0 | 6 / 0 / 0 |
@@ -442,15 +442,11 @@ no others. It does not cover:
 `find data -exec cat {} \;` is treated as a content read of `data`, because the
 files `{}` stands for are unknown; `-name`, `-type` and `-prune` filters are not
 honored, so it is denied if `data` holds anything protected. What veil does not
-follow: a script piped into a shell (`echo '...' | sh`), a `cd` earlier in the
-line (paths resolve against the directory the hook started in), and programs
-that run a command but are not in the list above (`docker exec`, `ssh host
-cmd`, `git grep`, and `stdbuf`, `caffeinate`, `arch`, `script` or
-`sandbox-exec` running `sh -c '...'`). It also misses code held in a
-variable's value that bash then runs (`PS4` under `bash -x`, `$( )` in
-`BASH_ENV`, a function in `BASH_FUNC_name%%`), and a shell string behind a
-redirection written first (`>log bash -c '...'`). Those are allowed today. A
-script file an interpreter is asked to run is read; see
+follow: some scripts piped into a shell (see [Piped Scripts](#piped-scripts)), a
+`cd` earlier in the line (paths resolve against the directory the hook started
+in), and programs that run a command but are not in the list above (`docker
+exec`, `ssh host cmd`, `git grep`). Those are allowed today. A script file an
+interpreter is asked to run is read; see
 [Script Files](#script-files). Variables, `$( )` results, what `xargs` reads,
 command text veil cannot parse and anything past the 64th command of one line
 or the 8th level of nesting are the dynamic-argument stance's; see
@@ -719,10 +715,11 @@ airtight. It does not see:
 - a command a program reaches another way than the calls above
   (`getattr(os, "system")`, an alias such as `from os import system as run`,
   `eval`), or one it takes from a file or the network;
-- a script that arrives through a pipe (`cat read.py | python3`), a module run
-  with `-m`, a zip, a `.pyc` or any binary;
-- a script piped into a shell, which is no program of an interpreter
-  (`echo 'cat .env' | sh`, `awk '{print "cat .env" | "sh"}'`);
+- a script a pipe brings whose text the command line does not spell out
+  (`cat read.py | python3`, `curl ... | sh`, `base64 -d | sh`, another program's
+  output, `awk '{print "cat .env" | "sh"}'`), a module run with `-m`, a zip, a
+  `.pyc` or any binary;
+- some pipes that do spell it out, listed under [Piped Scripts](#piped-scripts);
 - a script made by anything but `>`, `>>` or `tee` earlier on the same line
   (`cp`, `mv`, `curl -o`, a file a program opens itself), a file already there
   that is replaced through a path built at run time (`tee "$OUT"`; a typed
@@ -753,6 +750,30 @@ Two costs follow. A bundled script over 256 KiB (a minified Node bundle, for
 instance) that runs from a directory holding a protected path is denied, and
 there is no setting for the limit yet. Split the script, move it out of reach of
 the protected path, or run the work through an authorized spine tool.
+
+### Piped Scripts
+
+A shell or interpreter with no script of its own runs what its standard input
+brings. When the command line spells out the text a pipe brings it, veil reads
+that text as the script: `echo` or `printf` with literal words, or a
+here-document or here-string, piped straight on, or through `cat` or `tee`.
+`echo 'cat .env' | sh` is judged as `sh -c 'cat .env'` is, and so is what
+`xargs -0 sh -c` or `xargs -I{} sh -c '{}'` hands a shell. With any other `-c`
+string or a script file, what is piped is that script's data and is not read as
+code.
+
+Anything else a pipe brings is **allowed today**:
+
+- text the command line does not spell out: another program's output (`curl ...
+  | sh`, `cat read.sh | sh`, `base64 -d | sh`, `awk` printing into `"sh"`), or
+  output passed through `sort`, `sed`, `head` or `cat -u`;
+- a group, a loop or a function on the sending side, except for what its last
+  command writes: `(echo 'cat .env'; true) | sh`, `if ...; then echo ...; fi |
+  sh`, `f | sh`;
+- a shell that is not the first command to receive the pipe: `| { true; sh; }`,
+  `| bash -c sh`, `| eval sh`;
+- `xargs` with another replacement string (`-I% sh -c '%'`);
+- `sh < <(echo 'cat .env')`.
 
 ### MCP Tools
 

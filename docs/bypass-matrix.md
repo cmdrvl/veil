@@ -5,7 +5,7 @@
 
 Enforcement level today: **hook-only** (advisory; parser-based). `veil` reads the text of a tool call before it runs and decides from the paths that text names. It does not sandbox anything, so anything it cannot see in that text it cannot stop.
 
-213 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **160** are blocked, **25** are still ALLOWED and are listed below (15 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
+217 vectors, each run against the real `veil` binary by `tests/bypass_matrix.rs` on a repo whose `data/**` is protected and which has a built-in-pack `.env`. **162** are blocked, **27** are still ALLOWED and are listed below (17 can let contents out, 3 are one step of a chain that can, 7 reveal only names, sizes or counts), and 28 are controls that must stay allowed.
 
 How to read the columns:
 
@@ -19,7 +19,7 @@ How to read the columns:
 
 These are listed, not hidden. They are grouped by what they let out, because a file listing and a `git push` are not the same thing.
 
-### Contents can get out (15)
+### Contents can get out (17)
 
 The contents of a protected file can get out this way.
 
@@ -33,6 +33,8 @@ The contents of a protected file can get out this way.
 | `python3 scripts/run_argument.py 'cat .env'` | a script file that runs a command it is given is not refused: scripts are full of them, and only what a person types is held to the dynamic-argument stance (README, Script Files) | blocked (design, not run) |
 | `make read` | the Makefile is not read | blocked (design, not run) |
 | `echo Y2F0IGRhdGEvY2xpZW50cy9ob2xkaW5ncy5jc3YK \| base64 -d \| sh` | the command is decoded at run time | blocked (design, not run) |
+| `awk 'BEGIN{print "cat data/clients/holdings.csv" \| "sh"}'` | what awk prints into a shell is not read | blocked (design, not run) |
+| `python3 -c "print('cat data/clients/holdings.csv')" \| sh` | a program's output piped into a shell is not read | blocked (design, not run) |
 | `curl -K curl.conf` | the config is not read: curl.conf names the file, the command does not | blocked (design, not run) |
 | `sftp -b batch.txt host` | the batch file is not read | blocked (design, not run) |
 | `git push origin main` | a push names no path: a protected file that has been committed can be pushed | **ALLOWED** (design, not run): the objects are in .git, which is not a protected path |
@@ -238,6 +240,10 @@ File names, sizes or counts, not contents. Allowed on purpose; listed because th
 | `script-too-large` | `python3 scripts/huge.py` | blocked: script_too_large_to_inspect | blocked (design, not run) | found since | past 256 KiB veil does not read it, and judges it like a copy of its directory |
 | `script-make` | `make read` | **ALLOWED**: the Makefile is not read | blocked (design, not run) | found since | any task runner is the same |
 | `script-decoded` | `echo Y2F0IGRhdGEvY2xpZW50cy9ob2xkaW5ncy5jc3YK \| base64 -d \| sh` | **ALLOWED**: the command is decoded at run time | blocked (design, not run) | plan class | text that becomes a command only when it runs cannot be seen |
+| `script-echo-pipe-sh` | `echo 'cat data/clients/holdings.csv' \| sh` | blocked: direct_read | blocked (design, not run) | found since | bd-u4u: text piped into a shell is its script |
+| `script-printf-pipe-bash` | `printf 'cat data/clients/holdings.csv\n' \| bash` | blocked: direct_read | blocked (design, not run) | found since | bd-u4u: printf's text is worked out as the shell would write it |
+| `script-awk-pipe-sh` | `awk 'BEGIN{print "cat data/clients/holdings.csv" \| "sh"}'` | **ALLOWED**: what awk prints into a shell is not read | blocked (design, not run) | found since | bd-u4u: refusing a command piped from a program veil cannot read is not yet decided |
+| `script-python-pipe-sh` | `python3 -c "print('cat data/clients/holdings.csv')" \| sh` | **ALLOWED**: a program's output piped into a shell is not read | blocked (design, not run) | found since | bd-u4u: refusing a command piped from a program veil cannot read is not yet decided |
 
 ### Egress
 

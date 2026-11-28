@@ -279,6 +279,25 @@ fn stdout_text(
     }
 }
 
+/// What `command` writes into a pipe, for the shell or interpreter at the other
+/// end (bd-u4u): what [`stdout_text`] knows, and what `cat` and `tee` pass on
+/// from a pipe of their own. Nothing else is given the passed-on text: a file
+/// `tee` writes from a pipe stays [`Writes::Computed`].
+pub(super) fn piped_output(command: &SimpleCommand) -> Option<String> {
+    let line = split(&command.argv);
+    let (program, args) = line.words.split_first()?;
+    let passes_on = match command_name(program) {
+        "cat" => args.iter().all(|word| *word == "-"),
+        "tee" => true,
+        _ => false,
+    };
+
+    if passes_on && !line.reads_file && command.piped_program().is_some() {
+        return command.piped_program().map(str::to_owned);
+    }
+    stdout_text(program, args, command, &line)
+}
+
 /// What a command reads from standard input, when it is a here-document or a
 /// here-string with nothing in it the shell computes.
 fn stdin_text(command: &SimpleCommand, line: &Line<'_>) -> Option<String> {

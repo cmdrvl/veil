@@ -353,6 +353,12 @@ fn command_extraction(command: &SimpleCommand, cwd: &Path, names_stand: bool) ->
     for text in command.here_strings() {
         paths.extend(heredoc_script_paths(program, text));
     }
+    if let Some(text) = command.piped_program()
+        && let Some(kind) = interpreter_kind(command_name(program))
+        && script::reads_program_from_stdin(kind, command_name(program), &handed)
+    {
+        paths.extend(heredoc_script_paths(program, text));
+    }
     paths.extend(egress::here_string_paths(
         program,
         &command.redirection_words(),

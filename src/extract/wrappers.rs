@@ -20,7 +20,7 @@ use super::decompose::{
     MAX_DEPTH, Origin, Run, STDIN_ARGUMENTS, SimpleCommand, emit, read_stored_code,
     read_variable_code, script,
 };
-use super::{command_name, lookup};
+use super::{InterpreterKind, command_name, lookup, script as scripts};
 
 /// Options a wrapper takes, and which of them carry a value.
 struct Options {
@@ -661,6 +661,7 @@ fn expand_inner(command: SimpleCommand, depth: usize, run: &mut Run, out: &mut V
                         assigned: Vec::new(),
                         origin: Origin::Wrapper,
                         stdin_piped: command.stdin_piped,
+                        piped_text: command.piped_text.clone(),
                         heredoc_body: None,
                         heredoc_computed: false,
                         lookup_changed: false,
@@ -703,11 +704,26 @@ fn shell_scripts(words: &[String], eval: bool, command: &SimpleCommand) -> Vec<S
         .as_ref()
         .filter(|_| !eval && own.is_none());
 
+    // with no script of its own and none named, it runs what a pipe brings;
+    // and `xargs -0 sh -c` or `xargs -I{} sh -c '{}'` makes that the `-c` string
+    let from_xargs = command.unresolved.iter().any(|w| w == STDIN_ARGUMENTS);
+    let piped = command.piped_program().filter(|_| {
+        !eval
+            && ((from_xargs && matches!(own.as_deref(), None | Some("{}")))
+                || (own.is_none()
+                    && scripts::reads_program_from_stdin(
+                        InterpreterKind::Shell,
+                        command_name(&words[0]),
+                        args,
+                    )))
+    });
+
     // A here-string is read even beside a script of the shell's own, which can
     // start a shell that runs it: `eval bash <<< 'cat x'`.
     own.into_iter()
         .chain(command.here_strings().into_iter().map(str::to_owned))
         .chain(document.cloned())
+        .chain(piped.map(str::to_owned))
         .collect()
 }
 

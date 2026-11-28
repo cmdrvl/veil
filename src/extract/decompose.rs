@@ -26,7 +26,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::expand::{self, Redirection, Vars, Word};
-use super::{RedirectTarget, redirect, wrappers};
+use super::{RedirectTarget, redirect, wrappers, written};
 use super::{collect_input_redirect_paths, is_shell_assignment, lookup};
 
 pub use super::expand::ShellEnv;
@@ -137,6 +137,12 @@ pub struct SimpleCommand {
     pub origin: Origin,
     /// Standard input comes from an earlier command in a pipeline.
     pub stdin_piped: bool,
+    /// What that command writes into the pipe, when its words spell it out
+    /// (`echo 'cat x' | sh`). It is what a shell or interpreter with no script
+    /// of its own runs (bd-u4u), and only those read it: the last command of a
+    /// group is not all the group writes, so it can add to what is judged and
+    /// never stand for the whole.
+    pub piped_text: Option<String>,
     /// The here-document attached to this command, when it has one.
     pub heredoc_body: Option<String>,
     /// The here-document's delimiter was not quoted and its body has something
@@ -163,6 +169,7 @@ impl SimpleCommand {
             assigned: Vec::new(),
             origin: Origin::Top,
             stdin_piped: false,
+            piped_text: None,
             heredoc_body: None,
             heredoc_computed: false,
             lookup_changed: false,
@@ -227,6 +234,15 @@ impl SimpleCommand {
             }
         }
         found
+    }
+
+    /// The text a pipe brings to standard input, unless a here-document or a
+    /// here-string takes its place.
+    pub(super) fn piped_program(&self) -> Option<&str> {
+        // most commands have none, and are asked nothing more
+        let text = self.piped_text.as_deref()?;
+        let replaced = self.heredoc_body.is_some() || !self.here_strings().is_empty();
+        (!replaced).then_some(text)
     }
 
     /// The arguments the program is handed.
@@ -412,10 +428,17 @@ fn script_body(
     };
     let mut scoped_directories = HashMap::new();
     let mut conditional_depth = 0usize;
+    // what the segment before this one writes into the pipe between them
+    let mut written_to_pipe: Option<String> = None;
+    let mut segments = segments.into_iter();
 
-    for segment in segments {
+    while let Some(segment) = segments.next() {
         if !run.take_segment() {
             return;
+        }
+        let mut piped_text = written_to_pipe.take();
+        if !segment.takes_piped_text {
+            piped_text = None;
         }
         let mut directory = segment_directory(&segment, &root_directory, &mut scoped_directories);
         run.env.cwd = directory.path.clone();
@@ -525,9 +548,10 @@ fn script_body(
         {
             read_variable_code(&word.text, depth, run, out);
         }
-        let Some(command) = simple_command(words, &segment, origin, &directory) else {
+        let Some(mut command) = simple_command(words, &segment, origin, &directory) else {
             continue;
         };
+        command.piped_text = piped_text;
         let next_directory = shell_directory_after(&command, &directory, run.env.home.as_deref())
             .map(|mut next| {
                 if segment.conditional || conditional_depth > 0 || doubtful {
@@ -541,9 +565,16 @@ fn script_body(
         let line = (!writes.is_empty()).then(|| (out.len(), command.clone()));
         let doubted = run.doubted;
         run.doubted |= doubtful;
+        let first_of_line = out.len();
         wrappers::expand(command, depth, run, out);
         run.doubted = doubted;
         run.vars.restore(saved);
+        // the last command of the line is the one whose output the pipe takes
+        if matches!(segments.as_slice(), [next, ..] if next.takes_piped_text)
+            && out.len() > first_of_line
+        {
+            written_to_pipe = out.last().and_then(written::piped_output);
+        }
         if let Some((first, line)) = line {
             keep_writes(writes, line, first, out);
         }
@@ -800,6 +831,7 @@ fn simple_command(
         assigned: Vec::new(),
         origin,
         stdin_piped: segment.stdin_piped,
+        piped_text: None,
         heredoc_body: segment.heredoc.clone(),
         heredoc_computed: segment.heredoc_computed,
         lookup_changed: false,
@@ -855,6 +887,9 @@ struct Segment {
     /// [`SUBSTITUTION`], here-document operators removed.
     text: String,
     stdin_piped: bool,
+    /// A pipe before this segment brings it what the segment before wrote,
+    /// across a line break or `(` too.
+    takes_piped_text: bool,
     /// Parenthesized subshell scopes containing this segment, outermost first.
     cwd_scopes: Option<Vec<usize>>,
     /// Pipelines and background commands do not change the caller's directory.
@@ -1197,7 +1232,20 @@ fn scan(text: &str) -> Option<Vec<Segment>> {
         &cwd_scopes,
         false,
     );
-    segments.retain(|segment| !segment.is_blank());
+    // The scan ends a segment at a line break and at `(`, so after `|` it may
+    // leave a blank one between the pipe and the command that reads it. Only
+    // the piped text follows the pipe past them (bd-u4u): how a `cd` there is
+    // followed goes by `stdin_piped`, which stays as the scan set it.
+    let mut pipe_waits = false;
+    segments.retain_mut(|segment| {
+        if segment.is_blank() {
+            pipe_waits |= segment.stdin_piped;
+            return false;
+        }
+        segment.takes_piped_text = segment.stdin_piped || pipe_waits;
+        pipe_waits = false;
+        true
+    });
     Some(segments)
 }
 

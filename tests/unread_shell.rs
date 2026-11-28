@@ -581,6 +581,111 @@ fn a_trap_action_is_read_for_what_it_reads() {
 }
 
 #[test]
+fn text_piped_into_a_shell_is_read_as_its_script() {
+    // bd-u4u
+    let fixture = Fixture::new();
+
+    assert_refused(
+        &fixture,
+        &[
+            "echo 'cat protected/x.csv' | sh",
+            "echo cat protected/x.csv | sh",
+            "printf 'cat protected/x.csv\\n' | bash",
+            "printf '%s\\n' 'cat protected/x.csv' | bash",
+            "echo 'cat protected/x.csv' | bash -s",
+            "echo 'cat \"$1\"' | bash -s -- protected/x.csv",
+            "echo 'cat protected/x.csv' | bash -",
+            "echo 'cat protected/x.csv' | sh /dev/stdin",
+            "echo 'cat protected/x.csv' | bash -e -u",
+            "echo 'cat protected/x.csv' |\nsh",
+            "echo 'cat protected/x.csv' | # why\n\n  sh",
+            "cat <<'EOF' |\ncat protected/x.csv\nEOF\nsh",
+            "echo ok |\ncat protected/x.csv",
+            "echo 'cat protected/x.csv' | sh 2>&1",
+            "echo 'cat protected/x.csv' 2>/dev/null | sh",
+            "command echo 'cat protected/x.csv' | sh",
+            "echo 'cat protected/x.csv' | nohup sh",
+            "echo 'cat protected/x.csv' | env sh",
+            "echo 'cat protected/x.csv' | nice -n 1 bash",
+            "echo 'cat protected/x.csv' | cat | sh",
+            "echo 'cat protected/x.csv' | tee copy.sh | sh",
+            "cat <<'EOF' | sh\ncat protected/x.csv\nEOF",
+            "cat <<< 'cat protected/x.csv' | sh",
+            "(echo 'cat protected/x.csv') | sh",
+            "echo 'cat protected/x.csv' | (sh)",
+            // xargs hands what it reads to the shell as the `-c` string
+            "echo 'cat protected/x.csv' | xargs -0 sh -c",
+            "echo 'cat protected/x.csv' | xargs -I{} sh -c '{}'",
+            "echo 'cat protected/x.csv' | { sh; }",
+            "true && echo 'cat protected/x.csv' | sh",
+            "bash -c \"echo 'cat protected/x.csv' | sh\"",
+            "echo \"echo 'cat protected/x.csv' | sh\" | sh",
+        ],
+        |_| true,
+    );
+    assert_refused(
+        &fixture,
+        &[
+            "echo 'import os; os.system(\"cat protected/x.csv\")' | python3",
+            "echo 'print(open(\"protected/x.csv\").read())' | python3",
+            "echo 'print(open(\"protected/x.csv\").read())' | python3 -",
+        ],
+        |_| installed("python3"),
+    );
+}
+
+/// Finding where a pipe goes must not change how a `cd` behind one is followed:
+/// an earlier form of the bd-u4u change allowed these.
+#[test]
+fn a_directory_change_behind_a_pipe_is_followed_as_before() {
+    let fixture = Fixture::new();
+
+    assert_refused(
+        &fixture,
+        &[
+            "echo hi | (cd protected; cat x.csv)",
+            "echo hi | (cd protected && cat x.csv)",
+            "echo hi | (\ncd protected\ncat x.csv\n)",
+            "echo hi |\n(cd protected; cat x.csv)",
+            "echo hi |\n{ cd protected; cat x.csv; }",
+        ],
+        |_| true,
+    );
+}
+
+#[test]
+fn text_piped_into_something_that_does_not_run_it_stays_allowed() {
+    let fixture = Fixture::new();
+    fs::write(fixture.project.join("count.sh"), "wc -l\n").expect("script");
+    let mut denied = Vec::new();
+
+    for command in [
+        "echo hi | sh",
+        "echo ok | cat",
+        "echo 'cat protected/x.csv' | grep cat",
+        "echo 'cat protected/x.csv' | cat > notes-copy.txt",
+        "echo 'cat protected/x.csv' | tee howto.txt",
+        // the shell has a script of its own, so the pipe is that script's data
+        "echo 'cat protected/x.csv' | bash count.sh",
+        "echo 'cat protected/x.csv' | sh -c 'wc -l'",
+        "echo 'cat protected/x.csv' | python3 -c 'import sys; print(len(sys.stdin.read()))'",
+        // not piped into the shell
+        "echo 'cat protected/x.csv' || sh -n count.sh",
+        "echo 'cat protected/x.csv'; sh count.sh",
+        "echo 'cat protected/x.csv' | wc -c; echo done | sh",
+        // here the `-c` string is xargs's own, and what is piped is its data
+        "echo notes.txt | xargs -I{} sh -c 'wc -l {}'",
+        // a here-document of the shell's own is what it reads
+        "echo 'cat protected/x.csv' | sh <<'EOF'\necho hi\nEOF",
+    ] {
+        if fixture.denies(command) {
+            denied.push(command);
+        }
+    }
+    assert!(denied.is_empty(), "denied:\n{}", denied.join("\n"));
+}
+
+#[test]
 fn ordinary_uses_of_the_same_forms_stay_allowed() {
     let fixture = Fixture::new();
     let mut denied = Vec::new();

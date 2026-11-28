@@ -174,11 +174,12 @@ fn inline_programs(command: &SimpleCommand) -> (Option<exec::Language>, Vec<Stri
 
     if texts.is_empty()
         && let Some(kind) = interpreter_kind(name)
-        && script_operand(kind, name, args) == Operand::Stdin
+        && reads_program_from_stdin(kind, name, args)
     {
         // bash reads whichever comes last, so all of them are read
         texts.extend(command.heredoc_body.clone());
         texts.extend(command.here_strings().into_iter().map(str::to_owned));
+        texts.extend(command.piped_program().map(str::to_owned));
     }
     (Some(language), texts)
 }
@@ -879,6 +880,44 @@ enum Operand<'a> {
     Inline,
     /// On standard input, which `python3 < read.py` fills from a file.
     Stdin,
+}
+
+/// Whether an interpreter run with `args` takes its program from standard
+/// input: it names no script, or names standard input itself.
+pub(super) fn reads_program_from_stdin(kind: InterpreterKind, name: &str, args: &[String]) -> bool {
+    if kind == InterpreterKind::Shell && has_stdin_flag(args) {
+        return true;
+    }
+    match script_operand(kind, name, args) {
+        Operand::Stdin => true,
+        Operand::File(path) => matches!(path, "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"),
+        Operand::Inline => false,
+    }
+}
+
+/// `bash -s a b`: with `-s` the words after the options are parameters, not a
+/// script.
+fn has_stdin_flag(args: &[String]) -> bool {
+    let mut words = args.iter().map(String::as_str);
+
+    while let Some(word) = words.next() {
+        match word {
+            "--" => return false,
+            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file" => {
+                words.next();
+            }
+            _ if word.starts_with("--") || word.starts_with('+') => {}
+            _ => match word.strip_prefix('-') {
+                Some(cluster) if !cluster.is_empty() => {
+                    if cluster.contains('s') {
+                        return true;
+                    }
+                }
+                _ => return false,
+            },
+        }
+    }
+    false
 }
 
 /// The script file among an interpreter's arguments: the first word that is not
