@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+use crate::supervise::HARNESS_TIMEOUT_SECS;
+
 /// The `PreToolUse` matcher for the tools an MCP server provides (bd-1wa). It
 /// is a regular expression, not a tool name: Claude Code matches it against
 /// `mcp__<server>__<tool>`.
@@ -599,6 +601,7 @@ fn veil_hook(command: &str) -> Value {
     json!({
         "type": "command",
         "command": command,
+        "timeout": HARNESS_TIMEOUT_SECS,
     })
 }
 
@@ -680,6 +683,13 @@ fn set_hook_command(hook: &mut Value, command: &str) {
     let object = ensure_object(hook);
     object.insert("type".to_owned(), Value::String("command".to_owned()));
     object.insert("command".to_owned(), Value::String(command.to_owned()));
+    let waits_long_enough = object
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .is_some_and(|seconds| seconds >= HARNESS_TIMEOUT_SECS as f64);
+    if !waits_long_enough {
+        object.insert("timeout".to_owned(), json!(HARNESS_TIMEOUT_SECS));
+    }
 }
 
 fn resolved_veil_command() -> io::Result<String> {
@@ -1031,6 +1041,60 @@ mod tests {
                 &[veil_hook(TEST_VEIL_COMMAND)]
             );
         }
+    }
+
+    /// A harness that waits less than veil's own deadline would let a slow call
+    /// through, so install asks it to wait longer.
+    #[test]
+    fn install_asks_the_harness_to_wait_longer_than_veil_takes() {
+        let path = temp_settings_path("install-timeout");
+        let executable_path = temp_executable_path("install-timeout");
+        create_executable(&executable_path);
+        let command = quote_test_command(&executable_path);
+        let hook =
+            |timeout: Value| json!({ "type": "command", "command": command, "timeout": timeout });
+        write_settings(
+            &path,
+            &json!({
+                "hooks": {
+                    "PreToolUse": [
+                        { "matcher": "Read", "hooks": [{ "type": "command", "command": command }] },
+                        { "matcher": "Grep", "hooks": [hook(json!(5))] },
+                        { "matcher": "Bash", "hooks": [hook(json!(120))] },
+                        { "matcher": "Write", "hooks": [hook(json!("10"))] },
+                        {
+                            "matcher": "Custom",
+                            "hooks": [{ "type": "command", "command": "/usr/local/bin/custom" }]
+                        }
+                    ]
+                }
+            }),
+        )
+        .expect("fixture settings should be writable");
+
+        install_into_path_with_command(&path, &command).expect("install should succeed");
+
+        let settings = read_settings(&path);
+        let entries = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse should remain an array");
+        let timeout_of = |matcher: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["matcher"] == matcher)
+                .expect("expected a matcher entry")["hooks"][0]
+                .get("timeout")
+                .cloned()
+        };
+        // none, one too short and one that is no number are all raised
+        assert_eq!(timeout_of("Read"), Some(json!(30)));
+        assert_eq!(timeout_of("Grep"), Some(json!(30)));
+        assert_eq!(timeout_of("Write"), Some(json!(30)));
+        // a longer one is the user's to keep
+        assert_eq!(timeout_of("Bash"), Some(json!(120)));
+        // an entry that was not there has it too
+        assert_eq!(timeout_of("mcp__.*"), Some(json!(30)));
+        assert_eq!(timeout_of("Custom"), None);
     }
 
     #[test]

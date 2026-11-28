@@ -340,13 +340,24 @@ for a call veil let through. If you saw fewer permission prompts with an earlier
 veil, you may see more of them now. `veil --schema` describes what is printed.
 
 veil exits 2, which blocks the call, when it cannot answer: a payload or a config
-file it cannot read, or a crash. A harness may let a call through when its hook
-dies, so the `veil` it starts runs a second `veil` that judges the call, and
-exits 2 when that one ends in any way but with an answer: a panic, running out of
-stack or memory, or being killed. The second process took about 4 ms more per
-call in a release build on an Intel Mac. Two things are not covered: the first
-process being killed, and a check that takes longer than the harness waits for a
-hook. Some very long or deeply nested commands take veil tens of seconds.
+file it cannot read, a crash, or a check that takes too long. A harness may let a
+call through when its hook dies or is slow, so the `veil` it starts runs a second
+`veil` that judges the call. The first one exits 2 when the second ends in any way
+but with an answer (a panic, running out of stack or memory, being killed), or
+has not ended after 20 seconds. Some very long or deeply nested commands take
+longer than that, and are blocked; the slowest ordinary check measured, four
+searches of a directory of 46,000 entries, took under 2 seconds. The second
+process took about 4 ms more per call in a release build on an Intel Mac.
+
+By default Claude Code waits 600 seconds for a hook, Gemini CLI 60, Copilot 30 and
+Grok 5. `veil install` writes `"timeout": 30` on its hooks, in seconds, and keeps
+a longer one. Grok reads that from Claude Code's settings. **After upgrading, run
+`veil install` again:** a hook installed by an earlier veil has no timeout, so
+Grok stops waiting for it after 5 seconds. For a hook you wrote yourself, give it
+at least 30 seconds.
+
+Not covered: the first process being killed, and a harness that waits less than
+20 seconds for the hook.
 
 A content search of a directory reads every file beneath it, so veil walks the
 directory before allowing it and denies the search when any path under it is
